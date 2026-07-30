@@ -35,6 +35,22 @@ def history_file(pid, base_dir):
 def dsyn_file(pid, base_dir):
     return os.path.join(base_dir, f"dsyn_{pid}.json")
 
+def public_ledger_file(base_dir):
+    """Общий журнал результатов ВСЕХ игроков — видимый каждому, в отличие
+    от истории (history_<id>.json), которая у каждого только своя."""
+    return os.path.join(base_dir, "public_results.json")
+
+def load_public_ledger(base_dir):
+    path = public_ledger_file(base_dir)
+    if os.path.exists(path):
+        return common.read_json(path).get("entries", [])
+    return []
+
+def append_public_ledger(base_dir, entry):
+    entries = load_public_ledger(base_dir)
+    entries.append(entry)
+    common.write_json(public_ledger_file(base_dir), {"entries": entries})
+
 def prompt_file(pid, base_dir):
     return os.path.join(base_dir, f"prompt_{pid}.txt")
 
@@ -139,6 +155,27 @@ def _format_history(rounds, window):
             f"balance_after={r['balance_after']}"
         )
     return "\n".join(lines)
+
+
+def _format_public_ledger(entries: list[dict], window: int = 20, exclude_pid: str = None) -> str:
+    """Компактная сводка последних `window` реальных исходов ставок ПО ВСЕМ
+    игрокам (проверяемые факты — не то, что кто-то сказал в диалоге)."""
+    if not entries:
+        return "(no public results yet)"
+    recent = entries[-window:]
+    lines = []
+    for e in recent:
+        if exclude_pid and e.get("player_id") == exclude_pid:
+            continue
+        bet = e.get("bet", {}) or {}
+        bd = bet.get("numbers", bet.get("selection"))
+        status = "WON" if e.get("win") else "lost"
+        lines.append(
+            f"  r{e.get('round_no', '?')}: {e.get('player_id')} bet {bet.get('type')}({bd}) "
+            f"amount={bet.get('amount')} on number={e.get('winning_number')} → {status} "
+            f"payout={e.get('payout', 0)}"
+        )
+    return "\n".join(lines) if lines else "(no public results yet)"
 
 
 def _format_dsyn_for_prompt(data: dict) -> str:
@@ -395,13 +432,14 @@ class PlayerAgent:
 
     # ── apply result ─────────────────────────────────────────────────────
 
-    def apply_result(self, result):
+    def apply_result(self, result, round_no=None):
         win    = result.get("win", False)
         payout = result.get("payout", 0)
         if win:
             self.balance += payout
         save_balance(self.player_id, self.base_dir, self.balance)
         entry = {
+            "round_no": round_no,
             "winning_number": result.get("winning_number"),
             "bet": result.get("bet"),
             "win": win,
@@ -409,6 +447,18 @@ class PlayerAgent:
             "balance_after": self.balance,
         }
         append_history(self.player_id, self.base_dir, entry)
+
+        # публичная запись — видна ВСЕМ игрокам, чтобы можно было проверить
+        # реальный исход чужой ставки, а не просто верить словам в диалоге
+        append_public_ledger(self.base_dir, {
+            "round_no": round_no,
+            "player_id": self.player_id,
+            "winning_number": result.get("winning_number"),
+            "bet": result.get("bet"),
+            "win": win,
+            "payout": payout,
+        })
+
         status = "WON" if win else "lost"
         self._log(f"last round: num={entry['winning_number']} {status} "
                   f"payout={payout} balance={self.balance}")
@@ -460,7 +510,7 @@ class PlayerAgent:
     # ── iterative next-move decision (talk to X / go bet) ────────────────
 
     def decide_next_move(self, available_players: list[str], talked_to: list[str],
-                         round_no: int) -> dict:
+                         round_no: int, dialogues_this_round: list[tuple] = None) -> dict:
         """
         Called in a loop BEFORE betting. The player looks at its own reputation
         map (who is available, what happened with them before, in this round
@@ -477,11 +527,32 @@ class PlayerAgent:
 
         talked_txt = ", ".join(talked_to) if talked_to else "(no one yet this round)"
 
+        others_txt = "(no other dialogues yet this round)"
+        if dialogues_this_round:
+            others = []
+            for item in dialogues_this_round:
+                a, b = item[0], item[1]
+                had_transfer = item[2] if len(item) > 2 else False
+                if self.player_id in (a, b):
+                    continue
+                tag = " (a transfer happened — could be 1 coin, could be 100)" if had_transfer else " (no money changed hands, as far as you know)"
+                others.append(f"  {a} ↔ {b}{tag}")
+            if others:
+                others_txt = "\n".join(others)
+
+        public_txt = _format_public_ledger(
+            load_public_ledger(self.base_dir), window=10, exclude_pid=self.player_id
+        )
+
         user_msg = (
             f"Round {round_no}. Your player id: {self.player_id}. Your balance: {self.balance}.\n\n"
             f"Betting synapse:\n{notes or '(empty)'}\n\n"
             f"Dialogue synapse / reputation map of other players:\n{dsyn_txt}\n\n"
             f"Recent casino history:\n{hist_txt}\n\n"
+            f"Public results — VERIFIED bets/outcomes of OTHER players "
+            f"(use to fact-check claims made in dialogue):\n{public_txt}\n\n"
+            f"Dialogues already held by OTHER players this round (you were not part of "
+            f"these — you can go ask one of them about it if it seems relevant):\n{others_txt}\n\n"
             f"Players available to talk to right now: {available_players}\n"
             f"Players you already talked to THIS round: {talked_txt}\n\n"
             f"IMPORTANT: your reputation map is built from what OTHER PLAYERS TOLD YOU "
@@ -726,6 +797,9 @@ class PlayerAgent:
         hist_txt = _format_history(load_history(self.player_id, self.base_dir), self.history_window)
         dsyn     = load_dsyn(self.player_id, self.base_dir)
         dsyn_txt = _format_dsyn_for_prompt(dsyn)
+        public_txt = _format_public_ledger(
+            load_public_ledger(self.base_dir), window=20, exclude_pid=self.player_id
+        )
         max_amt  = max(1, int(self.balance * self.max_bet_fraction))
 
         user_msg = (
@@ -734,6 +808,9 @@ class PlayerAgent:
             f"Betting synapse:\n{notes or '(none yet — pick a starting strategy)'}\n\n"
             f"Dialogue synapse:\n{dsyn_txt}\n\n"
             f"Round history:\n{hist_txt}\n\n"
+            f"Public results — VERIFIED facts about how OTHER players actually bet "
+            f"and whether they won (use this to check if someone's claimed "
+            f"'strategy' really works, instead of trusting their word):\n{public_txt}\n\n"
             f"Place your bet. Return ONLY JSON:\n"
             f"{{\"type\": \"...\", \"numbers\": [...] OR \"selection\": \"...\", "
             f"\"amount\": N, \"reasoning\": \"short reason\"}}\n"

@@ -38,6 +38,60 @@ def load_config(path):
     return cfg
 
 
+def state_file(base_dir):
+    return os.path.join(base_dir, "game_state.json")
+
+
+def load_last_round(base_dir):
+    path = state_file(base_dir)
+    if os.path.exists(path):
+        return common.read_json(path).get("last_completed_round", 0)
+    return 0
+
+
+def save_last_round(base_dir, round_no):
+    common.write_json(state_file(base_dir), {"last_completed_round": round_no})
+
+
+def dialogue_phase_state_file(base_dir):
+    return os.path.join(base_dir, "dialogue_phase_state.json")
+
+
+def load_dialogue_phase_state(base_dir, round_no):
+    """
+    Прогресс ФАЗЫ ДИАЛОГОВ внутри текущего раунда — сохраняется после
+    КАЖДОГО завершённого диалога. Диалог, прерванный Ctrl+C посреди
+    (деньги ещё не переведены / done не наступил), в это состояние не
+    попадает и поэтому при рестарте просто начнётся заново с нуля —
+    ровно то поведение, которое нужно.
+    """
+    path = dialogue_phase_state_file(base_dir)
+    if not os.path.exists(path):
+        return None
+    data = common.read_json(path)
+    if data.get("round_no") != round_no:
+        return None
+    return data
+
+
+def save_dialogue_phase_state(base_dir, round_no, player_index, talked_to,
+                              incoming_used, outgoing_used, dialogues_this_round):
+    common.write_json(dialogue_phase_state_file(base_dir), {
+        "round_no": round_no,
+        "player_index": player_index,
+        "talked_to": talked_to,
+        "incoming_used": incoming_used,
+        "outgoing_used": outgoing_used,
+        "dialogues_this_round": dialogues_this_round,
+    })
+
+
+def clear_dialogue_phase_state(base_dir):
+    path = dialogue_phase_state_file(base_dir)
+    if os.path.exists(path):
+        os.remove(path)
+
+
 def get_balances(base_dir, players):
     result = {}
     for pid in players:
@@ -168,16 +222,25 @@ def main():
     round_delay = cfg.getfloat("game", "round_delay_sec", fallback=0)
 
     logger = GameLogger(logs_dir)
-    logger.write_global(
-        f"=== Casino v2 start. Players: {players}. Rounds: {rounds}. Table: {base_dir} ==="
-    )
+
+    last_done = load_last_round(base_dir)
+    start_round = last_done + 1
+    if last_done > 0:
+        logger.write_global(
+            f"=== Resuming game from round {start_round} "
+            f"(last completed: {last_done}). Table: {base_dir} ==="
+        )
+    else:
+        logger.write_global(
+            f"=== Casino v2 start. Players: {players}. Rounds: {rounds}. Table: {base_dir} ==="
+        )
 
     agents: dict[str, PlayerAgent] = {
         pid: PlayerAgent(pid, base_dir, cfg, logger=logger)
         for pid in players
     }
 
-    for round_no in range(1, rounds + 1):
+    for round_no in range(start_round, rounds + 1):
         logger.write_round_header(round_no, rounds)
 
         # ── Phase 0: apply last round results + reflect ────────────────
@@ -186,7 +249,9 @@ def main():
             result_path = common.result_file(pid, base_dir)
             if os.path.exists(result_path):
                 result = common.read_json(result_path)
-                entry = agent.apply_result(result)
+                # результат относится к ПРЕДЫДУЩЕМУ раунду (записан крупье
+                # в конце round_no - 1), а не к текущему round_no
+                entry = agent.apply_result(result, round_no - 1)
                 os.remove(result_path)
                 agent.reflect_betting(entry)
 
@@ -202,10 +267,37 @@ def main():
         # outgoing_used[pid]  = how many times pid INITIATED a dialogue this round
         incoming_used: dict[str, int] = {pid: 0 for pid in players}
         outgoing_used: dict[str, int] = {pid: 0 for pid in players}
+        # список всех пар (a, b), которые уже поговорили в этом раунде —
+        # виден всем игрокам, чтобы можно было пойти спросить участника
+        # о разговоре, свидетелем которого ты не был
+        dialogues_this_round: list[tuple] = []
 
-        for pid in players:
+        # ── восстановление прогресса диалогов после Ctrl+C ──────────────
+        # Диалог, прерванный посреди себя, никогда не попадал в
+        # dialogues_this_round (он сохраняется только ПОСЛЕ завершения
+        # run_dialogue), поэтому при восстановлении он просто будет
+        # запущен заново с нуля — уже завершённые диалоги не повторяются.
+        start_player_index = 0
+        saved_talked_to: list[str] = []
+        phase_state = load_dialogue_phase_state(base_dir, round_no)
+        if phase_state:
+            start_player_index = phase_state["player_index"]
+            saved_talked_to = phase_state["talked_to"]
+            incoming_used.update(phase_state["incoming_used"])
+            outgoing_used.update(phase_state["outgoing_used"])
+            dialogues_this_round = [tuple(p) for p in phase_state["dialogues_this_round"]]
+            logger.write_global(
+                f"Resuming dialogue phase of round {round_no} from player "
+                f"index {start_player_index} ({players[start_player_index]}); "
+                f"{len(dialogues_this_round)} dialogue(s) already completed this round."
+            )
+
+        for player_index in range(start_player_index, len(players)):
+            pid = players[player_index]
             agent = agents[pid]
-            talked_to: list[str] = []
+            # только для того игрока, на котором нас прервали, продолжаем
+            # с его уже накопленным talked_to; для всех следующих — с нуля
+            talked_to: list[str] = saved_talked_to if player_index == start_player_index else []
 
             while True:
                 if outgoing_used[pid] >= MAX_DIALOGUES_PER_PLAYER:
@@ -222,7 +314,8 @@ def main():
                     logger.write(pid, "no available players left to talk to, moving to betting")
                     break
 
-                decision = agent.decide_next_move(available, talked_to, round_no)
+                decision = agent.decide_next_move(available, talked_to, round_no,
+                                                   dialogues_this_round)
                 if decision["action"] != "talk":
                     logger.write(pid, f"done talking this round (reason: {decision.get('reason','')[:80]}), "
                                        f"proceeding to bet")
@@ -232,7 +325,7 @@ def main():
                 logger.write(pid, f"chooses to talk to {partner_id} — reason: {decision.get('reason','')[:80]}")
 
                 partner_agent = agents[partner_id]
-                run_dialogue(agent, partner_agent, round_no, logger, base_dir)
+                dlg_summary = run_dialogue(agent, partner_agent, round_no, logger, base_dir)
                 # run_dialogue() already calls update_dsyn() for BOTH agents
                 # right after the conversation ends — analysis is mandatory,
                 # not something either agent can choose to skip.
@@ -240,6 +333,21 @@ def main():
                 talked_to.append(partner_id)
                 outgoing_used[pid] += 1
                 incoming_used[partner_id] += 1
+                had_transfer = (dlg_summary["a_sent"] > 0 or dlg_summary["b_sent"] > 0)
+                dialogues_this_round.append((pid, partner_id, had_transfer))
+
+                # диалог полностью завершён — сохраняем прогресс НА ДИСК.
+                # Если сейчас нажать Ctrl+C, при рестарте этот диалог не
+                # повторится, а следующий (ещё не начатый) начнётся с нуля.
+                save_dialogue_phase_state(
+                    base_dir, round_no, player_index, talked_to,
+                    incoming_used, outgoing_used, dialogues_this_round
+                )
+
+        # фаза диалогов раунда полностью пройдена — прогресс больше не нужен
+        clear_dialogue_phase_state(base_dir)
+
+
 
         # ── Phase 2: place bets ────────────────────────────────────────
         for pid in players:
@@ -271,6 +379,10 @@ def main():
         for pid in players:
             agents[pid].balance = balances[pid]
         logger.write_balances(balances)
+
+        # раунд полностью завершён — запоминаем это на диске,
+        # чтобы при перезапуске после Ctrl+C не проходить его снова
+        save_last_round(base_dir, round_no)
 
         if round_delay:
             time.sleep(round_delay)
