@@ -68,7 +68,8 @@ def save_text(path, text):
 def load_notes(pid, base_dir):
     path = notes_file(pid, base_dir)
     if os.path.exists(path):
-        return common.read_json(path).get("notes", "")
+        # FIX-6: старые прогоны могли записать не-строку — приводим на чтении
+        return _as_text(common.read_json(path).get("notes", ""))
     return ""
 
 def save_notes(pid, base_dir, notes):
@@ -119,6 +120,21 @@ def save_balance(pid, base_dir, balance):
 #   ],
 #   "compressed_history": "compact text summary of older interactions"
 # }
+
+def _as_text(value, fallback=""):
+    """FIX-6: LLM возвращает то строку, то список, то dict. Приводим к
+    строке, не роняя игру и не записывая на диск структуру, на которой
+    потом упадёт len()."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return fallback
+    if isinstance(value, (list, tuple)):
+        return "\n".join(_as_text(v) for v in value)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
 
 def _empty_dsyn():
     return {"reputation": {}, "interactions": [], "compressed_history": ""}
@@ -371,7 +387,7 @@ class PlayerAgent:
                 system=self.abstract_prompt + "\nTASK: Compress your betting synapse.",
                 user=user_msg, temperature=0.3, max_tokens=400
             )
-            compressed = resp.get("notes", notes)[:MAX_SYNAPSE_CHARS]
+            compressed = _as_text(resp.get("notes"), notes)[:MAX_SYNAPSE_CHARS]
             save_notes(self.player_id, self.base_dir, compressed)
             self._log(f"betting synapse compressed: {len(notes)} → {len(compressed)} chars")
             return compressed
@@ -418,7 +434,7 @@ class PlayerAgent:
                 system=self.abstract_prompt + "\nTASK: Compress dialogue synapse history.",
                 user=user_msg, temperature=0.3, max_tokens=300
             )
-            new_compressed = resp.get("compressed_history", existing_compressed)[:500]
+            new_compressed = _as_text(resp.get("compressed_history"), existing_compressed)[:500]
         except Exception as e:
             self._log(f"dialogue synapse compression failed ({e})")
             new_compressed = existing_compressed
@@ -466,16 +482,37 @@ class PlayerAgent:
 
     # ── reflect: update betting synapse ─────────────────────────────────
 
-    def reflect_betting(self, last_entry):
+    def reflect_betting(self, last_entry=None):
         notes    = self._compress_betting_synapse_if_needed()
         history  = load_history(self.player_id, self.base_dir)
         hist_text = _format_history(history, self.history_window)
-        outcome  = "WON" if last_entry["win"] else "lost"
+
+        # FIX-5: last_entry=None означает, что в прошлом раунде игрок не
+        # ставил (обычно — баланс 0). Раньше рефлексия в этом случае просто
+        # не вызывалась, и банкрот навсегда замораживал свою синапсу и
+        # персону — переставал эволюционировать ровно тогда, когда это
+        # было нужнее всего. Теперь он получает свой ход на переосмысление
+        # и может переключиться на диалоговую экономику (займы, продажа
+        # стратегий), чтобы вернуться в игру.
+        if last_entry is None:
+            result_line = (
+                f"You did NOT place a bet last round (balance was {self.balance}). "
+                f"Betting alone will not get you out of this. Rethink your approach: "
+                f"the dialogue economy (loans, selling your strategy or information, "
+                f"brokering) is available to you every round and does not require "
+                f"capital up front.\n\n"
+            )
+        else:
+            outcome = "WON" if last_entry["win"] else "lost"
+            result_line = (
+                f"Round result: number={last_entry['winning_number']}, "
+                f"bet={last_entry['bet']['type']} amount={last_entry['bet']['amount']} → "
+                f"{outcome}, payout={last_entry['payout']}, "
+                f"balance={last_entry['balance_after']}.\n\n"
+            )
 
         user_msg = (
-            f"Round result: number={last_entry['winning_number']}, "
-            f"bet={last_entry['bet']['type']} amount={last_entry['bet']['amount']} → "
-            f"{outcome}, payout={last_entry['payout']}, balance={last_entry['balance_after']}.\n\n"
+            result_line +
             f"Current betting synapse:\n{notes or '(empty)'}\n\n"
             f"Round history:\n{hist_text}\n\n"
             f"Current persona/strategy text (the ONLY part of your prompt you can edit):\n"
@@ -494,9 +531,12 @@ class PlayerAgent:
                 system=self.abstract_prompt + "\nTASK: Reflect on last round. Update betting synapse.",
                 user=user_msg, temperature=0.5, max_tokens=500
             )
-            new_notes = resp.get("notes", notes)
+            # FIX-6: модель периодически возвращает notes/new_persona
+            # списком или dict-ом. Раньше это молча записывалось на диск и
+            # падало позже, вне try — на len(notes) в компрессоре синапсы.
+            new_notes = _as_text(resp.get("notes"), notes)[:MAX_SYNAPSE_CHARS]
             if resp.get("update_persona") and resp.get("new_persona"):
-                new_persona = resp["new_persona"]
+                new_persona = _as_text(resp["new_persona"], self.persona_prompt)
                 save_text(prompt_file(self.player_id, self.base_dir), new_persona)
                 self._log(f"PERSONA REWRITTEN ({len(new_persona)} chars):\n{new_persona}")
         except Exception as e:
@@ -586,9 +626,26 @@ class PlayerAgent:
 
     # ── one dialogue turn ─────────────────────────────────────────────────
 
-    @staticmethod
-    def _detect_loop(conversation: list[dict], threshold: float = 0.7, window: int = 4,
-                     immediate_threshold: float = 0.5) -> bool:
+    # FIX-4: служебные слова раздували пересечение множеств и убивали
+    # нормальный торг. "Lend me 10 coins now, I will return 12 next round"
+    # vs "I will lend you 10 coins if you return 15 next round, not 12" —
+    # идеальный контроффер — детектировался как петля на 2-м сообщении.
+    _STOPWORDS = frozenset("""
+        a an and are as at be been but by can coins could do does for from get
+        give had has have he her him his i if in is it its me my next no not of
+        on one or our out round she so that the their them then there they this
+        to up us was we what when which who will with would you your yours it's
+        i'll i'd we'll you'll don't won't let's just now ok okay
+    """.split())
+
+    @classmethod
+    def _content_words(cls, message: str) -> set:
+        words = re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9]+", message.lower())
+        return {w for w in words if w not in cls._STOPWORDS and len(w) > 1}
+
+    @classmethod
+    def _detect_loop(cls, conversation: list[dict], threshold: float = 0.75, window: int = 4,
+                     immediate_threshold: float = 0.8) -> bool:
         """
         Returns True if the newest message is suspiciously similar to ANY of
         the last `window` messages (catches drift/repetition over several
@@ -597,23 +654,24 @@ class PlayerAgent:
         since an early near-echo of the other player's exact offer is a
         stronger signal of parroting than of a legitimate counter-offer).
         """
-        if len(conversation) < 2:
+        # FIX-4: первый ответ на оффер естественно переиспользует его
+        # лексику ("10 coins", "strategy", "loan") — это торг, а не петля.
+        # Немедленную проверку включаем только с 3-го сообщения.
+        if len(conversation) < 3:
             return False
-        latest = set(conversation[-1]["message"].lower().split())
+        latest = cls._content_words(conversation[-1]["message"])
         if not latest:
             return False
 
         # sensitive check against the single immediately preceding message
-        prev_words = set(conversation[-2]["message"].lower().split())
+        prev_words = cls._content_words(conversation[-2]["message"])
         if prev_words:
             overlap = len(latest & prev_words) / max(len(latest), len(prev_words))
             if overlap >= immediate_threshold:
                 return True
 
-        if len(conversation) < 3:
-            return False
         for prev in conversation[-(window + 1):-1]:
-            prev_words = set(prev["message"].lower().split())
+            prev_words = cls._content_words(prev["message"])
             if not prev_words:
                 continue
             overlap = len(latest & prev_words) / max(len(latest), len(prev_words))
@@ -695,8 +753,23 @@ class PlayerAgent:
                 system=self.abstract_prompt + f"\nTASK: Dialogue turn with {partner_id}. Be concrete, no filler, no repetition.",
                 user=user_msg, temperature=0.8, max_tokens=300
             )
-            transfer = max(0, min(int(resp.get("transfer", 0)), self.balance))
-            transfer_to = resp.get("transfer_to") if transfer > 0 else None
+            try:
+                raw_transfer = int(float(resp.get("transfer", 0) or 0))
+            except (TypeError, ValueError):
+                raw_transfer = 0
+            transfer = max(0, min(raw_transfer, self.balance))
+            # FIX-1: единственный возможный получатель в этом диалоге —
+            # сам партнёр. Модель регулярно возвращает transfer>0 с
+            # transfer_to=null (или с опечаткой в id), и раньше такой
+            # перевод молча пропадал, оставляя в логе фантомную сделку.
+            # Считаем непустую сумму намерением заплатить партнёру;
+            # явное указание ТРЕТЬЕГО игрока — по-прежнему отмена.
+            raw_to = resp.get("transfer_to")
+            if transfer > 0 and raw_to not in (None, "", partner_id):
+                self._log(f"transfer_to={raw_to!r} is not the dialogue partner "
+                          f"({partner_id}) — transfer cancelled")
+                transfer = 0
+            transfer_to = partner_id if transfer > 0 else None
             return {
                 "message": str(resp.get("message", "…")),
                 "transfer": transfer,

@@ -92,6 +92,39 @@ def clear_dialogue_phase_state(base_dir):
         os.remove(path)
 
 
+def settle_pending_results(agents, players, base_dir, round_no, logger,
+                           reflect=True):
+    """
+    FIX-2: применяет все НЕОБРАБОТАННЫЕ result_<pid>.json (их пишет крупье
+    в конце раунда) — начисляет выплату, дописывает историю и публичный
+    журнал. Раньше это делалось ТОЛЬКО в Фазе 0 следующего раунда, поэтому
+    выигрыш последнего раунда игры не зачислялся никогда: цикл кончался,
+    файлы результатов оставались на диске, а save_last_round() уже не давал
+    прогнать раунд повторно.
+
+    FIX-5: если результата нет (игрок не ставил — например, баланс был 0),
+    рефлексия всё равно вызывается. Иначе банкрот навсегда замораживал свою
+    синапсу и персону ровно тогда, когда учиться нужнее всего.
+
+    Возвращает число применённых результатов.
+    """
+    applied = 0
+    for pid in players:
+        agent = agents[pid]
+        result_path = common.result_file(pid, base_dir)
+        if os.path.exists(result_path):
+            result = common.read_json(result_path)
+            entry = agent.apply_result(result, round_no)
+            os.remove(result_path)
+            applied += 1
+            if reflect:
+                agent.reflect_betting(entry)
+        elif reflect and round_no >= 1:
+            logger.write(pid, "no bet result for last round — reflecting anyway")
+            agent.reflect_betting(None)
+    return applied
+
+
 def get_balances(base_dir, players):
     result = {}
     for pid in players:
@@ -131,17 +164,27 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             round_no=round_no,
             is_initiator=(turn == 0)
         )
-        transfer_a = min(turn_a["transfer"], agent_a.balance)
-        if transfer_a > 0 and turn_a.get("transfer_to") == pid_b:
-            agent_a.balance -= transfer_a
-            agent_b.balance += transfer_a
+        # FIX-1: только ФАКТИЧЕСКИ проведённый перевод попадает в лог,
+        # в conversation и в диалоговую синапсу. Раньше запись делалась
+        # вне if-а, поэтому при transfer>0 с чужим/пустым transfer_to
+        # деньги не двигались, но обе стороны видели "[+N coins]" —
+        # фантомная сделка, отравлявшая репутацию.
+        requested_a = min(turn_a["transfer"], agent_a.balance)
+        transfer_a = 0
+        if requested_a > 0 and turn_a.get("transfer_to") == pid_b:
+            agent_a.balance -= requested_a
+            agent_b.balance += requested_a
             save_balance(pid_a, table_dir, agent_a.balance)
             save_balance(pid_b, table_dir, agent_b.balance)
-            a_total_sent += transfer_a
+            transfer_a = requested_a
+            a_total_sent += requested_a
+        elif requested_a > 0:
+            logger.write(pid_a, f"transfer of {requested_a} coins DROPPED "
+                                f"(transfer_to={turn_a.get('transfer_to')!r}, expected {pid_b!r})")
 
         conversation.append({
             "from": pid_a, "message": turn_a["message"],
-            "transfer": transfer_a if transfer_a > 0 else 0,
+            "transfer": transfer_a,
             "transfer_to": pid_b if transfer_a > 0 else None
         })
         logger.write_dialogue(round_no, pid_a, pid_b, turn * 2 + 1,
@@ -159,17 +202,23 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             round_no=round_no,
             is_initiator=False
         )
-        transfer_b = min(turn_b["transfer"], agent_b.balance)
-        if transfer_b > 0 and turn_b.get("transfer_to") == pid_a:
-            agent_b.balance -= transfer_b
-            agent_a.balance += transfer_b
+        # FIX-1 (симметрично для B)
+        requested_b = min(turn_b["transfer"], agent_b.balance)
+        transfer_b = 0
+        if requested_b > 0 and turn_b.get("transfer_to") == pid_a:
+            agent_b.balance -= requested_b
+            agent_a.balance += requested_b
             save_balance(pid_b, table_dir, agent_b.balance)
             save_balance(pid_a, table_dir, agent_a.balance)
-            b_total_sent += transfer_b
+            transfer_b = requested_b
+            b_total_sent += requested_b
+        elif requested_b > 0:
+            logger.write(pid_b, f"transfer of {requested_b} coins DROPPED "
+                                f"(transfer_to={turn_b.get('transfer_to')!r}, expected {pid_a!r})")
 
         conversation.append({
             "from": pid_b, "message": turn_b["message"],
-            "transfer": transfer_b if transfer_b > 0 else 0,
+            "transfer": transfer_b,
             "transfer_to": pid_a if transfer_b > 0 else None
         })
         logger.write_dialogue(round_no, pid_a, pid_b, turn * 2 + 2,
@@ -244,16 +293,10 @@ def main():
         logger.write_round_header(round_no, rounds)
 
         # ── Phase 0: apply last round results + reflect ────────────────
-        for pid in players:
-            agent = agents[pid]
-            result_path = common.result_file(pid, base_dir)
-            if os.path.exists(result_path):
-                result = common.read_json(result_path)
-                # результат относится к ПРЕДЫДУЩЕМУ раунду (записан крупье
-                # в конце round_no - 1), а не к текущему round_no
-                entry = agent.apply_result(result, round_no - 1)
-                os.remove(result_path)
-                agent.reflect_betting(entry)
+        # результат относится к ПРЕДЫДУЩЕМУ раунду (записан крупье
+        # в конце round_no - 1), а не к текущему round_no
+        settle_pending_results(agents, players, base_dir, round_no - 1, logger,
+                               reflect=(round_no > start_round or last_done > 0))
 
         # ── Phase 1: dialogue phase (iterative) ─────────────────────────
         # Each player, in turn, repeatedly decides: talk to a specific
@@ -298,6 +341,17 @@ def main():
             # только для того игрока, на котором нас прервали, продолжаем
             # с его уже накопленным talked_to; для всех следующих — с нуля
             talked_to: list[str] = saved_talked_to if player_index == start_player_index else []
+
+            # FIX-7: раньше состояние писалось ТОЛЬКО после завершённого
+            # диалога, поэтому Ctrl+C во время ПЕРВОГО диалога игрока N
+            # откатывал указатель на игрока N-1 — тот уже отговорил, но на
+            # рестарте получал право на новые диалоги, и лимит
+            # MAX_DIALOGUES_PER_PLAYER де-факто был мягче заявленного.
+            # Фиксируем позицию на входе в ход каждого игрока.
+            save_dialogue_phase_state(
+                base_dir, round_no, player_index, talked_to,
+                incoming_used, outgoing_used, dialogues_this_round
+            )
 
             while True:
                 if outgoing_used[pid] >= MAX_DIALOGUES_PER_PLAYER:
@@ -360,9 +414,14 @@ def main():
                 continue
 
             bet = agent.decide_bet()
+            # FIX-3: сначала файл ставки, потом списание. Обрыв между двумя
+            # операциями раньше означал "деньги списаны, ставки нет" —
+            # чистая потеря. Теперь худший случай обратный: ставка есть,
+            # списание не прошло, и на рестарте Фаза 2 её пропустит по
+            # `if os.path.exists(bet_file)`. Деньги не исчезают.
+            common.write_json(common.bet_file(pid, base_dir), bet)
             agent.balance -= bet["amount"]
             save_balance(pid, base_dir, agent.balance)
-            common.write_json(common.bet_file(pid, base_dir), bet)
             bd = bet.get("numbers", bet.get("selection"))
             logger.write(pid, f"bet: {bet['type']}({bd}) amount={bet['amount']} "
                              f"balance_after={agent.balance}")
@@ -386,6 +445,16 @@ def main():
 
         if round_delay:
             time.sleep(round_delay)
+
+    # FIX-2: последний раунд крупье уже разыграл, но Фазы 0 следующего
+    # раунда не будет — начисляем выплаты здесь, иначе выигрыш последнего
+    # раунда пропадает, а ставка остаётся списанной. reflect=False: играть
+    # больше не в чем, обновлять синапсу незачем (и это экономит N вызовов
+    # LLM на выходе).
+    settled = settle_pending_results(agents, players, base_dir, rounds, logger,
+                                     reflect=False)
+    if settled:
+        logger.write_global(f"Final settlement: {settled} pending result(s) applied.")
 
     logger.write_global("=== Game over ===")
     logger.write_balances(get_balances(base_dir, players))
