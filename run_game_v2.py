@@ -22,8 +22,12 @@ from croupier_v2 import run_round
 from game_logger import GameLogger
 
 
-MAX_DIALOGUE_PARTNERS = 2
 MAX_DIALOGUE_TURNS = 4
+# Safety cap: how many dialogues a single player may have in one round —
+# either as the one who initiates (outgoing) or as the one being talked to
+# (incoming). Tracked separately so a popular target doesn't accidentally
+# eat into its own budget for initiating conversations.
+MAX_DIALOGUES_PER_PLAYER = 3
 
 
 def load_config(path):
@@ -186,38 +190,56 @@ def main():
                 os.remove(result_path)
                 agent.reflect_betting(entry)
 
-        # ── Phase 1: dialogue phase ────────────────────────────────────
-        # Track who has already participated in a dialogue this round
-        # to avoid too many cross-conversations.
-        # Each player can initiate with up to 2 partners (config limit).
-        initiated: dict[str, list] = {pid: [] for pid in players}
+        # ── Phase 1: dialogue phase (iterative) ─────────────────────────
+        # Each player, in turn, repeatedly decides: talk to a specific
+        # other player, or stop and go bet. After EVERY dialogue both
+        # participants are forced (by run_dialogue) to analyse it and
+        # update their own reputation synapse — this happens unconditionally
+        # at the orchestrator level, so a player can never "forget" to
+        # reflect on a conversation before deciding its next move.
+        #
+        # incoming_used[pid]  = how many times pid was TALKED TO this round
+        # outgoing_used[pid]  = how many times pid INITIATED a dialogue this round
+        incoming_used: dict[str, int] = {pid: 0 for pid in players}
+        outgoing_used: dict[str, int] = {pid: 0 for pid in players}
 
         for pid in players:
             agent = agents[pid]
-            available = [p for p in players if p != pid]
+            talked_to: list[str] = []
 
-            # Check if agent wants dialogue
-            decision = agent.decide_dialogue(available, round_no)
-            if not decision["want_dialogue"] or not decision["partners"]:
-                logger.write(pid, f"skips dialogue this round (intent: {decision['intent'][:60]})")
-                continue
+            while True:
+                if outgoing_used[pid] >= MAX_DIALOGUES_PER_PLAYER:
+                    logger.write(pid, "reached max outgoing dialogues this round, moving to betting")
+                    break
 
-            logger.write(pid, f"wants dialogue with {decision['partners']} — intent: {decision['intent'][:80]}")
+                available = [
+                    p for p in players
+                    if p != pid
+                    and p not in talked_to
+                    and incoming_used[p] < MAX_DIALOGUES_PER_PLAYER
+                ]
+                if not available:
+                    logger.write(pid, "no available players left to talk to, moving to betting")
+                    break
 
-            for partner_id in decision["partners"][:MAX_DIALOGUE_PARTNERS]:
-                # Check if partner has capacity (they accept up to 2 initiated dialogues)
-                if len(initiated.get(partner_id, [])) >= MAX_DIALOGUE_PARTNERS:
-                    logger.write(pid, f"{partner_id} is busy (max dialogues reached), skipping")
-                    continue
-                if partner_id in initiated[pid]:
-                    logger.write(pid, f"already talked to {partner_id} this round, skipping")
-                    continue
+                decision = agent.decide_next_move(available, talked_to, round_no)
+                if decision["action"] != "talk":
+                    logger.write(pid, f"done talking this round (reason: {decision.get('reason','')[:80]}), "
+                                       f"proceeding to bet")
+                    break
+
+                partner_id = decision["partner"]
+                logger.write(pid, f"chooses to talk to {partner_id} — reason: {decision.get('reason','')[:80]}")
 
                 partner_agent = agents[partner_id]
                 run_dialogue(agent, partner_agent, round_no, logger, base_dir)
+                # run_dialogue() already calls update_dsyn() for BOTH agents
+                # right after the conversation ends — analysis is mandatory,
+                # not something either agent can choose to skip.
 
-                initiated[pid].append(partner_id)
-                initiated[partner_id].append(pid)  # partner also counts it
+                talked_to.append(partner_id)
+                outgoing_used[pid] += 1
+                incoming_used[partner_id] += 1
 
         # ── Phase 2: place bets ────────────────────────────────────────
         for pid in players:
