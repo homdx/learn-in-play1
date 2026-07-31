@@ -18,6 +18,7 @@ import time
 
 import common
 import roles
+import speech_cost
 import transfer_ledger
 from agent_v2 import PlayerAgent, load_balance, save_balance
 from croupier_v2 import run_round
@@ -124,6 +125,10 @@ def settle_pending_results(agents, players, base_dir, round_no, logger,
         if pid in done:
             continue
         agent = agents[pid]
+        # TALK-2: номер рефлексируемого раунда передаём атрибутом, а не
+        # аргументом: reflect_betting подменяется шпионами в существующих
+        # тестах, и смена сигнатуры сломала бы их без всякой пользы.
+        agent.current_round = round_no
         result_path = common.result_file(pid, base_dir)
         if os.path.exists(result_path):
             result = common.read_json(result_path)
@@ -304,6 +309,14 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
     conversation = []
     a_total_sent = 0
     b_total_sent = 0
+    # TALK-1: плата за слова, уходящая казино. Счётчики обнуляются на каждый
+    # диалог: агент должен видеть расход именно этого разговора, иначе
+    # цифра быстро становится фоновой и перестаёт влиять на решение.
+    tariff = getattr(agent_a, "tariff", None) or speech_cost.SpeechTariff()
+    a_speech_cost = 0
+    b_speech_cost = 0
+    agent_a.speech_spent_this_dialogue = 0
+    agent_b.speech_spent_this_dialogue = 0
     # FIX-9: кому осталось сделать один ЗАКРЫВАЮЩИЙ ход после чужого done.
     # Раньше `done` от любой стороны делал безусловный break, и оппонент не
     # получал хода вообще. Тот, кто ДОЛЖЕН заплатить, выигрывал от того, что
@@ -342,10 +355,22 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             logger.write(pid_a, f"transfer of {requested_a} coins DROPPED "
                                 f"(transfer_to={turn_a.get('transfer_to')!r}, expected {pid_b!r})")
 
+        # TALK-1: тариф снимается ПОСЛЕ перевода из этой же реплики — иначе
+        # плата за слова о сделке могла бы съесть монеты, которыми сделка
+        # оплачивается, и тариф ломал бы ровно то поведение, которое должен
+        # поощрять.
+        fee_a = speech_cost.charge(agent_a, turn_a["message"], tariff,
+                                   table_dir, save_balance, logger)
+        a_speech_cost += fee_a["charged"]
+        speech_cost.record(pid_a, table_dir, round_no, pid_b,
+                           fee_a["charged"], fee_a["lines"])
+        agent_a.speech_spent_this_dialogue = a_speech_cost
+
         conversation.append({
             "from": pid_a, "message": turn_a["message"],
             "transfer": transfer_a,
-            "transfer_to": pid_b if transfer_a > 0 else None
+            "transfer_to": pid_b if transfer_a > 0 else None,
+            "speech_cost": fee_a["charged"], "speech_lines": fee_a["lines"]
         })
         logger.write_dialogue(round_no, pid_a, pid_b, turn * 2 + 1,
                                pid_a, turn_a["message"], transfer_a, pid_b if transfer_a > 0 else None)
@@ -379,10 +404,18 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             logger.write(pid_b, f"transfer of {requested_b} coins DROPPED "
                                 f"(transfer_to={turn_b.get('transfer_to')!r}, expected {pid_a!r})")
 
+        fee_b = speech_cost.charge(agent_b, turn_b["message"], tariff,
+                                   table_dir, save_balance, logger)
+        b_speech_cost += fee_b["charged"]
+        speech_cost.record(pid_b, table_dir, round_no, pid_a,
+                           fee_b["charged"], fee_b["lines"])
+        agent_b.speech_spent_this_dialogue = b_speech_cost
+
         conversation.append({
             "from": pid_b, "message": turn_b["message"],
             "transfer": transfer_b,
-            "transfer_to": pid_a if transfer_b > 0 else None
+            "transfer_to": pid_a if transfer_b > 0 else None,
+            "speech_cost": fee_b["charged"], "speech_lines": fee_b["lines"]
         })
         logger.write_dialogue(round_no, pid_a, pid_b, turn * 2 + 2,
                                pid_b, turn_b["message"], transfer_b, pid_a if transfer_b > 0 else None)
@@ -397,7 +430,8 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
     common.write_json(dlg_path, {
         "round": round_no, "pid_a": pid_a, "pid_b": pid_b,
         "conversation": conversation,
-        "a_sent": a_total_sent, "b_sent": b_total_sent
+        "a_sent": a_total_sent, "b_sent": b_total_sent,
+        "a_speech_cost": a_speech_cost, "b_speech_cost": b_speech_cost
     })
 
     # Update dialogue synapses
@@ -410,13 +444,18 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
     agent_a.update_dsyn(pid_b, conversation, net_a, round_no)
     agent_b.update_dsyn(pid_a, conversation, net_b, round_no)
 
+    speech_note = ""
+    if tariff.enabled:
+        speech_note = (f" Speech fees to casino: {pid_a} {a_speech_cost}, "
+                       f"{pid_b} {b_speech_cost}.")
     logger.write_global(
         f"Dialogue {pid_a}↔{pid_b} done. "
         f"{pid_a} sent {a_total_sent}, {pid_b} sent {b_total_sent}. "
-        f"Turns: {len(conversation)}"
+        f"Turns: {len(conversation)}.{speech_note}"
     )
     return {"a_sent": a_total_sent, "b_sent": b_total_sent,
-            "turns": len(conversation), "conversation": conversation}
+            "turns": len(conversation), "conversation": conversation,
+            "a_speech_cost": a_speech_cost, "b_speech_cost": b_speech_cost}
 
 
 # ─────────────────────────────────────────── main ─────────────────────────
@@ -443,6 +482,7 @@ def main():
     # через двадцать раундов и сотню вызовов модели, когда выяснится, что
     # роль не применилась и весь прогон бессмыслен.
     role_assignment = roles.parse_roles(cfg, players)
+    tariff = speech_cost.parse_tariff(cfg)
 
     rounds = args.rounds or cfg.getint("game", "rounds", fallback=10)
     round_delay = cfg.getfloat("game", "round_delay_sec", fallback=0)
@@ -469,10 +509,11 @@ def main():
         )
 
     logger.write_global(role_assignment.summary())
+    logger.write_global(tariff.summary())
 
     agents: dict[str, PlayerAgent] = {
         pid: PlayerAgent(pid, base_dir, cfg, logger=logger,
-                         roles_assignment=role_assignment)
+                         roles_assignment=role_assignment, tariff=tariff)
         for pid in players
     }
 

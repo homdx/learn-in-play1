@@ -19,6 +19,7 @@ from datetime import datetime
 import common
 import promise_ledger
 import roles
+import speech_cost
 import transfer_ledger
 from llm_client import LLMClient, LLMUnavailable
 
@@ -652,7 +653,7 @@ feels promising, and refine it round by round based on what actually works.
 
 class PlayerAgent:
     def __init__(self, player_id, base_dir, cfg, logger=None,
-                 roles_assignment=None):
+                 roles_assignment=None, tariff=None):
         self.player_id = player_id
         self.base_dir = base_dir
         self.cfg = cfg
@@ -714,6 +715,15 @@ class PlayerAgent:
             self.roles = roles.parse_roles(cfg, players)
         self.role           = self.roles.role_of(player_id)
         self.persona_locked = self.roles.is_locked(player_id)
+
+        # TALK-1: тариф на речь. Разбирается тем же способом, что и роли —
+        # агент может создать его сам, чтобы PlayerAgent оставался
+        # конструируемым вне run_game_v2 (тесты, утилиты).
+        self.tariff = (tariff if tariff is not None
+                       else speech_cost.parse_tariff(cfg))
+        # сколько монет игрок уже отдал казино за слова в ТЕКУЩЕМ диалоге;
+        # обнуляется в начале каждого диалога из run_dialogue
+        self.speech_spent_this_dialogue = 0
 
         pf = prompt_file(player_id, base_dir)
         seeded = roles.seed_prompt_file(pf, self.roles, player_id, save_text)
@@ -1113,7 +1123,8 @@ class PlayerAgent:
 
     # ── reflect: update betting synapse ─────────────────────────────────
 
-    def reflect_betting(self, last_entry=None):
+    def reflect_betting(self, last_entry=None, round_no=None):
+        round_no = round_no or getattr(self, "current_round", None)
         notes    = self._compress_betting_synapse_if_needed()
         persona  = self._compress_persona_if_needed()   # FIX-12
         history  = load_history(self.player_id, self.base_dir)
@@ -1142,7 +1153,7 @@ class PlayerAgent:
             # в свою синапсу "Round 35: ..." вместо настоящего номера раунда —
             # ошибка тихо копилась раунд за раундом. Явно называем и подписываем
             # оба числа, чтобы модели было не за что зацепиться для путаницы.
-            round_no = last_entry.get("round_no")
+            round_no = last_entry.get("round_no", round_no)
             round_tag = f"round {round_no}" if round_no is not None else "this round"
             result_line = (
                 f"Result of {round_tag} (note: this is the ROUND number, separate "
@@ -1183,8 +1194,19 @@ class PlayerAgent:
                 f"synapses and the public ledger.\"}}"
             )
 
+        # TALK-2: расход на речь ставится РЯДОМ со ставкой, до синапсы. Без
+        # этой строки рефлексия видела только ставки, и падение баланса от
+        # болтовни списывалось бы на них — игрок стал бы ставить осторожнее
+        # вместо того, чтобы меньше говорить.
+        speech_block = ""
+        if round_no is not None:
+            speech_block = speech_cost.format_reflect_summary(
+                self.player_id, self.base_dir, round_no, self.tariff,
+                bet_amount=(last_entry["bet"]["amount"] if last_entry else None))
+
         user_msg = (
-            result_line +
+            result_line
+            + speech_block +
             f"Current betting synapse:\n{notes or '(empty)'}\n\n"
             f"Round history:\n{hist_text}\n\n"
             + persona_block
@@ -1317,6 +1339,9 @@ class PlayerAgent:
             f"against your own past interactions (deals_done / deals_failed / net transfers) "
             f"before trusting it. A high trust_score should come from actual deals and money "
             f"that changed hands, not from claims made in conversation.\n\n"
+            + self.tariff.move_hint()
+            + speech_cost.format_partner_costs(self.player_id, self.base_dir,
+                                               self.tariff) +
             f"Decide your NEXT move:\n"
             f"  - talk to one specific available player (pick who and why), OR\n"
             f"  - stop talking this round and go place a bet at the casino.\n\n"
@@ -1424,10 +1449,15 @@ class PlayerAgent:
         # against anything — leading to confidently wrong statements like
         # "Black lost" when the player's own ledger entry says it won.
         hist_txt = _format_history(load_history(self.player_id, self.base_dir), 4)
+        # TALK-2: цена КАЖДОЙ реплики прямо в транскрипте. Агрегата в конце
+        # промпта было мало: без цены на каждой строке нельзя заметить, что
+        # "Agreement confirmed and locked" стоило столько же, сколько
+        # содержательное предложение — а именно из этого выводится правило.
         conv_txt = "\n".join(
             f"  {t['from']}: {t['message']}"
             + (f" [sent {t['transfer']} coins to {t['transfer_to']}]"
                if t.get("transfer", 0) > 0 else "")
+            + speech_cost.format_transcript_cost(t, self.tariff)
             for t in conversation
         )
         turns_left = 8 - len(conversation)
@@ -1505,8 +1535,9 @@ class PlayerAgent:
             # был, а реестр обещаний нет. Асимметрия исправлена.
             + promise_ledger.due_reminder(self.player_id, self.base_dir, round_no)
             + transfer_ledger.format_recent(self.player_id, self.base_dir,
-                                             partner=partner_id) +
-            f"Your balance: {self.balance}. Max transfer: {self.balance} coins.\n\n"
+                                             partner=partner_id)
+            + self.tariff.status_text(self.speech_spent_this_dialogue, self.balance)
+            + f"Your balance: {self.balance}. Max transfer: {self.balance} coins.\n\n"
             f"Note: 'transfer' only lets YOU send coins to {partner_id}. If you want THEM "
             f"to pay you, say so in your message and wait for their turn — do not send "
             f"coins yourself when you meant to ask for payment.\n\n"
@@ -1526,7 +1557,8 @@ class PlayerAgent:
         )
         try:
             resp = self.client.chat_json(
-                system=self.abstract_prompt + f"\nTASK: Dialogue turn with {partner_id}. Be concrete, no filler, no repetition.",
+                system=self.abstract_prompt + self.tariff.rule_text()
+                       + f"\nTASK: Dialogue turn with {partner_id}. Be concrete, no filler, no repetition.",
                 user=user_msg, temperature=0.8, max_tokens=self.tok_dialogue
             )
             try:
