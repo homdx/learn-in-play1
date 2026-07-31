@@ -1417,6 +1417,13 @@ class PlayerAgent:
                                            self.deals_shown, self.fails_shown)
         score_txt = _format_scoreboard(load_public_ledger(self.base_dir),
                                        exclude_pid=self.player_id)
+        # FIX: dialogue_turn was the only prompt-building path that never
+        # showed the agent its OWN recent round outcomes (decide_next_move
+        # and plan_round both already do). Without it, a player mid-dialogue
+        # has no way to fact-check its own claims about its own last result
+        # against anything — leading to confidently wrong statements like
+        # "Black lost" when the player's own ledger entry says it won.
+        hist_txt = _format_history(load_history(self.player_id, self.base_dir), 4)
         conv_txt = "\n".join(
             f"  {t['from']}: {t['message']}"
             + (f" [sent {t['transfer']} coins to {t['transfer_to']}]"
@@ -1488,6 +1495,9 @@ class PlayerAgent:
             f"Casino scoreboard — VERIFIED totals from the public ledger. If "
             f"{partner_id} describes their own results, check them here before "
             f"paying for anything:\n{score_txt}\n\n"
+            f"Your own recent rounds (fact-check any claim you or {partner_id} "
+            f"make about YOUR results against this — do not rely on memory or "
+            f"guesswork about what you won or lost):\n{hist_txt}\n\n"
             f"Conversation so far:\n{conv_txt or '(just started)'}\n\n"
             + _dialogue_running_totals(conversation, self.player_id, partner_id)
             # FIX-20b: раньше due_reminder стоял ТОЛЬКО в plan_round, хотя

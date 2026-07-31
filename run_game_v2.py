@@ -30,7 +30,7 @@ MAX_DIALOGUE_TURNS = 4
 # either as the one who initiates (outgoing) or as the one being talked to
 # (incoming). Tracked separately so a popular target doesn't accidentally
 # eat into its own budget for initiating conversations.
-MAX_DIALOGUES_PER_PLAYER = 3
+MAX_DIALOGUES_PER_PLAYER = 2
 
 
 def load_config(path):
