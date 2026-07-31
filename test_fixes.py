@@ -2133,8 +2133,8 @@ class _BailoutAgent:
 
 
 class _BailoutLog:
-    """Заглушка GameLogger: копит строки, чтобы проверить, что
-    эмиссия попала и в общий лог, и в персональный."""
+    """Заглушка GameLogger: копит строки, чтобы проверить, что начисление
+    попало и в общий лог, и в персональный лог получателя."""
 
     def __init__(self):
         self.lines = []
@@ -2150,90 +2150,125 @@ class _BailoutLog:
 
 
 class TestBailout(unittest.TestCase):
-    """Разовая эмиссия при затяжном нуле."""
+    """Докапитализация банкрота и публичное объявление о ней."""
+
+    PLAYERS = ["player1", "player2", "player3"]
 
     def setUp(self):
         self.table = tempfile.mkdtemp()
         self.cfg = configparser.ConfigParser()
         self.cfg.read_dict({"game": {"bailout_enabled": "true",
                                      "bailout_zero_rounds": "2",
-                                     "bailout_amount": "20"}})
-        self.players = ["player1", "player2"]
-        self.agents = {p: _BailoutAgent() for p in self.players}
+                                     "bailout_amount": "20",
+                                     "bailout_all_players": "false"}})
+        self.agents = {p: _BailoutAgent() for p in self.PLAYERS}
         self.log = _BailoutLog()
 
-    def _bal(self, pid, v):
-        common.write_json(common.balance_file(pid, self.table), {"balance": v})
+    def _bal(self, pid, value):
+        common.write_json(common.balance_file(pid, self.table), {"balance": value})
+
+    def _balances(self):
+        return run_game_v2.get_balances(self.table, self.PLAYERS)
 
     def _run(self, round_no):
         run_game_v2.apply_bailout_if_needed(
-            self.agents, self.players, self.table, round_no, self.cfg, self.log)
+            self.agents, self.PLAYERS, self.table, round_no, self.cfg, self.log)
+
+    def _setup(self, **balances):
+        for pid in self.PLAYERS:
+            self._bal(pid, balances.get(pid, 50))
 
     def test_fires_only_after_more_than_two_zero_rounds(self):
-        self._bal("player1", 0)
-        self._bal("player2", 50)
+        self._setup(player2=0)
         for r in (1, 2):
             self._run(r)
-            self.assertEqual(
-                run_game_v2.get_balances(self.table, self.players),
-                {"player1": 0, "player2": 50},
-                "эмиссия сработала раньше третьего нулевого раунда")
+            self.assertEqual(self._balances()["player2"], 0,
+                             "начислено раньше третьего нулевого раунда")
         self._run(3)
-        self.assertEqual(
-            run_game_v2.get_balances(self.table, self.players),
-            {"player1": 20, "player2": 70},
-            "+20 не начислены ВСЕМ на третьем нулевом раунде")
-        self.assertEqual(self.agents["player2"].balance, 70,
+        self.assertEqual(self._balances()["player2"], 20,
+                         "+20 не начислены банкроту на третьем нулевом раунде")
+
+    def test_only_the_bankrupt_gets_paid_by_default(self):
+        self._setup(player2=0)
+        for r in (1, 2, 3):
+            self._run(r)
+        self.assertEqual(self._balances(),
+                         {"player1": 50, "player2": 20, "player3": 50},
+                         "деньги получил кто-то кроме банкрота")
+        self.assertEqual(self.agents["player1"].balance, 0,
+                         "баланс не-получателя трогать нельзя")
+        self.assertEqual(self.agents["player2"].balance, 20,
                          "баланс агента в памяти разошёлся с диском")
 
-    def test_not_applied_twice_after_restart(self):
-        self._bal("player1", 0)
-        self._bal("player2", 50)
+    def test_all_players_mode(self):
+        self.cfg["game"]["bailout_all_players"] = "true"
+        self._setup(player2=0)
         for r in (1, 2, 3):
             self._run(r)
-        self._run(3)            # рестарт внутри того же раунда
-        self.assertEqual(
-            run_game_v2.get_balances(self.table, self.players),
-            {"player1": 20, "player2": 70},
-            "повторный проход раунда начислил эмиссию второй раз")
+        self.assertEqual(self._balances(),
+                         {"player1": 70, "player2": 20, "player3": 70},
+                         "режим bailout_all_players не начислил всем")
+        self.assertIn("EVERY player", common.bailout_notice(self.table, 3))
+
+    def test_not_applied_twice_after_restart(self):
+        self._setup(player2=0)
+        for r in (1, 2, 3):
+            self._run(r)
+        self._run(3)                      # рестарт внутри того же раунда
+        self.assertEqual(self._balances()["player2"], 20,
+                         "повторный проход раунда начислил второй раз")
 
     def test_streak_resets_after_payout(self):
-        self._bal("player1", 0)
-        self._bal("player2", 50)
+        self._setup(player2=0)
         for r in (1, 2, 3):
             self._run(r)
-        self._bal("player1", 0)          # снова разорился
+        self._bal("player2", 0)           # снова разорился
         for r in (4, 5):
             self._run(r)
-        self.assertEqual(run_game_v2.get_balances(self.table, self.players)["player1"], 0,
+        self.assertEqual(self._balances()["player2"], 0,
                          "счётчик нулей не обнулился после выплаты")
         self._run(6)
-        self.assertEqual(run_game_v2.get_balances(self.table, self.players)["player1"], 20)
+        self.assertEqual(self._balances()["player2"], 20)
 
-    def test_notice_is_one_off_and_logged(self):
-        self._bal("player1", 0)
-        self._bal("player2", 50)
+    def test_several_bankrupts_are_all_named_with_balances(self):
+        self._setup(player1=0, player3=0)
         for r in (1, 2, 3):
             self._run(r)
-        self.assertIn("+20", common.bailout_notice(self.table, 3))
-        self.assertIn("player1", common.bailout_notice(self.table, 3))
+        notice = common.bailout_notice(self.table, 3)
+        self.assertIn("player1", notice)
+        self.assertIn("player3", notice)
+        self.assertIn("player1 = 20 coin(s)", notice)
+        self.assertIn("player3 = 20 coin(s)", notice)
+        self.assertNotIn("player2 =", notice,
+                         "в объявление попал не-банкрот")
+        self.assertEqual(self._balances(),
+                         {"player1": 20, "player2": 50, "player3": 20})
+
+    def test_notice_is_one_off_and_logged(self):
+        self._setup(player2=0)
+        for r in (1, 2, 3):
+            self._run(r)
+        notice = common.bailout_notice(self.table, 3)
+        self.assertIn("+20", notice)
+        self.assertIn("player2", notice)
+        self.assertIn("player2 = 20 coin(s)", notice)
         self.assertEqual(common.bailout_notice(self.table, 4), "",
                          "объявление должно быть разовым")
         self.assertEqual(common.bailout_notice(self.table, 2), "")
-        self.assertTrue(any("BAILOUT" in m for _, m in self.log.lines),
-                        "эмиссия не попала в лог/консоль")
+        self.assertTrue(any(pid == "GAME" and "BAILOUT" in m
+                            for pid, m in self.log.lines),
+                        "начисление не попало в общий лог/консоль")
         self.assertTrue(any(pid == "player2" and "BAILOUT" in m
                             for pid, m in self.log.lines),
-                        "нет персональной строки в логе игрока")
+                        "нет строки в персональном логе банкрота")
 
     def test_disabled_by_config(self):
         self.cfg["game"]["bailout_enabled"] = "false"
-        self._bal("player1", 0)
-        self._bal("player2", 50)
+        self._setup(player2=0)
         for r in (1, 2, 3, 4):
             self._run(r)
-        self.assertEqual(run_game_v2.get_balances(self.table, self.players),
-                         {"player1": 0, "player2": 50})
+        self.assertEqual(self._balances()["player2"], 0)
+        self.assertEqual(common.bailout_notice(self.table, 3), "")
 
     def test_notice_reaches_every_prompt(self):
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)),

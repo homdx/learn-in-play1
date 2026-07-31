@@ -184,13 +184,14 @@ def read_json(path):
 
 
 # ---------------------------------------------------------------------------
-# Разовая эмиссия ("bailout"): если хотя бы один игрок сидит на нуле дольше
-# чем N раундов подряд, казино зачисляет ВСЕМ игрокам одинаковую сумму.
-# Состояние живёт в table/bailout_state.json:
+# Докапитализация банкрота ("bailout"): если игрок сидит на нуле дольше чем N
+# раундов подряд, казино зачисляет монеты — либо только ему, либо всем
+# (см. bailout_all_players в config_v2.ini). Состояние в bailout_state.json:
 #   zero_streak   — {player_id: сколько раундов подряд баланс <= 0}
 #   counted_round — раунд, для которого серии уже пересчитаны (защита от
 #                   повторного начисления при рестарте после Ctrl+C)
-#   last          — последняя эмиссия: раунд, сумма, из-за кого сработала
+#   last          — последнее начисление: раунд, сумма, кто банкрот, кому
+#                   начислено и какой у банкротов баланс ПОСЛЕ начисления
 # ---------------------------------------------------------------------------
 
 def bailout_state_file(base_dir=None):
@@ -214,37 +215,63 @@ def save_bailout_state(base_dir, state):
 
 def bailout_notice(base_dir, round_no) -> str:
     """
-    Объявление об эмиссии для промптов — РАЗОВО, только в том раунде, в
-    котором она действительно произошла (в следующем раунде строка снова
-    пустая, начисление уже растворилось в балансе).
+    Публичное объявление о банкротстве и начислении — РАЗОВО, только в том
+    раунде, в котором оно произошло (в следующем раунде строка снова пустая:
+    деньги уже растворились в балансе).
 
     Тот же приём, что и в _current_round_notice(): конкретный факт про ЭТОТ
-    раунд, поставленный вплотную к данным, вместо абзаца в правилах. Без
-    него +20 монет появляются у всех из ниоткуда посреди раунда, и агент,
-    который весь прошлый раунд требовал с кого-то долг, с высокой
-    вероятностью запишет эмиссию себе как «мне вернули» — а плательщик
-    честно скажет, что ничего не отправлял. Поэтому здесь прямо сказано,
-    что деньги пришли ОТ КАЗИНО, всем поровну, и не являются ни платежом,
-    ни возвратом долга.
+    раунд вплотную к данным, а не абзац в правилах. Здесь он нужен дважды:
+
+    1. Чужой баланс НИГДЕ больше не публикуется (скорборд намеренно его не
+       показывает, чтобы не выдавать исход приватных сделок). Без этой
+       строки о разорении соседа не знает никто, и «помочь банкроту» —
+       решение, которое некому принять.
+    2. Монеты появляются у игрока из ниоткуда посреди раунда. Агент,
+       который в прошлом раунде требовал долг, с высокой вероятностью
+       запишет их как «мне вернули», а плательщик честно скажет, что
+       ничего не слал. Поэтому прямо сказано: деньги ОТ КАЗИНО, это не
+       перевод, не возврат и не выполненное обещание.
     """
     if round_no is None:
         return ""
     last = load_bailout_state(base_dir).get("last") or {}
     if last.get("round_no") != round_no:
         return ""
-    who = ", ".join(last.get("triggered_by") or []) or "at least one player"
+
+    amount   = last.get("amount", 0)
+    bankrupt = last.get("bankrupt") or []
+    after    = last.get("balances_after") or {}
+    zr       = last.get("zero_rounds")
+    to_all   = bool(last.get("all_players"))
+
+    who     = ", ".join(bankrupt) or "at least one player"
+    verb    = "has" if len(bankrupt) == 1 else "have"
+    bal_txt = ", ".join(f"{pid} = {after.get(pid, 0)} coin(s)" for pid in bankrupt)
+
+    if to_all:
+        payout = (
+            f"The house has credited EVERY player at this table, including you, "
+            f"with +{amount} coin(s) — the same amount for everyone, nobody was "
+            f"favoured. "
+        )
+    else:
+        payout = (
+            f"The house has credited {who} with +{amount} coin(s). NOBODY ELSE "
+            f"received anything: your own balance was not changed by this. "
+        )
+
     return (
-        f"HOUSE ANNOUNCEMENT — round {round_no}: the casino has just credited "
-        f"EVERY player, including you, with +{last.get('amount', 0)} coin(s). "
-        f"Reason: {who} had a zero balance for more than "
-        f"{last.get('zero_rounds')} consecutive round(s), so the house topped "
-        f"everyone up by the same amount. This is a ONE-OFF payment for round "
-        f"{round_no} only, announced once, and it was IDENTICAL for everyone — "
-        f"nobody was favoured and nobody paid for it. It did NOT come from "
-        f"another player: it is not a gift, not a loan, not a repayment of any "
-        f"debt. Do not treat it as a debt you now owe, do not thank or bill "
-        f"anyone for it, and do not count it as anyone keeping a promise. Your "
-        f"balance quoted below already includes it.\n"
+        f"HOUSE ANNOUNCEMENT — round {round_no}, announced to EVERY player at "
+        f"this table: {who} went bankrupt ({verb} had a zero balance for more "
+        f"than {zr} consecutive round(s)). {payout}"
+        f"Balance of the bankrupt player(s) immediately after the credit: "
+        f"{bal_txt or '(unknown)'}. This money came FROM THE HOUSE — it is not "
+        f"a gift, not a loan and not a repayment from any player, so do not "
+        f"record it as a debt, do not thank or bill anyone for it, and do not "
+        f"count it as anyone keeping a promise. Every player sees this same "
+        f"announcement in round {round_no}, so it is not information you could "
+        f"sell as news. What you do about it is your own decision: help them, "
+        f"ignore it, or use it.\n"
     )
 
 def write_json(path, data):

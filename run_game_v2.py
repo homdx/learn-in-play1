@@ -220,29 +220,24 @@ def get_balances(base_dir, players):
 
 def apply_bailout_if_needed(agents, players, base_dir, round_no, cfg, logger):
     """
-    Разовая эмиссия. Считает серии нулевых балансов и, если у хотя бы
-    одного игрока серия стала БОЛЬШЕ `bailout_zero_rounds`, зачисляет
-    `bailout_amount` монет ВСЕМ игрокам поровну.
+    Докапитализация банкрота. Считает серии нулевых балансов и, если у игрока
+    серия стала БОЛЬШЕ `bailout_zero_rounds`, зачисляет `bailout_amount`
+    монет: только банкроту (по умолчанию) или всем, если включён
+    `bailout_all_players`.
 
-    Зачем всем, а не банкроту: точечная докапитализация одного игрока
-    ломает единственный проверяемый факт в игре — публичный журнал. Все
-    остальные видят, что у него из ниоткуда появились деньги, и любая его
-    ложь про «мне вернули долг» становится неопровержимой. Одинаковое
-    начисление всем такого зазора не создаёт, а объявление в промпте
-    (common.bailout_notice) закрывает его окончательно.
-
-    Вызывается ПОСЛЕ Фазы 0 — балансы прошлого раунда к этому моменту уже
-    начислены, — и ДО фазы диалогов, чтобы деньги были на руках у всех до
-    первого разговора.
+    Вызывается ПОСЛЕ Фазы 0 — выплаты прошлого раунда к этому моменту уже
+    начислены, — и ДО фазы диалогов, чтобы деньги были на руках до первого
+    разговора, а объявление легло в промпты того же раунда.
 
     Идемпотентность: counted_round помнит, за какой раунд серии уже
-    пересчитаны, поэтому обрыв внутри раунда и повторный запуск не
-    начислят вторую порцию.
+    пересчитаны, поэтому обрыв внутри раунда и повторный запуск не начислят
+    вторую порцию.
     """
     if not cfg.getboolean("game", "bailout_enabled", fallback=True):
         return
     zero_rounds = cfg.getint("game", "bailout_zero_rounds", fallback=2)
     amount      = cfg.getint("game", "bailout_amount",      fallback=20)
+    to_all      = cfg.getboolean("game", "bailout_all_players", fallback=False)
 
     state = common.load_bailout_state(base_dir)
     if state["counted_round"] == round_no:
@@ -260,24 +255,33 @@ def apply_bailout_if_needed(agents, players, base_dir, round_no, cfg, logger):
             streak[pid] = 0
 
     if broke:
+        recipients = list(players) if to_all else list(broke)
         detail = ", ".join(f"{pid} ({streak[pid]} round(s) at zero)" for pid in broke)
+        scope  = "EVERY player" if to_all else "the bankrupt player(s) only"
         logger.write_global(
-            f"BAILOUT: {detail} — house credits +{amount} coin(s) to EVERY "
-            f"player for round {round_no}."
+            f"BAILOUT: bankrupt — {detail}. House credits +{amount} coin(s) to "
+            f"{scope} for round {round_no}."
         )
-        for pid in players:
+        after = {}
+        for pid in recipients:
             new_balance = balances.get(pid, 0) + amount
             agents[pid].balance = new_balance
             save_balance(pid, base_dir, new_balance)
             logger.write(pid, f"BAILOUT +{amount} coins (balance "
                               f"{balances.get(pid, 0)} → {new_balance})")
+            # серия обнуляется только тому, кто реально получил деньги
+            streak[pid] = 0
+            after[pid] = new_balance
         logger.write_balances(get_balances(base_dir, players))
-        streak = {pid: 0 for pid in players}      # серия обнуляется всем
         state["last"] = {
             "round_no": round_no,
             "amount": amount,
-            "triggered_by": broke,
+            "bankrupt": broke,
+            "recipients": recipients,
+            "balances_after": {pid: after.get(pid, balances.get(pid, 0))
+                               for pid in broke},
             "zero_rounds": zero_rounds,
+            "all_players": to_all,
         }
 
     state["zero_streak"]   = streak
@@ -480,7 +484,7 @@ def main():
                                checkpoint_round=round_no)
         clear_phase0_state(base_dir)   # FIX-15: фаза 0 пройдена целиком
 
-        # ── Phase 0b: разовая эмиссия при затяжном нуле ────────────────
+        # ── Phase 0b: докапитализация банкрота + объявление ────────────
         apply_bailout_if_needed(agents, players, base_dir, round_no,
                                 cfg, logger)
 
