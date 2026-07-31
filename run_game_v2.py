@@ -19,6 +19,7 @@ import time
 import common
 from agent_v2 import PlayerAgent, load_balance, save_balance
 from croupier_v2 import run_round
+from llm_client import LLMClient, LLMUnavailable
 from game_logger import GameLogger
 
 
@@ -93,7 +94,7 @@ def clear_dialogue_phase_state(base_dir):
 
 
 def settle_pending_results(agents, players, base_dir, round_no, logger,
-                           reflect=True):
+                           reflect=True, checkpoint_round=None):
     """
     FIX-2: применяет все НЕОБРАБОТАННЫЕ result_<pid>.json (их пишет крупье
     в конце раунда) — начисляет выплату, дописывает историю и публичный
@@ -109,7 +110,17 @@ def settle_pending_results(agents, players, base_dir, round_no, logger,
     Возвращает число применённых результатов.
     """
     applied = 0
+    # FIX-15: чекпойнт фазы. checkpoint_round=None → не сохранять (финальный
+    # расчёт после конца игры, повторять его нечему).
+    done = load_phase0_done(base_dir, checkpoint_round) if checkpoint_round else set()
+    if done:
+        logger.write_global(
+            f"Phase 0 of round {checkpoint_round}: skipping {len(done)} player(s) "
+            f"who already reflected before the restart ({', '.join(sorted(done))})."
+        )
     for pid in players:
+        if pid in done:
+            continue
         agent = agents[pid]
         result_path = common.result_file(pid, base_dir)
         if os.path.exists(result_path):
@@ -122,7 +133,77 @@ def settle_pending_results(agents, players, base_dir, round_no, logger,
         elif reflect and round_no >= 1:
             logger.write(pid, "no bet result for last round — reflecting anyway")
             agent.reflect_betting(None)
+        # игрок полностью обработан — фиксируем на диске сразу, чтобы
+        # следующий обрыв не заставил его рефлексировать повторно
+        if checkpoint_round:
+            done.add(pid)
+            save_phase0_done(base_dir, checkpoint_round, done)
     return applied
+
+
+def round_player_order(players: list, round_no: int) -> list:
+    """
+    FIX-10: порядок хода в фазе диалогов, сдвигаемый на одного каждый раунд.
+
+    Раунд 1 начинает player1, раунд 2 — player2, ... раунд 5 — player5,
+    раунд 6 — снова player1. Порядок остальных сохраняется циклически:
+
+        round 1: p1 p2 p3 p4 p5
+        round 2: p2 p3 p4 p5 p1
+        round 5: p5 p1 p2 p3 p4
+        round 6: p1 p2 p3 p4 p5
+
+    Зачем: список чужих диалогов (`dialogues_this_round`) наполняется ПО ХОДУ
+    фазы, поэтому первый игрок видит его пустым, а последний — целиком. При
+    фиксированном порядке player1 не видел ни одного чужого разговора НИ РАЗУ
+    за всю партию и каждый раунд тратил свои диалоги вслепую, тогда как
+    последний в списке всегда ходил с полной картиной. Это систематическое
+    преимущество позиции, а не шум: оно смешивалось бы с результатом при
+    любой попытке сравнить, чья персона оказалась удачнее.
+
+    Ротация детерминирована и зависит только от round_no, поэтому порядок
+    пересчитывается один в один при восстановлении после Ctrl+C (в
+    dialogue_phase_state.json хранится индекс в ЭТОМ порядке).
+    """
+    if not players:
+        return []
+    offset = (round_no - 1) % len(players)
+    return players[offset:] + players[:offset]
+
+
+def phase0_state_file(base_dir):
+    return os.path.join(base_dir, "phase0_state.json")
+
+
+def load_phase0_done(base_dir, round_no):
+    """
+    FIX-15: кто уже отрефлексировал в Фазе 0 этого раунда.
+
+    Раньше чекпойнт был только у фазы диалогов, поэтому любой обрыв внутри
+    раунда заставлял всех игроков рефлексировать заново. В реальном прогоне
+    раунд 2 запускался трижды из-за HTTP 504, и персон было переписано 14
+    штук за два с половиной раунда — у одного игрока персона одного и того
+    же раунда переписана дважды и оба раза длиннее. Это не только лишние
+    пять вызовов LLM на каждый обрыв, но и лишний дрейф личности агента.
+    """
+    path = phase0_state_file(base_dir)
+    if not os.path.exists(path):
+        return set()
+    data = common.read_json(path)
+    if data.get("round_no") != round_no:
+        return set()
+    return set(data.get("done", []))
+
+
+def save_phase0_done(base_dir, round_no, done):
+    common.write_json(phase0_state_file(base_dir),
+                      {"round_no": round_no, "done": sorted(done)})
+
+
+def clear_phase0_state(base_dir):
+    path = phase0_state_file(base_dir)
+    if os.path.exists(path):
+        os.remove(path)
 
 
 def get_balances(base_dir, players):
@@ -150,19 +231,25 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
     conversation = []
     a_total_sent = 0
     b_total_sent = 0
-    done = False
+    # FIX-9: кому осталось сделать один ЗАКРЫВАЮЩИЙ ход после чужого done.
+    # Раньше `done` от любой стороны делал безусловный break, и оппонент не
+    # получал хода вообще. Тот, кто ДОЛЖЕН заплатить, выигрывал от того, что
+    # первым скажет "done": реплика "Deal, I agree" с done=true закрывала
+    # согласованную сделку в ноль монет. Теперь оппоненту даётся ровно один
+    # закрывающий ход — попрощаться или доплатить по уже согласованному,
+    # но не начать новый торг (см. closing_turn в dialogue_turn).
+    closing_for = None
 
     for turn in range(MAX_DIALOGUE_TURNS):
-        if done:
-            break
-
         # Agent A's turn
+        a_is_closing = (closing_for == pid_a)
         turn_a = agent_a.dialogue_turn(
             partner_id=pid_b,
             partner_balance=agent_b.balance,
             conversation=conversation,
             round_no=round_no,
-            is_initiator=(turn == 0)
+            is_initiator=(turn == 0),
+            closing_turn=a_is_closing
         )
         # FIX-1: только ФАКТИЧЕСКИ проведённый перевод попадает в лог,
         # в conversation и в диалоговую синапсу. Раньше запись делалась
@@ -190,17 +277,20 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
         logger.write_dialogue(round_no, pid_a, pid_b, turn * 2 + 1,
                                pid_a, turn_a["message"], transfer_a, pid_b if transfer_a > 0 else None)
 
+        if a_is_closing:
+            break                       # закрывающий ход A отыгран — конец
         if turn_a.get("done"):
-            done = True
-            break
+            closing_for = pid_b         # B получает один закрывающий ход
 
         # Agent B's turn
+        b_is_closing = (closing_for == pid_b)
         turn_b = agent_b.dialogue_turn(
             partner_id=pid_a,
             partner_balance=agent_a.balance,
             conversation=conversation,
             round_no=round_no,
-            is_initiator=False
+            is_initiator=False,
+            closing_turn=b_is_closing
         )
         # FIX-1 (симметрично для B)
         requested_b = min(turn_b["transfer"], agent_b.balance)
@@ -224,8 +314,10 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
         logger.write_dialogue(round_no, pid_a, pid_b, turn * 2 + 2,
                                pid_b, turn_b["message"], transfer_b, pid_a if transfer_b > 0 else None)
 
+        if b_is_closing:
+            break                       # закрывающий ход B отыгран — конец
         if turn_b.get("done"):
-            done = True
+            closing_for = pid_a         # A получает закрывающий ход
 
     # Save dialogue log
     dlg_path = os.path.join(table_dir, f"dlg_r{round_no:03d}_{pid_a}_{pid_b}.json")
@@ -246,7 +338,8 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
         f"{pid_a} sent {a_total_sent}, {pid_b} sent {b_total_sent}. "
         f"Turns: {len(conversation)}"
     )
-    return {"a_sent": a_total_sent, "b_sent": b_total_sent, "turns": len(conversation)}
+    return {"a_sent": a_total_sent, "b_sent": b_total_sent,
+            "turns": len(conversation), "conversation": conversation}
 
 
 # ─────────────────────────────────────────── main ─────────────────────────
@@ -270,6 +363,13 @@ def main():
     rounds = args.rounds or cfg.getint("game", "rounds", fallback=10)
     round_delay = cfg.getfloat("game", "round_delay_sec", fallback=0)
 
+    # FIX-17: порог выключателя из конфига
+    LLMClient.configure_breaker(cfg.getint("api", "max_consecutive_failures",
+                                           fallback=6))
+    use_checklist = cfg.getboolean("game", "use_checklist", fallback=True)
+    checklist_after_each_dialogue = cfg.getboolean(
+        "game", "checklist_after_each_dialogue", fallback=True)
+
     logger = GameLogger(logs_dir)
 
     last_done = load_last_round(base_dir)
@@ -290,13 +390,23 @@ def main():
     }
 
     for round_no in range(start_round, rounds + 1):
+      # FIX-17: раунд целиком под выключателем. Если сервер моделей лёг,
+      # раунд ОБРЫВАЕТСЯ и НЕ сохраняется — раньше игра доигрывала его на
+      # аварийных заглушках и шла дальше как ни в чём не бывало: в реальном
+      # прогоне два раунда сгорели за одну секунду, оставив по пять
+      # фиктивных ставок в 1 монету, и партия объявила себя законченной.
+      # Чекпойнты Фазы 0 и фазы диалогов позволяют доиграть его после
+      # починки сервера, ничего не потеряв.
+      try:
         logger.write_round_header(round_no, rounds)
 
         # ── Phase 0: apply last round results + reflect ────────────────
         # результат относится к ПРЕДЫДУЩЕМУ раунду (записан крупье
         # в конце round_no - 1), а не к текущему round_no
         settle_pending_results(agents, players, base_dir, round_no - 1, logger,
-                               reflect=(round_no > start_round or last_done > 0))
+                               reflect=(round_no > start_round or last_done > 0),
+                               checkpoint_round=round_no)
+        clear_phase0_state(base_dir)   # FIX-15: фаза 0 пройдена целиком
 
         # ── Phase 1: dialogue phase (iterative) ─────────────────────────
         # Each player, in turn, repeatedly decides: talk to a specific
@@ -315,6 +425,14 @@ def main():
         # о разговоре, свидетелем которого ты не был
         dialogues_this_round: list[tuple] = []
 
+        # FIX-10: порядок хода сдвигается на одного каждый раунд, чтобы
+        # позиция «ходит первым вслепую» / «ходит последним со всей
+        # картиной» доставалась каждому поровну.
+        round_order = round_player_order(players, round_no)
+        logger.write_global(
+            f"Dialogue order for round {round_no}: {' → '.join(round_order)}"
+        )
+
         # ── восстановление прогресса диалогов после Ctrl+C ──────────────
         # Диалог, прерванный посреди себя, никогда не попадал в
         # dialogues_this_round (он сохраняется только ПОСЛЕ завершения
@@ -331,12 +449,12 @@ def main():
             dialogues_this_round = [tuple(p) for p in phase_state["dialogues_this_round"]]
             logger.write_global(
                 f"Resuming dialogue phase of round {round_no} from player "
-                f"index {start_player_index} ({players[start_player_index]}); "
+                f"index {start_player_index} ({round_order[start_player_index]}); "
                 f"{len(dialogues_this_round)} dialogue(s) already completed this round."
             )
 
-        for player_index in range(start_player_index, len(players)):
-            pid = players[player_index]
+        for player_index in range(start_player_index, len(round_order)):
+            pid = round_order[player_index]
             agent = agents[pid]
             # только для того игрока, на котором нас прервали, продолжаем
             # с его уже накопленным talked_to; для всех следующих — с нуля
@@ -352,6 +470,16 @@ def main():
                 base_dir, round_no, player_index, talked_to,
                 incoming_used, outgoing_used, dialogues_this_round
             )
+
+            # FIX-19: планирование ПЕРЕД диалогами этого игрока. Ставим здесь,
+            # а не в начале всей фазы, чтобы агент видел уже состоявшиеся
+            # чужие разговоры этого раунда — та же информация, что и при
+            # выборе собеседника, но у него есть шанс записать намерение
+            # прежде, чем начнёт действовать.
+            if use_checklist:
+                avail = [p for p in players
+                         if p != pid and incoming_used[p] < MAX_DIALOGUES_PER_PLAYER]
+                agents[pid].plan_round(round_no, avail)
 
             while True:
                 if outgoing_used[pid] >= MAX_DIALOGUES_PER_PLAYER:
@@ -390,6 +518,19 @@ def main():
                 had_transfer = (dlg_summary["a_sent"] > 0 or dlg_summary["b_sent"] > 0)
                 dialogues_this_round.append((pid, partner_id, had_transfer))
 
+                # FIX-19: обновление чек-листа у ОБЕИХ сторон, пока разговор
+                # свеж. Отдельно от update_dsyn: та пишет долгосрочную
+                # репутацию, эта — конкретные обязательства и что стребовать.
+                if use_checklist and checklist_after_each_dialogue:
+                    conv   = dlg_summary["conversation"]
+                    a_sent = dlg_summary["a_sent"]
+                    b_sent = dlg_summary["b_sent"]
+                    # pid — инициатор (сторона A), partner_id — сторона B
+                    agents[pid].update_checklist(partner_id, conv,
+                                                 b_sent - a_sent, round_no)
+                    agents[partner_id].update_checklist(pid, conv,
+                                                        a_sent - b_sent, round_no)
+
                 # диалог полностью завершён — сохраняем прогресс НА ДИСК.
                 # Если сейчас нажать Ctrl+C, при рестарте этот диалог не
                 # повторится, а следующий (ещё не начатый) начнётся с нуля.
@@ -413,7 +554,7 @@ def main():
                 logger.write(pid, "balance is 0, cannot bet.")
                 continue
 
-            bet = agent.decide_bet()
+            bet = agent.decide_bet(round_no)
             # FIX-3: сначала файл ставки, потом списание. Обрыв между двумя
             # операциями раньше означал "деньги списаны, ставки нет" —
             # чистая потеря. Теперь худший случай обратный: ставка есть,
@@ -445,6 +586,18 @@ def main():
 
         if round_delay:
             time.sleep(round_delay)
+
+      except LLMUnavailable as e:
+        logger.write_global(f"!!! LLM UNAVAILABLE during round {round_no}: {e}")
+        logger.write_global(
+            f"Round {round_no} aborted and NOT recorded. Fix the model server "
+            f"and re-run with the same --rounds: the game resumes from round "
+            f"{round_no}, and Phase 0 / dialogue checkpoints preserve the work "
+            f"already done in it."
+        )
+        logger.write_balances(get_balances(base_dir, players))
+        logger.close()
+        raise SystemExit(2)
 
     # FIX-2: последний раунд крупье уже разыграл, но Фазы 0 следующего
     # раунда не будет — начисляем выплаты здесь, иначе выигрыш последнего

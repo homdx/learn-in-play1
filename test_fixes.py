@@ -21,6 +21,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import common
 import llm_client
+from llm_client import LLMClient as RealLLMClient
+try:
+    from llm_client import LLMUnavailable
+except ImportError:                      # старый код: выключателя ещё нет
+    class LLMUnavailable(RuntimeError):
+        pass
 import agent_v2
 import run_game_v2
 from agent_v2 import PlayerAgent
@@ -492,6 +498,1113 @@ class TestMoneyConservation(GameHarness):
         self.run_game(rounds=3, seed=3)
         for pid, bal in self.balances().items():
             self.assertGreaterEqual(bal, 0, f"{pid} ушёл в минус: {bal}")
+
+
+
+
+# ───────────── FIX-8/FIX-9: дедлайн и закрывающий ход ─────────────────────
+
+class TestDeadlineAndClosingTurn(GameHarness):
+
+    def _hint(self, is_initiator, turns_left=2):
+        """Воспроизводит ветку role_hint для turns_left<=2."""
+        return (
+            ("You initiated this." if is_initiator else "They contacted you.")
+            + f" Only {turns_left} message(s) left in this conversation — "
+        )
+
+    def test_initiator_also_gets_the_deadline_warning(self):
+        """
+        FIX-8: соседние строковые литералы склеивались раньше тернарника,
+        поэтому инициатор получал только "You initiated this." без всякого
+        предупреждения о дедлайне — а он говорит на 1/3/5/7-м сообщениях.
+        """
+        seen = []
+        cfg = make_cfg(self.table, self.logs, 1)
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table, cfg)
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.0, max_tokens=0):
+                seen.append(user)
+                return {"message": "ok", "transfer": 0, "transfer_to": None,
+                        "done": False}
+
+        agent.client = Spy()
+        # 6 сообщений уже сказано → turns_left = 2
+        distinct = [
+            "selling dozen system cheap",
+            "prefer column strategies personally",
+            "borrow twenty repay thirty",
+            "collateral required otherwise refuse",
+            "rumour circulating about player3",
+            "verify ledger before believing",
+        ]
+        conv = [{"from": "player1" if i % 2 == 0 else "player2", "message": m}
+                for i, m in enumerate(distinct)]
+        agent.dialogue_turn("player2", 100, conv, 1, is_initiator=True)
+        self.assertIn(
+            "message(s) left", seen[-1],
+            "инициатор не получил предупреждение о дедлайне (FIX-8)"
+        )
+
+    def test_partner_gets_a_closing_turn_after_done(self):
+        """
+        FIX-9: раньше `done` от одной стороны делал безусловный break, и
+        партнёр не получал хода вообще — не мог доплатить по согласованному.
+        """
+        FakeLLM.behaviour = {
+            "next_move": lambda u: (
+                {"action": "talk", "partner": "player2", "reason": "x"}
+                if "Your player id: player1" in u and "(no one yet this round)" in u
+                else {"action": "bet", "reason": "x"}
+            ),
+            # A сразу закрывает диалог; B на закрывающем ходу платит
+            "dialogue": lambda u: (
+                {"message": "final offer: 5 coins for the strategy, take it or leave it",
+                 "transfer": 0, "transfer_to": None, "done": True}
+                if "Dialogue with player2" in u else
+                {"message": "taking it, here are the coins", "transfer": 5,
+                 "transfer_to": "player1", "done": True}
+            ),
+            "bet": lambda u: {"type": "even_money", "selection": "red", "amount": 1},
+        }
+        self.run_game(rounds=1, winning_number=0)
+        dlg = self.dialogues()[0]
+        self.assertEqual(
+            len(dlg["conversation"]), 2,
+            "партнёр не получил закрывающий ход после done (FIX-9)"
+        )
+        self.assertEqual(
+            dlg["b_sent"], 5,
+            "партнёр не смог доплатить по уже согласованной сделке (FIX-9)"
+        )
+
+    def test_closing_turn_does_not_extend_into_new_negotiation(self):
+        """Закрывающий ход ровно один — новый круг торга он не открывает."""
+        FakeLLM.behaviour = {
+            "next_move": lambda u: (
+                {"action": "talk", "partner": "player2", "reason": "x"}
+                if "Your player id: player1" in u and "(no one yet this round)" in u
+                else {"action": "bet", "reason": "x"}
+            ),
+            "dialogue": lambda u: (
+                {"message": "I am done here, goodbye", "transfer": 0,
+                 "transfer_to": None, "done": True}
+                if "Dialogue with player2" in u else
+                # партнёр пытается продолжить торг (done=false) — не должен смочь
+                {"message": "wait, let me counter with a brand new offer",
+                 "transfer": 0, "transfer_to": None, "done": False}
+            ),
+            "bet": lambda u: {"type": "even_money", "selection": "red", "amount": 1},
+        }
+        self.run_game(rounds=1, winning_number=0)
+        dlg = self.dialogues()[0]
+        self.assertEqual(len(dlg["conversation"]), 2,
+                         "закрывающий ход открыл новый круг торга (FIX-9)")
+
+    def test_done_warning_present_on_every_turn(self):
+        """FIX-9b: агент на КАЖДОМ ходу знает, что done=true лишает его
+        возможности заплатить — иначе должник закрывает сделку в ноль."""
+        seen = []
+        cfg = make_cfg(self.table, self.logs, 1)
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table, cfg)
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.0, max_tokens=0):
+                seen.append(user)
+                return {"message": "ok", "transfer": 0, "transfer_to": None,
+                        "done": False}
+
+        agent.client = Spy()
+        agent.dialogue_turn("player2", 100, [], 1, is_initiator=True)
+        self.assertIn('setting "done": true ends YOUR participation', seen[-1],
+                      "предупреждение про done отсутствует в промпте (FIX-9b)")
+
+
+# ─────────────────── FIX-10: ротация порядка хода ─────────────────────────
+
+class TestRoundRobinOrder(unittest.TestCase):
+
+    P5 = ["player1", "player2", "player3", "player4", "player5"]
+
+    def test_exact_rotation_sequence(self):
+        """Р1 начинает player1, Р2 — player2, ... Р5 — player5, Р6 — снова player1."""
+        expected = {
+            1: ["player1", "player2", "player3", "player4", "player5"],
+            2: ["player2", "player3", "player4", "player5", "player1"],
+            3: ["player3", "player4", "player5", "player1", "player2"],
+            4: ["player4", "player5", "player1", "player2", "player3"],
+            5: ["player5", "player1", "player2", "player3", "player4"],
+            6: ["player1", "player2", "player3", "player4", "player5"],
+        }
+        for rnd, want in expected.items():
+            self.assertEqual(
+                run_game_v2.round_player_order(self.P5, rnd), want,
+                f"порядок в раунде {rnd} неверен (FIX-10)"
+            )
+
+    def test_every_player_leads_once_per_cycle(self):
+        leaders = [run_game_v2.round_player_order(self.P5, r)[0]
+                   for r in range(1, len(self.P5) + 1)]
+        self.assertEqual(sorted(leaders), sorted(self.P5),
+                         "за цикл не каждый игрок побывал первым (FIX-10)")
+
+    def test_every_player_visits_every_position_once_per_cycle(self):
+        """Полная справедливость: за N раундов каждый стоит на каждой позиции ровно раз."""
+        seats = {p: [] for p in self.P5}
+        for r in range(1, len(self.P5) + 1):
+            for pos, pid in enumerate(run_game_v2.round_player_order(self.P5, r)):
+                seats[pid].append(pos)
+        for pid, positions in seats.items():
+            self.assertEqual(sorted(positions), list(range(len(self.P5))),
+                             f"{pid} занял позиции {sorted(positions)} (FIX-10)")
+
+    def test_order_is_deterministic_for_resume(self):
+        """Порядок зависит ТОЛЬКО от round_no — иначе чекпойнт FIX-7 указывал бы
+        на другого игрока после рестарта."""
+        for r in (1, 4, 7, 23):
+            self.assertEqual(run_game_v2.round_player_order(self.P5, r),
+                             run_game_v2.round_player_order(self.P5, r),
+                             "порядок не воспроизводится (FIX-10)")
+
+    def test_single_player_and_empty_list(self):
+        self.assertEqual(run_game_v2.round_player_order(["p1"], 7), ["p1"])
+        self.assertEqual(run_game_v2.round_player_order([], 3), [])
+
+
+def ring_partner(u):
+    """Собеседник по кольцу: p1→p2→p3→p1. Даёт равномерный граф общения,
+    в котором позиционный эффект виден в чистом виде."""
+    if "(no one yet this round)" not in u:
+        return {"action": "bet", "reason": "x"}
+    me = u.split("Your player id: ")[1].split(".")[0].strip()
+    avail = (u.split("available to talk to right now: [")[1].split("]")[0]
+             .replace("'", "").split(", "))
+    want = PLAYERS[(PLAYERS.index(me) + 1) % len(PLAYERS)]
+    return {"action": "talk", "partner": want if want in avail else avail[0],
+            "reason": "x"}
+
+
+class TestPositionalFairness(GameHarness):
+
+    def test_no_player_is_permanently_blind(self):
+        """
+        До FIX-10 первый в списке НИ РАЗУ за партию не видел ни одного чужого
+        диалога (структурно: список чужих разговоров пуст, когда он ходит).
+        После ротации слепая позиция достаётся всем по очереди.
+        """
+        import collections
+        seen = collections.defaultdict(list)
+        orig = PlayerAgent.decide_next_move
+
+        def spy(self, avail, talked, rn, dlgs=None):
+            others = [d for d in (dlgs or []) if self.player_id not in (d[0], d[1])]
+            seen[self.player_id].append(len(others))
+            return orig(self, avail, talked, rn, dlgs)
+
+        PlayerAgent.decide_next_move = spy
+        try:
+            FakeLLM.behaviour = {
+                # КОЛЬЦО общения p1→p2→p3→p1: если все сходятся на одном
+                # партнёре, для него все диалоги оказываются "своими" и
+                # эффект ротации маскируется артефактом сценария
+                "next_move": ring_partner,
+                "dialogue": lambda u: {"message": "brief exchange of terms",
+                                       "transfer": 0, "transfer_to": None, "done": True},
+                "bet": lambda u: {"type": "even_money", "selection": "red", "amount": 5},
+            }
+            self.run_game(rounds=len(PLAYERS), seed=2)
+        finally:
+            PlayerAgent.decide_next_move = orig
+
+        blind = [pid for pid, counts in seen.items() if max(counts) == 0]
+        self.assertEqual(
+            blind, [],
+            f"игроки {blind} за полный цикл не увидели ни одного чужого "
+            f"диалога — позиционная слепота сохранилась (FIX-10)"
+        )
+
+
+# ───────────── FIX-11: бюджеты и память из конфига ────────────────────────
+
+class TestConfigurableBudgets(GameHarness):
+
+    def _cfg(self, tokens=None, memory=None):
+        cfg = make_cfg(self.table, self.logs, 1)
+        if tokens:
+            cfg.read_dict({"tokens": {k: str(v) for k, v in tokens.items()}})
+        if memory:
+            cfg.read_dict({"memory": {k: str(v) for k, v in memory.items()}})
+        return cfg
+
+    def test_every_call_site_uses_its_configured_budget(self):
+        """
+        Раньше пять из шести бюджетов были зашиты в agent_v2.py и из ini не
+        настраивались вовсе — [player] max_tokens попадал только в ставку.
+        """
+        want = {"bet": 111, "dialogue": 222, "next_move": 333,
+                "reflect": 444, "update_dsyn": 555, "compress": 666}
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table,
+                            self._cfg(tokens=want, memory={"synapse_chars": 50}))
+        got = {}
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                tag = ("compress" if "Compress" in system else
+                       "reflect" if "Reflect" in system else
+                       "next_move" if "Decide next move" in system else
+                       "dialogue" if "Dialogue turn" in system else
+                       "update_dsyn" if "Update reputation" in system else
+                       "bet" if "Place casino bet" in system else "?")
+                got[tag] = max_tokens
+                if tag == "bet":
+                    return {"type": "even_money", "selection": "red", "amount": 5}
+                if tag == "next_move":
+                    return {"action": "bet", "reason": "x"}
+                if tag == "dialogue":
+                    return {"message": "m", "transfer": 0, "transfer_to": None,
+                            "done": True}
+                return {"notes": "n", "update_persona": False, "trust_score": 6,
+                        "reputation_note": "n", "future_intent": "i", "summary": "s"}
+
+        agent.client = Spy()
+        agent_v2.save_notes("player1", self.table, "x" * 200)   # > synapse_chars → compress
+        agent.reflect_betting(None)
+        agent.decide_next_move(["player2"], [], 1, [])
+        agent.dialogue_turn("player2", 50, [], 1, is_initiator=True)
+        agent.update_dsyn("player2", [{"from": "player1", "message": "m"}], 0, 1)
+        agent.decide_bet()
+
+        for tag, budget in want.items():
+            self.assertEqual(got.get(tag), budget,
+                             f"вызов '{tag}' игнорирует [tokens] {tag}={budget} (FIX-11)")
+
+    def test_memory_thresholds_come_from_config(self):
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table,
+                            self._cfg(memory={"synapse_chars": 7777,
+                                              "dsyn_chars": 8888,
+                                              "raw_interactions": 33}))
+        self.assertEqual(agent.synapse_chars, 7777)
+        self.assertEqual(agent.dsyn_chars, 8888)
+        self.assertEqual(agent.raw_interactions, 33)
+
+    def test_defaults_are_the_raised_ones(self):
+        """Без секций [tokens]/[memory] действуют новые, расширенные значения."""
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table, make_cfg(self.table, self.logs, 1))
+        self.assertGreaterEqual(agent.synapse_chars, 4000,
+                                "порог синапсы не поднят (FIX-11)")
+        self.assertGreaterEqual(agent.dsyn_chars, 6000)
+        self.assertGreater(agent.tok_dialogue, agent.tok_bet,
+                           "диалогу по-прежнему выделено меньше, чем ставке (FIX-11)")
+
+
+class TestLedgerWindow(unittest.TestCase):
+
+    @staticmethod
+    def ledger(n_rounds=10, players=("p1", "p2", "p3", "p4", "p5")):
+        out = []
+        for r in range(1, n_rounds + 1):
+            for p in players:
+                out.append({"round_no": r, "player_id": p, "winning_number": 7,
+                            "bet": {"type": "even_money", "selection": "red",
+                                    "amount": 5},
+                            "win": False, "payout": 0})
+        return out
+
+    def test_window_is_applied_after_filtering_own_entries(self):
+        """
+        Раньше срез брался ДО отбрасывания своих записей, поэтому реальное
+        окно было меньше заявленного и зависело от числа игроков: при пяти
+        window=10 давал 8 строк, т.е. по 2 ставки на оппонента.
+        """
+        txt = agent_v2._format_public_ledger(self.ledger(), window=10,
+                                             exclude_pid="p3")
+        lines = [l for l in txt.strip().split("\n") if l.strip()]
+        self.assertEqual(len(lines), 10,
+                         f"окно=10 дало {len(lines)} строк — срез применён "
+                         f"до фильтрации (FIX-11)")
+        self.assertNotIn("p3 bet", txt, "свои записи не отфильтрованы")
+
+    def test_window_larger_than_history_returns_everything(self):
+        entries = self.ledger(n_rounds=3)          # 15 записей, 12 чужих
+        txt = agent_v2._format_public_ledger(entries, window=999, exclude_pid="p3")
+        lines = [l for l in txt.strip().split("\n") if l.strip()]
+        self.assertEqual(len(lines), 12)
+
+    def test_dsyn_display_limits_are_honoured(self):
+        d = agent_v2._empty_dsyn()
+        d["reputation"]["p2"] = {"trust_score": 5, "net": 0,
+                                 "deals_done": [f"d{i}" for i in range(20)],
+                                 "deals_failed": [f"f{i}" for i in range(20)],
+                                 "reputation_note": "", "future_intent": "",
+                                 "last_seen_round": 1}
+        d["interactions"] = [{"round": i, "partner": "p2", "net_transfer": 0,
+                              "summary": f"s{i}"} for i in range(20)]
+        txt = agent_v2._format_dsyn_for_prompt(d, recent=7, deals=5, fails=3)
+        self.assertEqual(txt.count("net=+0c — s"), 7, "recent не соблюдён (FIX-11)")
+        done_line = [l for l in txt.split("\n") if "✓" in l][0]
+        self.assertEqual(done_line.count(";"), 4, "deals не соблюдён (FIX-11)")
+
+
+class TestConfigParsable(unittest.TestCase):
+
+    def test_shipped_ini_has_no_inline_comments(self):
+        """
+        configparser не срезает комментарии в конце строки: `x = 5  # note`
+        читается целиком как строка и роняет getint(). Игра грузит конфиг
+        обычным ConfigParser, так что такая строка убила бы запуск.
+        """
+        import configparser as cp
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "config_v2.ini")
+        c = cp.ConfigParser()
+        c.read(path, encoding="utf-8")
+        for section in ("tokens", "memory"):
+            self.assertIn(section, c.sections(), f"нет секции [{section}]")
+            for key in c[section]:
+                try:
+                    c.getint(section, key)
+                except ValueError as e:
+                    self.fail(f"[{section}] {key} не парсится как int "
+                              f"(комментарий в конце строки?): {e}")
+
+
+# ───────────── FIX-12: персона больше не растёт бесконечно ────────────────
+
+class TestPersonaBounded(GameHarness):
+
+    def _agent(self, persona_chars=300):
+        cfg = make_cfg(self.table, self.logs, 1)
+        cfg.read_dict({"memory": {"persona_chars": str(persona_chars)}})
+        os.makedirs(self.table, exist_ok=True)
+        return PlayerAgent("player1", self.table, cfg)
+
+    def test_oversized_persona_is_compressed_on_reflect(self):
+        """
+        Персона была ЕДИНСТВЕННЫМ неограниченным компонентом промпта: заметки
+        резались по synapse_chars, синапса — по dsyn_chars, журнал — по окну,
+        а персону не обрезал и не сжимал никто.
+        """
+        agent = self._agent(persona_chars=300)
+        agent_v2.save_text(agent_v2.prompt_file("player1", self.table), "Z" * 5000)
+        FakeLLM.behaviour = {"reflect": lambda u: {"notes": "n", "update_persona": False}}
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                if "Compress your persona" in system:
+                    return {"new_persona": "Tight broker persona. Charges upfront."}
+                return {"notes": "n", "update_persona": False}
+
+        agent.client = Spy()
+        agent.reflect_betting(None)
+        self.assertLessEqual(
+            len(agent.persona_prompt), 300,
+            f"персона осталась {len(agent.persona_prompt)} символов (FIX-12)"
+        )
+
+    def test_persona_compression_does_not_send_persona_twice(self):
+        """
+        system при сжатии должен быть CORE_SYSTEM_PROMPT, а не abstract_prompt:
+        последний содержит саму персону, и вызов, который чинит переполнение
+        контекста, переполнял бы его сильнее всех остальных.
+        """
+        agent = self._agent(persona_chars=300)
+        marker = "UNIQUEPERSONAMARKER"
+        agent_v2.save_text(agent_v2.prompt_file("player1", self.table),
+                           marker + "Z" * 5000)
+        seen = {}
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                if "Compress your persona" in system:
+                    seen["system"] = system
+                    return {"new_persona": "short"}
+                return {"notes": "n", "update_persona": False}
+
+        agent.client = Spy()
+        agent.reflect_betting(None)
+        self.assertIn("system", seen, "сжатие персоны не вызывалось")
+        self.assertNotIn(marker, seen["system"],
+                         "персона уехала в запрос дважды — в system и в user (FIX-12)")
+
+    def test_compression_call_itself_stays_bounded(self):
+        """
+        FIX-12b: вызов сжатия кладёт персону в user-сообщение целиком. На
+        персоне в 50k символов это давало 166% контекста — вызов, лечащий
+        переполнение, переполнял сильнее всего остального.
+        """
+        agent = self._agent(persona_chars=300)
+        agent_v2.save_text(agent_v2.prompt_file("player1", self.table), "Z" * 50000)
+        sizes = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                sizes.append(len(system) + len(user))
+                if "Compress your persona" in system:
+                    return {"new_persona": "short"}
+                return {"notes": "n", "update_persona": False}
+
+        agent.client = Spy()
+        agent.reflect_betting(None)
+        hard = 300 * agent_v2.PERSONA_HARD_FACTOR
+        self.assertLess(
+            max(sizes), len(agent_v2.CORE_SYSTEM_PROMPT) + hard + 3000,
+            f"запрос на сжатие раздулся до {max(sizes)} символов (FIX-12b)"
+        )
+
+    def test_new_persona_over_limit_is_truncated_on_save(self):
+        """Модель регулярно игнорирует объявленный лимит — не верим на слово."""
+        agent = self._agent(persona_chars=200)
+        FakeLLM.behaviour = {
+            "reflect": lambda u: {"notes": "n", "update_persona": True,
+                                  "new_persona": "Q" * 4000},
+        }
+        agent.reflect_betting(None)
+        self.assertLessEqual(len(agent.persona_prompt), 200,
+                             "переросшая персона записана без обрезки (FIX-12)")
+
+    def test_abstract_prompt_is_bounded_even_without_reflection(self):
+        """
+        Жёсткий потолок в abstract_prompt — последняя линия обороны: до первой
+        рефлексии (раунд 1) и на случай правки prompt_<id>.txt руками.
+        """
+        agent = self._agent(persona_chars=300)
+        agent_v2.save_text(agent_v2.prompt_file("player1", self.table), "Z" * 50000)
+        hard = 300 * agent_v2.PERSONA_HARD_FACTOR
+        self.assertLessEqual(
+            len(agent.abstract_prompt), len(agent_v2.CORE_SYSTEM_PROMPT) + hard + 200,
+            "abstract_prompt не ограничен жёстким потолком (FIX-12)"
+        )
+
+    def test_persona_limit_is_announced_in_the_reflect_prompt(self):
+        agent = self._agent(persona_chars=1234)
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                seen.append(user)
+                return {"notes": "n", "update_persona": False}
+
+        agent.client = Spy()
+        agent.reflect_betting(None)
+        self.assertIn("MAX 1234 characters", seen[-1],
+                      "лимит персоны не объявлен модели (FIX-12)")
+
+    def test_compression_failure_falls_back_to_truncation(self):
+        agent = self._agent(persona_chars=300)
+        agent_v2.save_text(agent_v2.prompt_file("player1", self.table), "Z" * 5000)
+
+        class Boom(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                if "Compress your persona" in system:
+                    raise RuntimeError("llm down")
+                return {"notes": "n", "update_persona": False}
+
+        agent.client = Boom()
+        agent.reflect_betting(None)
+        self.assertLessEqual(len(agent.persona_prompt), 300,
+                             "при сбое сжатия персона не обрезана (FIX-12)")
+
+
+class TestTruncateText(unittest.TestCase):
+
+    def test_cuts_at_sentence_boundary(self):
+        t = "First sentence here. Second sentence here. Third one runs long."
+        out = agent_v2._truncate_text(t, 45)
+        self.assertTrue(out.endswith("."), f"обрезано посреди предложения: {out!r}")
+        self.assertLessEqual(len(out), 45)
+
+    def test_falls_back_to_hard_cut_when_boundary_too_early(self):
+        """Если ближайшая граница съедает больше трети — режем жёстко."""
+        t = "Short. " + "x" * 200
+        out = agent_v2._truncate_text(t, 150)
+        self.assertLessEqual(len(out), 150)
+        self.assertGreater(len(out), 100, "потеряли слишком много текста")
+
+    def test_short_text_untouched(self):
+        self.assertEqual(agent_v2._truncate_text("abc", 100), "abc")
+
+
+# ───── FIX-13/14: проверяемость заявлений и скорборд ──────────────────────
+
+class TestVerifiability(unittest.TestCase):
+
+    def test_core_prompt_states_the_spin_rules(self):
+        """
+        В реальном прогоне player3 продал за 30 монет 'Audit log R1: 12 spins',
+        хотя спин в раунде ровно один и крутит его крупье. Правила должны быть
+        в неизменяемом ядре, а не надеяться на здравый смысл модели.
+        """
+        # промпт — свёрстанный текст, поэтому сравниваем по нормализованным
+        # пробелам: иначе тест ловит перенос строки, а не отсутствие правила
+        core = " ".join(agent_v2.CORE_SYSTEM_PROMPT.split())
+        for fragment in ("EXACTLY ONE spin per round", "PUBLIC LEDGER",
+                         "There is no 00", "37 pockets"):
+            self.assertIn(fragment, core, f"в ядре нет: {fragment!r} (FIX-13)")
+
+    def test_core_prompt_covers_both_directions(self):
+        """Проверять чужие заявления И знать, что твои собственные проверяемы."""
+        core = " ".join(agent_v2.CORE_SYSTEM_PROMPT.split())
+        self.assertIn("CHECK IT AGAINST THE PUBLIC LEDGER", core)
+        self.assertIn("Your OWN bets are in that same public ledger", core)
+
+    def test_core_prompt_still_allows_trading_opinions(self):
+        """Запрещать торговлю прогнозами нельзя — в ней вся игра."""
+        core = " ".join(agent_v2.CORE_SYSTEM_PROMPT.split())
+        self.assertIn("trading them is legitimate", core)
+
+
+class TestScoreboard(unittest.TestCase):
+
+    @staticmethod
+    def led(rows):
+        return [{"round_no": r, "player_id": p, "winning_number": 19,
+                 "bet": {"type": t, "selection": "red", "amount": a},
+                 "win": w, "payout": pay}
+                for r, p, t, a, w, pay in rows]
+
+    def test_pnl_is_computed_not_left_to_the_model(self):
+        txt = agent_v2._format_scoreboard(self.led([
+            (1, "p1", "even_money", 20, True, 40),
+            (2, "p1", "even_money", 10, False, 0),
+            (3, "p1", "even_money", 5,  False, 0),
+        ]))
+        self.assertIn("casino P&L=+5c", txt, f"P&L посчитан неверно: {txt}")
+        self.assertIn("3 bet(s)", txt)
+        self.assertIn("won 1/3", txt)
+
+    def test_own_entries_excluded(self):
+        txt = agent_v2._format_scoreboard(
+            self.led([(1, "p1", "even_money", 20, True, 40),
+                      (1, "p2", "even_money", 20, False, 0)]),
+            exclude_pid="p1")
+        self.assertNotIn("p1:", txt)
+        self.assertIn("p2:", txt)
+
+    def test_aggregate_covers_whole_game_not_a_window(self):
+        """Смысл скорборда в том, что он не обрезан окном журнала."""
+        rows = [(r, "p1", "even_money", 10, False, 0) for r in range(1, 101)]
+        txt = agent_v2._format_scoreboard(self.led(rows))
+        self.assertIn("100 bet(s)", txt, "агрегат обрезан окном (FIX-14)")
+        self.assertIn("casino P&L=-1000c", txt)
+
+    def test_empty_ledger_is_handled(self):
+        self.assertIn("no bets", agent_v2._format_scoreboard([]))
+
+    def test_scoreboard_reaches_all_three_decision_points(self):
+        """Он нужен и при выборе собеседника, и в диалоге, и при ставке."""
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "agent_v2.py"), encoding="utf-8").read()
+        for fn in ("def decide_next_move", "def dialogue_turn", "def decide_bet"):
+            start = src.index(fn)
+            body = src[start:start + 6000]
+            self.assertIn("score_txt", body,
+                          f"скорборд не доходит до {fn} (FIX-14)")
+
+
+class TestScoreboardCatchesRealFabrication(GameHarness):
+
+    def test_the_run_that_cost_player5_thirty_coins(self):
+        """
+        Воспроизводит реальный случай: player3 заявил 12 спинов, dozen и split,
+        50% попаданий. По журналу — одна ставка even_money на 20 монет.
+        """
+        os.makedirs(self.table, exist_ok=True)
+        for pid, amt, pay in [("player3", 20, 40), ("player5", 10, 30)]:
+            agent_v2.append_public_ledger(self.table, {
+                "round_no": 1, "player_id": pid, "winning_number": 19,
+                "bet": {"type": "even_money", "selection": "red", "amount": amt},
+                "win": True, "payout": pay})
+
+        agent = PlayerAgent("player5", self.table, make_cfg(self.table, self.logs, 1))
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                seen.append(user)
+                return {"message": "no", "transfer": 0, "transfer_to": None,
+                        "done": True}
+
+        agent.client = Spy()
+        agent.dialogue_turn("player3", 100, [
+            {"from": "player3", "message": "Audit log R1: 12 spins. Dozen 2 hit 4x."}
+        ], 2, is_initiator=False)
+
+        prompt = seen[-1]
+        self.assertIn("player3: casino P&L=+20c over 1 bet(s)", prompt,
+                      "скорборд не показан в диалоге — проверить нечем (FIX-14)")
+        self.assertIn("mostly even_money", prompt,
+                      "тип ставки не показан — заявление про dozen не опровергнуть")
+
+
+# ─────────────── FIX-15: чекпойнт Фазы 0 ──────────────────────────────────
+
+class TestPhase0Checkpoint(GameHarness):
+
+    def test_reflection_not_repeated_after_a_restart(self):
+        """
+        В реальном прогоне раунд 2 запускался трижды из-за HTTP 504, и каждый
+        раз все пятеро рефлексировали заново: 14 переписываний персоны за два
+        с половиной раунда.
+        """
+        os.makedirs(self.table, exist_ok=True)
+        cfg = make_cfg(self.table, self.logs, 1)
+        agents = {pid: PlayerAgent(pid, self.table, cfg) for pid in PLAYERS}
+        calls = []
+        orig = PlayerAgent.reflect_betting
+        PlayerAgent.reflect_betting = lambda self, e=None: calls.append(self.player_id)
+        try:
+            FakeLLM.behaviour = {}
+            logger = __import__("game_logger").GameLogger(self.logs)
+            # первый заход: обрываемся после двух игроков
+            run_game_v2.settle_pending_results(
+                agents, PLAYERS[:2], self.table, 1, logger, checkpoint_round=2)
+            self.assertEqual(calls, PLAYERS[:2])
+            # рестарт того же раунда: первые двое повторяться не должны
+            calls.clear()
+            run_game_v2.settle_pending_results(
+                agents, PLAYERS, self.table, 1, logger, checkpoint_round=2)
+            logger.close()
+        finally:
+            PlayerAgent.reflect_betting = orig
+        self.assertEqual(
+            calls, PLAYERS[2:],
+            f"после рестарта повторно отрефлексировали: {calls} (FIX-15)"
+        )
+
+    def test_checkpoint_is_scoped_to_its_round(self):
+        os.makedirs(self.table, exist_ok=True)
+        run_game_v2.save_phase0_done(self.table, 2, {"player1"})
+        self.assertEqual(run_game_v2.load_phase0_done(self.table, 2), {"player1"})
+        self.assertEqual(run_game_v2.load_phase0_done(self.table, 3), set(),
+                         "чекпойнт протёк в следующий раунд (FIX-15)")
+
+    def test_checkpoint_cleared_after_phase_completes(self):
+        os.makedirs(self.table, exist_ok=True)
+        run_game_v2.save_phase0_done(self.table, 2, {"player1"})
+        run_game_v2.clear_phase0_state(self.table)
+        self.assertEqual(run_game_v2.load_phase0_done(self.table, 2), set())
+
+    def test_final_settlement_does_not_checkpoint(self):
+        """Финальный расчёт повторять нечему — файл создаваться не должен."""
+        os.makedirs(self.table, exist_ok=True)
+        cfg = make_cfg(self.table, self.logs, 1)
+        agents = {pid: PlayerAgent(pid, self.table, cfg) for pid in PLAYERS}
+        logger = __import__("game_logger").GameLogger(self.logs)
+        run_game_v2.settle_pending_results(agents, PLAYERS, self.table, 1, logger,
+                                           reflect=False)
+        logger.close()
+        self.assertFalse(os.path.exists(run_game_v2.phase0_state_file(self.table)))
+
+
+# ───────── FIX-16: идемпотентная запись журнала и истории ─────────────────
+
+class TestLedgerIdempotent(GameHarness):
+
+    def _entry(self, pid, rnd, amount):
+        return {"round_no": rnd, "player_id": pid, "winning_number": 7,
+                "bet": {"type": "even_money", "selection": "red", "amount": amount},
+                "win": False, "payout": 0}
+
+    def test_replaying_a_round_replaces_instead_of_duplicating(self):
+        """
+        В реальном прогоне падение сервера оставило аварийные ставки в 1 монету
+        за раунды 3-4, а после перезапуска рядом легли настоящие. Журнал стал
+        буквально противоречивым — и пойманный на вранье игрок сослался на
+        «расхождение в журнале», формально говоря правду.
+        """
+        os.makedirs(self.table, exist_ok=True)
+        agent_v2.append_public_ledger(self.table, self._entry("player1", 3, 1))
+        agent_v2.append_public_ledger(self.table, self._entry("player1", 3, 20))
+
+        led = agent_v2.load_public_ledger(self.table)
+        r3 = [e for e in led if e["player_id"] == "player1" and e["round_no"] == 3]
+        self.assertEqual(len(r3), 1,
+                         f"на раунд 3 осталось {len(r3)} записей — призрак сбоя "
+                         f"остался в журнале (FIX-16)")
+        self.assertEqual(r3[0]["bet"]["amount"], 20,
+                         "сохранилась старая аварийная запись, а не настоящая")
+
+    def test_other_players_and_rounds_untouched(self):
+        os.makedirs(self.table, exist_ok=True)
+        for pid, rnd, amt in [("player1", 3, 1), ("player2", 3, 5),
+                              ("player1", 4, 7), ("player1", 3, 20)]:
+            agent_v2.append_public_ledger(self.table, self._entry(pid, rnd, amt))
+        led = agent_v2.load_public_ledger(self.table)
+        self.assertEqual(len(led), 3)
+        self.assertEqual({(e["player_id"], e["round_no"]) for e in led},
+                         {("player1", 3), ("player2", 3), ("player1", 4)})
+
+    def test_ledger_stays_sorted_by_round(self):
+        os.makedirs(self.table, exist_ok=True)
+        for rnd in (5, 1, 3):
+            agent_v2.append_public_ledger(self.table, self._entry("player1", rnd, 1))
+        rounds = [e["round_no"] for e in agent_v2.load_public_ledger(self.table)]
+        self.assertEqual(rounds, sorted(rounds))
+
+    def test_history_is_idempotent_too(self):
+        os.makedirs(self.table, exist_ok=True)
+        agent_v2.append_history("player1", self.table,
+                                {"round_no": 3, "balance_after": 10})
+        agent_v2.append_history("player1", self.table,
+                                {"round_no": 3, "balance_after": 99})
+        hist = agent_v2.load_history("player1", self.table)
+        self.assertEqual(len(hist), 1, "дубль раунда в личной истории (FIX-16)")
+        self.assertEqual(hist[0]["balance_after"], 99)
+
+    def test_scoreboard_not_poisoned_by_replayed_round(self):
+        """Скорборд считается по журналу — призраки искажали бы и его."""
+        os.makedirs(self.table, exist_ok=True)
+        agent_v2.append_public_ledger(self.table, self._entry("player1", 3, 1))
+        agent_v2.append_public_ledger(self.table, self._entry("player1", 3, 20))
+        txt = agent_v2._format_scoreboard(agent_v2.load_public_ledger(self.table))
+        self.assertIn("1 bet(s)", txt, f"скорборд посчитал призрак: {txt}")
+        self.assertIn("staked 20", txt)
+
+
+# ───────── FIX-17: выключатель при падении сервера моделей ────────────────
+
+class TestCircuitBreaker(GameHarness):
+
+    def setUp(self):
+        super().setUp()
+        RealLLMClient.configure_breaker(3)
+
+    def tearDown(self):
+        RealLLMClient.configure_breaker(6)
+        super().tearDown()
+
+    class Dead(RealLLMClient):
+        """Сервер лежит: любой вызов — отказ соединения."""
+        def __init__(self): pass
+        @classmethod
+        def from_config(cls, cfg, section=None): return cls()
+        def chat(self, *a, **kw):
+            raise RuntimeError("Connection refused")
+
+    def test_breaker_trips_after_n_consecutive_failures(self):
+        c = self.Dead()
+        for i in range(2):
+            with self.assertRaises(RuntimeError):
+                c.chat_json("s", "u")
+        with self.assertRaises(LLMUnavailable):
+            c.chat_json("s", "u")
+
+    def test_success_resets_the_counter(self):
+        c = self.Dead()
+        for _ in range(2):
+            with self.assertRaises(RuntimeError):
+                c.chat_json("s", "u")
+        llm_client._Breaker.failures = 0
+        with self.assertRaises(RuntimeError) as cm:
+            c.chat_json("s", "u")
+        self.assertNotIsInstance(cm.exception, LLMUnavailable)
+
+    def test_bad_json_does_not_trip_the_breaker(self):
+        """
+        Битый JSON означает, что сервер жив и отвечает — модель просто не
+        попала в формат. Это штатная ситуация с ретраем, а не повод рвать
+        раунд, иначе выключатель срабатывал бы на здоровом сервере.
+        """
+        class Garbage(RealLLMClient):
+            def __init__(self): pass
+            def chat(self, *a, **kw): return "not json at all"
+        c = Garbage()
+        for _ in range(10):
+            with self.assertRaises(Exception) as cm:
+                c.chat_json("s", "u")
+            self.assertNotIsInstance(cm.exception, LLMUnavailable)
+
+    def test_agent_does_not_swallow_the_breaker(self):
+        """
+        Ключевое: обычную ошибку агент гасит и уходит в заглушку — именно
+        поэтому падение сервера прошло незамеченным. Выключатель гаситься
+        не должен.
+        """
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table, make_cfg(self.table, self.logs, 1))
+
+        class Boom(FakeLLM):
+            def chat_json(self, *a, **kw):
+                raise LLMUnavailable("server down")
+
+        agent.client = Boom()
+        for call in (lambda: agent.decide_bet(1),
+                     lambda: agent.decide_next_move(["player2"], [], 1, []),
+                     lambda: agent.dialogue_turn("player2", 10, [], 1, True),
+                     lambda: agent.reflect_betting(None)):
+            with self.assertRaises(LLMUnavailable):
+                call()
+
+    def test_every_agent_handler_reraises_the_breaker(self):
+        """Статически: ни один except Exception не должен глотать выключатель."""
+        import ast as _ast
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "agent_v2.py"), encoding="utf-8").read()
+        bad = []
+        for node in _ast.walk(_ast.parse(src)):
+            if isinstance(node, _ast.Try):
+                names = [h.type.id for h in node.handlers
+                         if isinstance(h.type, _ast.Name)]
+                if "Exception" in names and "LLMUnavailable" not in names:
+                    bad.append(node.lineno)
+        self.assertEqual(bad, [], f"глотают выключатель, строки: {bad} (FIX-17)")
+
+
+# ───────── FIX-18: номер раунда и явное «спина ещё не было» ───────────────
+
+class TestCurrentRoundNotice(GameHarness):
+
+    def test_notice_names_the_round_and_denies_future_results(self):
+        txt = agent_v2._current_round_notice(4)
+        self.assertIn("CURRENT ROUND: 4", txt)
+        self.assertIn("has NOT been spun", txt)
+        self.assertIn("or any later round", txt)
+
+    def test_notice_sits_next_to_the_scoreboard_everywhere(self):
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "agent_v2.py"), encoding="utf-8").read()
+        # три решения + шаг планирования чек-листа (FIX-19)
+        self.assertEqual(src.count("+ _current_round_notice(round_no) +"), 4,
+                         "уведомление подставлено не везде (FIX-18)")
+
+    def test_decide_bet_now_knows_the_round(self):
+        """Раньше при выборе ставки агент вообще не знал, который идёт раунд."""
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table, make_cfg(self.table, self.logs, 1))
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                seen.append(user)
+                return {"type": "even_money", "selection": "red", "amount": 5}
+
+        agent.client = Spy()
+        agent.decide_bet(7)
+        self.assertIn("bet for round 7", seen[-1], "номер раунда не дошёл (FIX-18)")
+        self.assertIn("CURRENT ROUND: 7", seen[-1])
+
+    def test_the_r5_during_r4_scenario_is_now_contradicted_on_screen(self):
+        """
+        Воспроизводит реальный случай: находясь в раунде 4, игрок отчитался о
+        результате спина раунда 5 и заплатил по нему 60 монет.
+        """
+        os.makedirs(self.table, exist_ok=True)
+        agent_v2.append_public_ledger(self.table, {
+            "round_no": 3, "player_id": "player3", "winning_number": 36,
+            "bet": {"type": "even_money", "selection": "red", "amount": 5},
+            "win": True, "payout": 10})
+        agent = PlayerAgent("player1", self.table, make_cfg(self.table, self.logs, 1))
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                seen.append(user)
+                return {"message": "no", "transfer": 0, "transfer_to": None,
+                        "done": True}
+
+        agent.client = Spy()
+        agent.dialogue_turn("player3", 200, [
+            {"from": "player3",
+             "message": "Public ledger confirms the R5 60c joint position hit."}
+        ], 4, is_initiator=False)
+        prompt = seen[-1]
+        self.assertIn("CURRENT ROUND: 4", prompt)
+        self.assertIn("No result exists for round 4 or any later round", prompt)
+        self.assertIn("player3: casino P&L=+5c over 1 bet(s)", prompt)
+        self.assertIn("last bet in r3", prompt)
+
+
+# ───────────── FIX-19: чек-лист как краткосрочная повестка ────────────────
+
+class TestChecklist(GameHarness):
+
+    def _agent(self, pid="player1", **memory):
+        cfg = make_cfg(self.table, self.logs, 1)
+        if memory:
+            cfg.read_dict({"memory": {k: str(v) for k, v in memory.items()}})
+        os.makedirs(self.table, exist_ok=True)
+        return PlayerAgent(pid, self.table, cfg)
+
+    def test_starts_from_a_template_and_persists(self):
+        agent = self._agent()
+        self.assertIn("Owed TO me", agent._checklist_or_default())
+        agent_v2.save_checklist("player1", self.table, "my own format")
+        self.assertEqual(agent._checklist_or_default(), "my own format")
+
+    def test_agent_may_discard_the_suggested_structure_entirely(self):
+        """
+        Главное требование: файл принадлежит агенту. Он вправе выбросить все
+        предложенные заголовки и хранить что угодно в любом виде.
+        """
+        agent = self._agent()
+        exotic = "DEBTORS>>player3:24@r5|player2:8@r6\nTRUST_DELTA:+2,-1\nASK:player4"
+        FakeLLM.behaviour = {}
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                # проверяем, что агенту прямо разрешено ломать структуру
+                assert "throw the whole structure away" in user, user[:200]
+                return {"checklist": exotic}
+
+        agent.client = Spy()
+        agent.plan_round(3, ["player2"])
+        self.assertEqual(agent._checklist_or_default(), exotic)
+        self.assertNotIn("Owed TO me", agent._checklist_or_default())
+
+    def test_plan_round_sees_recent_results_and_scoreboard(self):
+        """«чтобы раунды тоже видели сразу последние игры при анализе»."""
+        agent = self._agent()
+        agent_v2.append_public_ledger(self.table, {
+            "round_no": 1, "player_id": "player2", "winning_number": 19,
+            "bet": {"type": "even_money", "selection": "red", "amount": 20},
+            "win": True, "payout": 40})
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                seen.append(user)
+                return {"checklist": "ok"}
+
+        agent.client = Spy()
+        agent.plan_round(2, ["player2"])
+        p = seen[-1]
+        self.assertIn("player2: casino P&L=+20c", p, "нет скорборда в планировании")
+        self.assertIn("Recent table results", p, "нет свежих результатов раундов")
+        self.assertIn("Your reputation map", p)
+        self.assertIn("CURRENT ROUND: 2", p)
+
+    def test_update_after_dialogue_sees_the_transcript(self):
+        agent = self._agent()
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                seen.append(user)
+                return {"checklist": "updated"}
+
+        agent.client = Spy()
+        agent.update_checklist("player3", [
+            {"from": "player3", "message": "I will repay 24 coins by r5",
+             "transfer": 0, "transfer_to": None},
+        ], -5, 4)
+        p = seen[-1]
+        self.assertIn("I will repay 24 coins by r5", p, "транскрипт не передан")
+        self.assertIn("-5", p, "нетто перевода не передано")
+        self.assertEqual(agent._checklist_or_default(), "updated")
+
+    def test_checklist_reaches_all_three_decisions(self):
+        """Выбор собеседника, сам диалог и выбор ставки."""
+        agent = self._agent()
+        agent_v2.save_checklist("player1", self.table, "MARKER_AGENDA_XYZ")
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                seen.append(user)
+                if "Place casino bet" in system:
+                    return {"type": "even_money", "selection": "red", "amount": 5}
+                if "Decide next move" in system:
+                    return {"action": "bet", "reason": "x"}
+                return {"message": "m", "transfer": 0, "transfer_to": None,
+                        "done": True}
+
+        agent.client = Spy()
+        agent.decide_next_move(["player2"], [], 1, [])
+        agent.dialogue_turn("player2", 10, [], 1, is_initiator=True)
+        agent.decide_bet(1)
+        for i, name in enumerate(("decide_next_move", "dialogue_turn", "decide_bet")):
+            self.assertIn("MARKER_AGENDA_XYZ", seen[i],
+                          f"чек-лист не дошёл до {name} (FIX-19)")
+
+    def test_disabled_flag_removes_it_from_prompts_entirely(self):
+        """
+        Выключение должно экономить и вызовы, И контекст — иначе агент
+        получал бы пустой шаблон вместо ничего.
+        """
+        cfg = make_cfg(self.table, self.logs, 1)
+        cfg.read_dict({"game": {"use_checklist": "false"}})
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table, cfg)
+        agent_v2.save_checklist("player1", self.table, "MARKER_AGENDA_XYZ")
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                seen.append(user)
+                return {"action": "bet", "reason": "x"}
+
+        agent.client = Spy()
+        agent.decide_next_move(["player2"], [], 1, [])
+        self.assertNotIn("MARKER_AGENDA_XYZ", seen[-1])
+        self.assertNotIn("YOUR CHECKLIST", seen[-1])
+
+    def test_bounded_like_the_persona(self):
+        """Урок FIX-12: любой самопишущийся файл обязан иметь потолок."""
+        agent = self._agent(checklist_chars=200)
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                return {"checklist": "Z" * 9000}
+
+        agent.client = Spy()
+        agent.plan_round(1, [])
+        self.assertLessEqual(len(agent._checklist_or_default()), 200,
+                             "чек-лист растёт без ограничения (FIX-19)")
+
+    def test_llm_failure_keeps_the_old_checklist(self):
+        agent = self._agent()
+        agent_v2.save_checklist("player1", self.table, "important agenda")
+
+        class Boom(FakeLLM):
+            def chat_json(self, *a, **kw):
+                raise RuntimeError("boom")
+
+        agent.client = Boom()
+        self.assertEqual(agent.plan_round(1, []), "important agenda")
+        self.assertEqual(agent._checklist_or_default(), "important agenda")
+
+    def test_breaker_is_not_swallowed_by_checklist_steps(self):
+        agent = self._agent()
+
+        class Down(FakeLLM):
+            def chat_json(self, *a, **kw):
+                raise LLMUnavailable("server down")
+
+        agent.client = Down()
+        with self.assertRaises(LLMUnavailable):
+            agent.plan_round(1, [])
+        with self.assertRaises(LLMUnavailable):
+            agent.update_checklist("player2", [], 0, 1)
+
+    def test_both_sides_update_after_a_dialogue(self):
+        """Обязательство фиксируют обе стороны, а не только инициатор."""
+        calls = []
+        orig = PlayerAgent.update_checklist
+        PlayerAgent.update_checklist = (
+            lambda self, p, c, n, r: calls.append((self.player_id, p)) or "x")
+        try:
+            FakeLLM.behaviour = {
+                "next_move": lambda u: (
+                    {"action": "talk", "partner": "player2", "reason": "x"}
+                    if "Your player id: player1" in u
+                    and "(no one yet this round)" in u
+                    else {"action": "bet", "reason": "x"}),
+                "dialogue": lambda u: {"message": "deal", "transfer": 0,
+                                       "transfer_to": None, "done": True},
+                "bet": lambda u: {"type": "even_money", "selection": "red",
+                                  "amount": 1},
+            }
+            self.run_game(rounds=1, winning_number=0)
+        finally:
+            PlayerAgent.update_checklist = orig
+        self.assertIn(("player1", "player2"), calls)
+        self.assertIn(("player2", "player1"), calls)
 
 
 if __name__ == "__main__":

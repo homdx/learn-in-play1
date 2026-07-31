@@ -65,6 +65,47 @@ def _ollama_chat_url(base_url: str) -> str:
     return f"{base}/api/chat"
 
 
+class LLMUnavailable(RuntimeError):
+    """
+    FIX-17: сервер моделей недоступен подряд слишком много раз.
+
+    Это НЕ обычная ошибка вызова: обычную агент гасит и уходит в заглушку
+    (аварийная ставка, "просто ставлю", пустая реплика). Именно поэтому в
+    реальном прогоне падение ollama осталось незамеченным — игра доиграла
+    два раунда за одну секунду на одних заглушках, записала пять фиктивных
+    ставок по 1 монете в раунд и объявила партию законченной.
+
+    Это исключение агенты НЕ гасят, а прокидывают наверх: раунд обрывается
+    без сохранения, а не играется вслепую. Благодаря чекпойнтам Фазы 0 и
+    фазы диалогов его можно доиграть после починки сервера.
+    """
+
+
+def _note_failure(exc):
+    _Breaker.failures += 1
+    if _Breaker.failures >= _Breaker.threshold:
+        raise LLMUnavailable(
+            f"{_Breaker.failures} LLM-вызовов подряд завершились ошибкой "
+            f"(последняя: {exc}). Раунд прерван, чтобы не доигрывать его на "
+            f"аварийных заглушках."
+        ) from None
+
+
+class _Breaker:
+    """
+    FIX-17: состояние выключателя. Живёт ОТДЕЛЬНО от LLMClient намеренно.
+
+    Это здоровье сервера моделей, а не свойство класса-обёртки: экземпляров
+    клиента много (по одному на агента), сервер один. Держать счётчик
+    атрибутом LLMClient оказалось вдобавок хрупко — обращение по глобальному
+    имени внутри собственных методов ломается, если имя в модуле подменить
+    (например, заглушкой в тестах), а `cls._failures += 1` из подкласса
+    молча заводит отдельный счётчик на подклассе вместо общего.
+    """
+    failures = 0
+    threshold = 6
+
+
 class LLMClient:
     """
     Обёртка над одним профилем API (см. [api] / [api_local] / [api_remote]
@@ -182,9 +223,31 @@ class LLMClient:
         text = self._extract_content(raw)
         return strip_think(text)
 
+    @classmethod
+    def configure_breaker(cls, threshold: int):
+        _Breaker.threshold = max(1, int(threshold))
+        _Breaker.failures = 0
+
+    @classmethod
+    def reset_breaker(cls):
+        _Breaker.failures = 0
+
     def chat_json(self, system: str, user: str, temperature: float = 0.4,
                   max_tokens: int = 400) -> dict:
         """Как chat(), но парсит ответ как JSON (снимая ``` обёртку при необходимости)."""
-        text = self.chat(system, user, temperature=temperature, max_tokens=max_tokens)
-        cleaned = strip_json_fence(text)
-        return json.loads(cleaned)
+        try:
+            text = self.chat(system, user, temperature=temperature,
+                             max_tokens=max_tokens)
+            cleaned = strip_json_fence(text)
+            result = json.loads(cleaned)
+        except LLMUnavailable:
+            raise
+        except Exception as e:
+            # FIX-17: разрыв связи и битый JSON считаем по-разному. Битый JSON
+            # означает, что сервер жив и отвечает — модель просто не попала в
+            # формат, это штатная ситуация с ретраем, а не повод рвать раунд.
+            if not isinstance(e, (json.JSONDecodeError, ValueError)):
+                _note_failure(e)
+            raise
+        _Breaker.failures = 0
+        return result
