@@ -2279,5 +2279,165 @@ class TestBailout(unittest.TestCase):
             "объявление подставлено не во все четыре промпта")
 
 
+# ── FIX-22: reflect_betting ретраится и не врёт про баланс при сбое ────────
+
+class TestReflectBettingRetryAndFallback(GameHarness):
+    """
+    Реальный случай из разбора партии: у player2 reflect_betting упал по
+    504-таймауту, старые заметки остались как есть — синапса продолжала
+    утверждать "Balance: 115... WON", хотя реальный баланс был 80 и
+    последняя ставка была проиграна. Игрок планировал следующий раунд по
+    заведомо неверным фактам о самом себе.
+    """
+
+    def _entry(self, round_no=2, winning_number=35, win=False,
+               payout=0, balance_after=80):
+        return {
+            "round_no": round_no,
+            "winning_number": winning_number,
+            "bet": {"type": "even_money", "amount": 15},
+            "win": win,
+            "payout": payout,
+            "balance_after": balance_after,
+        }
+
+    def test_single_transient_failure_is_retried_and_recovers(self):
+        cfg = make_cfg(self.table, self.logs, 1)
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table, cfg)
+        agent.balance = 80
+        agent_v2.save_notes("player1", self.table, "old stale strategy text")
+
+        calls = {"n": 0}
+
+        def flaky_reflect(user):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("HTTP 504 Gateway Time-out")
+            return {"notes": "fresh notes after retry", "update_persona": False}
+
+        FakeLLM.behaviour = {"reflect": flaky_reflect}
+        agent.reflect_betting(self._entry())
+
+        self.assertEqual(calls["n"], 2,
+                         "первый сбой должен привести ровно к одному "
+                         "повторному вызову (FIX-22)")
+        notes = agent_v2.load_notes("player1", self.table)
+        self.assertEqual(notes, "fresh notes after retry",
+                         "успешный ретрай должен победить, а не старые "
+                         "заметки (FIX-22)")
+
+    def test_repeated_failure_does_not_silently_keep_stale_notes(self):
+        cfg = make_cfg(self.table, self.logs, 1)
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table, cfg)
+        agent.balance = 80
+        agent_v2.save_notes(
+            "player1", self.table,
+            "Balance: 115. Last bet: even_money(red), amount 10, WON. Net +10."
+        )
+
+        def always_fails(user):
+            raise RuntimeError("HTTP 504 Gateway Time-out")
+
+        FakeLLM.behaviour = {"reflect": always_fails}
+        agent.reflect_betting(self._entry(balance_after=80))
+
+        notes = agent_v2.load_notes("player1", self.table)
+        self.assertIn("80", notes,
+                      "реальный баланс должен появиться в заметках даже "
+                      "при двойном сбое (FIX-22)")
+        self.assertIn("FACT-CHECK", notes,
+                      "должна быть явная фактическая справка, а не тихая "
+                      "подмена (FIX-22)")
+        self.assertIn("lost", notes.lower(),
+                      "реальный исход последней ставки (проигрыш) должен "
+                      "быть отражён, а не унаследованное 'WON' (FIX-22)")
+        # старый текст стратегии не выбрасывается — он просто больше не
+        # единственный источник фактов
+        self.assertIn("Balance: 115", notes,
+                      "старый текст стратегии должен сохраниться под "
+                      "справкой, а не быть стёрт (FIX-22)")
+
+    def test_fallback_respects_synapse_char_limit(self):
+        cfg = make_cfg(self.table, self.logs, 1)
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table, cfg)
+        agent.balance = 80
+        agent.synapse_chars = 50
+        agent_v2.save_notes("player1", self.table, "x" * 500)
+
+        def always_fails(user):
+            raise RuntimeError("boom")
+
+        FakeLLM.behaviour = {"reflect": always_fails}
+        agent.reflect_betting(self._entry())
+
+        notes = agent_v2.load_notes("player1", self.table)
+        self.assertLessEqual(len(notes), 50,
+                             "справка о факте не должна пробивать лимит "
+                             "синапсы (FIX-22)")
+
+    def test_bankrupt_fallback_states_no_bet_placed(self):
+        cfg = make_cfg(self.table, self.logs, 1)
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table, cfg)
+        agent.balance = 0
+        agent_v2.save_notes("player1", self.table, "old plan assuming capital")
+
+        def always_fails(user):
+            raise RuntimeError("boom")
+
+        FakeLLM.behaviour = {"reflect": always_fails}
+        agent.reflect_betting(None)
+
+        notes = agent_v2.load_notes("player1", self.table)
+        self.assertIn("0", notes)
+        self.assertIn("no bet", notes.lower())
+
+
+# ── FIX-23: номер раунда не путается с выпавшим числом рулетки ─────────────
+
+class TestReflectPromptDisambiguatesSpinVsRound(GameHarness):
+    """
+    В логах партии player4 записал в свою синапсу "Round 35: Staked 10..."
+    вместо настоящего номера раунда (2) — спутав его с выпавшим на рулетке
+    числом 35. Промпт должен явно различать эти два числа.
+    """
+
+    def test_prompt_labels_winning_number_and_round_separately(self):
+        cfg = make_cfg(self.table, self.logs, 1)
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table, cfg)
+        agent.balance = 95
+
+        seen_user = {}
+
+        def capture(user):
+            seen_user["text"] = user
+            return {"notes": "ok", "update_persona": False}
+
+        FakeLLM.behaviour = {"reflect": capture}
+        entry = {
+            "round_no": 2,
+            "winning_number": 35,
+            "bet": {"type": "even_money", "amount": 10},
+            "win": False,
+            "payout": 0,
+            "balance_after": 95,
+        }
+        agent.reflect_betting(entry)
+
+        text = seen_user["text"]
+        self.assertIn("winning_number=35", text,
+                      "выпавшее число должно быть явно подписано (FIX-23)")
+        self.assertIn("round 2", text,
+                      "номер раунда должен присутствовать отдельно от "
+                      "выпавшего числа (FIX-23)")
+        self.assertNotIn("Round result: number=35", text,
+                         "старая двусмысленная формулировка не должна "
+                         "оставаться в промпте (FIX-23)")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

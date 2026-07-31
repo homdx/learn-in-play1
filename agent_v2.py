@@ -18,6 +18,7 @@ from datetime import datetime
 
 import common
 import promise_ledger
+import roles
 import transfer_ledger
 from llm_client import LLMClient, LLMUnavailable
 
@@ -302,6 +303,26 @@ def _as_text(value, fallback=""):
     if isinstance(value, dict):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
+
+
+def _stamp_stale_notes(old_notes: str, last_entry, real_balance: int,
+                       char_limit: int) -> str:
+    """FIX-22: когда reflect_betting дважды не смог обновить синапсу, мы
+    больше не отдаём старый текст как есть — он мог описывать другой баланс
+    и другой исход ставки (см. player2 в разборе партии: синапса говорила
+    "Balance: 115... WON", хотя реально было 80 и проигрыш). Приклеиваем
+    сверху короткую, гарантированно верную фактическую справку, оставляя
+    сам текст стратегии нетронутым внизу — под общим лимитом синапсы."""
+    if last_entry is None:
+        fact = f"[FACT-CHECK: balance is {real_balance}, no bet was placed last round.]"
+    else:
+        outcome = "WON" if last_entry.get("win") else "lost"
+        fact = (
+            f"[FACT-CHECK: balance is {real_balance} (not what the strategy text "
+            f"below may say). Last bet {outcome}, payout={last_entry.get('payout')}.] "
+        )
+    stale = f"{fact}\n{old_notes or ''}"
+    return stale[:char_limit]
 
 
 def _empty_dsyn():
@@ -630,7 +651,8 @@ feels promising, and refine it round by round based on what actually works.
 # ─────────────────────────────────────────────────────── PlayerAgent ──────
 
 class PlayerAgent:
-    def __init__(self, player_id, base_dir, cfg, logger=None):
+    def __init__(self, player_id, base_dir, cfg, logger=None,
+                 roles_assignment=None):
         self.player_id = player_id
         self.base_dir = base_dir
         self.cfg = cfg
@@ -678,8 +700,26 @@ class PlayerAgent:
 
         self.balance = load_balance(player_id, base_dir, self.start_balance)
 
+        # ROLE-1: назначаемая роль из [roles]. Разбор конфига идемпотентен и
+        # дешёвый, поэтому агент может сделать его сам — это позволяет
+        # создавать PlayerAgent вне run_game_v2 (тесты, отдельные утилиты) без
+        # обязательной передачи готового RoleAssignment.
+        if roles_assignment is not None:
+            self.roles = roles_assignment
+        else:
+            players = [p.strip() for p in
+                       cfg.get("game", "players", fallback="").split(",") if p.strip()]
+            if player_id not in players:
+                players = players + [player_id]
+            self.roles = roles.parse_roles(cfg, players)
+        self.role           = self.roles.role_of(player_id)
+        self.persona_locked = self.roles.is_locked(player_id)
+
         pf = prompt_file(player_id, base_dir)
-        if not os.path.exists(pf):
+        seeded = roles.seed_prompt_file(pf, self.roles, player_id, save_text)
+        if seeded:
+            self._log(f"role={self.role} persona_locked={self.persona_locked}")
+        elif not os.path.exists(pf):
             save_text(pf, DEFAULT_PERSONA_PROMPT)
 
     @property
@@ -819,6 +859,17 @@ class PlayerAgent:
         """
         persona = self.persona_prompt
         if len(persona) <= self.persona_chars:
+            return persona
+
+        # ROLE-1: у запертой персоны сжатие не просто бессмысленно — оно
+        # ВРАЖДЕБНО. Сжатие делается моделью, а модель, переписывая текст
+        # роли, неизбежно смягчает и обобщает его; через два-три сжатия от
+        # инструкции остаётся пересказ. Заперта — значит заперта, включая
+        # «безобидные» перезаписи. От переполнения контекста защищает
+        # жёсткая обрезка в abstract_prompt, она не пишет на диск.
+        if self.persona_locked:
+            self._log(f"persona locked (role={self.role}) — skipping compression "
+                      f"of {len(persona)} chars; hard cap still applies per call")
             return persona
 
         # FIX-12b: сам вызов сжатия кладёт персону в user-сообщение целиком.
@@ -1085,55 +1136,119 @@ class PlayerAgent:
             )
         else:
             outcome = "WON" if last_entry["win"] else "lost"
+            # FIX-23: раньше поле называлось просто "number=", без уточнения,
+            # что это номер ВЫПАВШЕГО ЧИСЛА рулетки (0-36), а не номер раунда.
+            # На практике одна из моделей (player4) начала путать их и писала
+            # в свою синапсу "Round 35: ..." вместо настоящего номера раунда —
+            # ошибка тихо копилась раунд за раундом. Явно называем и подписываем
+            # оба числа, чтобы модели было не за что зацепиться для путаницы.
+            round_no = last_entry.get("round_no")
+            round_tag = f"round {round_no}" if round_no is not None else "this round"
             result_line = (
-                f"Round result: number={last_entry['winning_number']}, "
+                f"Result of {round_tag} (note: this is the ROUND number, separate "
+                f"from the roulette wheel's winning number below): "
+                f"winning_number={last_entry['winning_number']}, "
                 f"bet={last_entry['bet']['type']} amount={last_entry['bet']['amount']} → "
                 f"{outcome}, payout={last_entry['payout']}, "
                 f"balance={last_entry['balance_after']}.\n\n"
+            )
+
+        # ROLE-1: у запертой персоны просить new_persona нельзя. Дело не в
+        # экономии токенов: если попросить и потом отбросить, модель каждый
+        # раунд формулирует «новую себя», видит, что мир её не принял, и
+        # начинает описывать этот конфликт в СИНАПСЕ — то есть роль всё равно
+        # размывается, только через другой файл. Проще не спрашивать.
+        if self.persona_locked:
+            persona_block = (
+                f"Your persona/strategy text (fixed for this game — you cannot "
+                f"edit it, and you are not being asked to):\n{persona}\n\n"
+                f"Update your betting synapse only.\n"
+                f"Return ONLY JSON:\n"
+                f"{{\"notes\": \"updated strategy (max {self.synapse_chars} chars)\"}}"
+            )
+        else:
+            persona_block = (
+                f"Current persona/strategy text (the ONLY part of your prompt you can edit):\n"
+                f"{persona}\n\n"
+                f"Update your betting synapse. You may also rewrite your persona/strategy text "
+                f"(NOT the core game rules — those are fixed and always apply regardless of what "
+                f"you write here; betting, paid services, and negotiation with other players remain "
+                f"available to you no matter how you rewrite this section).\n"
+                f"Return ONLY JSON:\n"
+                f"{{\"notes\": \"updated strategy (max {self.synapse_chars} chars)\",\n"
+                f" \"update_persona\": true/false,\n"
+                f" \"new_persona\": \"full new persona/strategy text, MAX {self.persona_chars} "
+                f"characters (only if update_persona=true). Keep it tight: this text is "
+                f"prepended to every prompt you receive, so bloat here crowds out your "
+                f"synapses and the public ledger.\"}}"
             )
 
         user_msg = (
             result_line +
             f"Current betting synapse:\n{notes or '(empty)'}\n\n"
             f"Round history:\n{hist_text}\n\n"
-            f"Current persona/strategy text (the ONLY part of your prompt you can edit):\n"
-            f"{persona}\n\n"
-            f"Update your betting synapse. You may also rewrite your persona/strategy text "
-            f"(NOT the core game rules — those are fixed and always apply regardless of what "
-            f"you write here; betting, paid services, and negotiation with other players remain "
-            f"available to you no matter how you rewrite this section).\n"
-            f"Return ONLY JSON:\n"
-            f"{{\"notes\": \"updated strategy (max {self.synapse_chars} chars)\",\n"
-            f" \"update_persona\": true/false,\n"
-            f" \"new_persona\": \"full new persona/strategy text, MAX {self.persona_chars} "
-            f"characters (only if update_persona=true). Keep it tight: this text is "
-            f"prepended to every prompt you receive, so bloat here crowds out your "
-            f"synapses and the public ledger.\"}}"
+            + persona_block
         )
-        try:
-            resp = self.client.chat_json(
-                system=self.abstract_prompt + "\nTASK: Reflect on last round. Update betting synapse.",
-                user=user_msg, temperature=0.5, max_tokens=self.tok_reflect
-            )
-            # FIX-6: модель периодически возвращает notes/new_persona
-            # списком или dict-ом. Раньше это молча записывалось на диск и
-            # падало позже, вне try — на len(notes) в компрессоре синапсы.
-            new_notes = _as_text(resp.get("notes"), notes)[:self.synapse_chars]
-            if resp.get("update_persona") and resp.get("new_persona"):
-                # FIX-12: модель регулярно превышает объявленный лимит —
-                # обрезаем по границе предложения, а не доверяем на слово.
-                raw_persona = _as_text(resp["new_persona"], persona)
-                new_persona = _truncate_text(raw_persona, self.persona_chars)
-                if len(raw_persona) > len(new_persona):
-                    self._log(f"new persona {len(raw_persona)} chars > limit "
-                              f"{self.persona_chars} — truncated")
-                save_text(prompt_file(self.player_id, self.base_dir), new_persona)
-                self._log(f"PERSONA REWRITTEN ({len(new_persona)} chars):\n{new_persona}")
-        except LLMUnavailable:
-            raise            # FIX-17: выключатель наверх, не в заглушку
-        except Exception as e:
-            self._log(f"reflect_betting failed ({e}), keeping old notes")
-            new_notes = notes
+        # FIX-22: раньше один-единственный сбой (504 от прокси, битый JSON,
+        # что угодно) молча оставлял СТАРУЮ синапсу как есть — а в ней мог
+        # быть вчерашний баланс и "last bet WON", хотя на самом деле только
+        # что был проигрыш. Игрок в следующем раунде принимал решения по
+        # заведомо неверным фактам о самом себе. Живой пример из партии:
+        # player2 вошёл в R3 с синапсой "Balance: 115... WON", хотя баланс
+        # был 80 и последняя ставка была проиграна.
+        #
+        # Лечим в два слоя:
+        #  1) один ретрай перед тем как сдаться — 504 и битый JSON нередко
+        #     разовые, повторный запрос часто проходит;
+        #  2) если и ретрай не помог, не отдаём старый текст молча: клеим
+        #     сверху короткую фактическую справку (реальный баланс и исход
+        #     последнего раунда), чтобы следующий раунд агент планировал
+        #     хотя бы от правильных цифр, даже если сама стратегия внутри
+        #     синапсы устарела.
+        new_notes = None
+        last_err = None
+        for attempt in range(2):
+            try:
+                resp = self.client.chat_json(
+                    system=self.abstract_prompt + "\nTASK: Reflect on last round. Update betting synapse.",
+                    user=user_msg, temperature=0.5, max_tokens=self.tok_reflect
+                )
+                # FIX-6: модель периодически возвращает notes/new_persona
+                # списком или dict-ом. Раньше это молча записывалось на диск и
+                # падало позже, вне try — на len(notes) в компрессоре синапсы.
+                new_notes = _as_text(resp.get("notes"), notes)[:self.synapse_chars]
+                if self.persona_locked and resp.get("update_persona"):
+                    # ROLE-1: модель всё равно иногда возвращает поле, которого
+                    # у неё не просили. Пишем это в лог, а не игнорируем молча:
+                    # частота попыток переписать роль — сама по себе результат
+                    # эксперимента (насколько персона «давит» на агента).
+                    self._log(f"persona locked (role={self.role}) — "
+                              f"ignored attempted rewrite")
+                elif resp.get("update_persona") and resp.get("new_persona"):
+                    # FIX-12: модель регулярно превышает объявленный лимит —
+                    # обрезаем по границе предложения, а не доверяем на слово.
+                    raw_persona = _as_text(resp["new_persona"], persona)
+                    new_persona = _truncate_text(raw_persona, self.persona_chars)
+                    if len(raw_persona) > len(new_persona):
+                        self._log(f"new persona {len(raw_persona)} chars > limit "
+                                  f"{self.persona_chars} — truncated")
+                    save_text(prompt_file(self.player_id, self.base_dir), new_persona)
+                    self._log(f"PERSONA REWRITTEN ({len(new_persona)} chars):\n{new_persona}")
+                last_err = None
+                break
+            except LLMUnavailable:
+                raise            # FIX-17: выключатель наверх, не в заглушку
+            except Exception as e:
+                last_err = e
+                if attempt == 0:
+                    self._log(f"reflect_betting failed ({e}), retrying once")
+                    continue
+
+        if last_err is not None:
+            self._log(f"reflect_betting failed twice ({last_err}), "
+                      f"keeping old notes with a corrected fact header")
+            new_notes = _stamp_stale_notes(notes, last_entry, self.balance,
+                                          self.synapse_chars)
 
         save_notes(self.player_id, self.base_dir, new_notes)
         self._log(f"betting synapse → {new_notes[:120]}{'…' if len(new_notes) > 120 else ''}")

@@ -17,6 +17,7 @@ import json
 import time
 
 import common
+import roles
 import transfer_ledger
 from agent_v2 import PlayerAgent, load_balance, save_balance
 from croupier_v2 import run_round
@@ -436,6 +437,13 @@ def main():
     os.makedirs(logs_dir, exist_ok=True)
 
     players = [p.strip() for p in cfg.get("game", "players").split(",") if p.strip()]
+
+    # ROLE-1: разбираем [roles] ДО создания логгера и агентов. Опечатка в
+    # имени игрока или роли роняет запуск здесь, на нулевой стоимости, а не
+    # через двадцать раундов и сотню вызовов модели, когда выяснится, что
+    # роль не применилась и весь прогон бессмыслен.
+    role_assignment = roles.parse_roles(cfg, players)
+
     rounds = args.rounds or cfg.getint("game", "rounds", fallback=10)
     round_delay = cfg.getfloat("game", "round_delay_sec", fallback=0)
 
@@ -460,8 +468,11 @@ def main():
             f"=== Casino v2 start. Players: {players}. Rounds: {rounds}. Table: {base_dir} ==="
         )
 
+    logger.write_global(role_assignment.summary())
+
     agents: dict[str, PlayerAgent] = {
-        pid: PlayerAgent(pid, base_dir, cfg, logger=logger)
+        pid: PlayerAgent(pid, base_dir, cfg, logger=logger,
+                         roles_assignment=role_assignment)
         for pid in players
     }
 
