@@ -161,6 +161,64 @@ class TestSeeding(RoleHarness):
         for name, text in roles.ROLE_PROMPTS.items():
             self.assertLessEqual(len(text.strip()), 2500, f"role {name} too long")
 
+    def test_role_prompt_has_headroom_for_edits(self):
+        """Впритык к лимиту нельзя: одна правка формулировки — и роль поедет
+        через компрессор. Держим запас."""
+        for name, text in roles.ROLE_PROMPTS.items():
+            self.assertLessEqual(len(text.strip()), 2450,
+                                 f"role {name} has no headroom left")
+
+
+# ──────────────────────────── 2b. содержательные инварианты текстов ───────
+#
+# Прогон 1-4 раундов показал два провала, оба — от формулировки, а не от
+# механики. Эти тесты фиксируют внесённые правки, чтобы они не потерялись
+# при следующем редактировании ролей.
+
+class TestRoleContentInvariants(unittest.TestCase):
+
+    @staticmethod
+    def flat(text):
+        """Схлопнуть переносы: тексты ролей перевёрстываются по ширине 78, и
+        проверка по сырой строке ломалась бы от одной лишней запятой."""
+        return " ".join(text.split())
+
+    def test_black_liar_targets_absent_player_inside_frame_step(self):
+        """Правило «мишень отсутствует» лежало только в DISCIPLINE, внизу, и
+        агент его терял: в R2 он потребовал долг с САМОГО собеседника, тот
+        просто вспомнил, что ничего не обещал, и отказал. Правило обязано
+        стоять в шаге FRAME, где принимается решение."""
+        text = roles.BLACK_LIAR_PROMPT
+        frame = self.flat(text.split("2. FRAME")[1].split("3. SELL")[0])
+        self.assertIn("ABSENT PLAYER", frame)
+        self.assertIn("Never claim", frame)
+        self.assertIn("person you are talking to", frame)
+
+    def test_white_liar_has_empty_ledger_fallback(self):
+        """Метод оракула требует чужих выигрышей. В первых раундах их нет, и
+        без запасного хода роль молчит — что и произошло: player4 за четыре
+        раунда не сделал ни одного заявления об авторстве."""
+        text = self.flat(roles.WHITE_LIAR_PROMPT)
+        self.assertIn("NO WINS YET", text)
+        self.assertIn("do not go quiet", text)
+
+    def test_both_roles_forbid_symmetric_joint_stakes(self):
+        """Оба лжеца скатились в «5c каждый, делим 50/50» — дефолт стола, к
+        которому модель тянет независимо от персоны. Запрет нужен в обеих."""
+        for name, text in roles.ROLE_PROMPTS.items():
+            low = self.flat(text).lower()
+            self.assertIn("symmetric joint stakes", low,
+                          f"role {name} does not forbid symmetric pools")
+            self.assertIn("50/50", text, f"role {name} misses the 50/50 case")
+
+    def test_neither_role_permits_inventing_ledger_facts(self):
+        """Вся конструкция держится на правдивом якоре. Если роль разрешит
+        выдумывать спины, первая же сверка её убьёт."""
+        self.assertIn("Never invent a bet, a spin",
+                      self.flat(roles.BLACK_LIAR_PROMPT))
+        self.assertIn("Never claim a spin",
+                      self.flat(roles.WHITE_LIAR_PROMPT))
+
 
 # ────────────────────────────────── 3. существующий файл персоны ──────────
 
