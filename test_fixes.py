@@ -28,6 +28,8 @@ except ImportError:                      # старый код: выключат
     class LLMUnavailable(RuntimeError):
         pass
 import agent_v2
+import promise_ledger
+import transfer_ledger
 import run_game_v2
 from agent_v2 import PlayerAgent
 
@@ -1605,6 +1607,641 @@ class TestChecklist(GameHarness):
             PlayerAgent.update_checklist = orig
         self.assertIn(("player1", "player2"), calls)
         self.assertIn(("player2", "player1"), calls)
+
+
+# ───────────── FIX-20: структурированный реестр обещаний ──────────────────
+
+class TestPromiseLedger(GameHarness):
+    """
+    README называл это единственным незакрытым пунктом: обещание живёт
+    только в свободном тексте синапсы/чек-листа, и его исполнение никем не
+    проверяется. Эти тесты — контрфактические в том же смысле, что и
+    остальные: они падают, если update_checklist не читает/не сохраняет
+    "promises", или если plan_round не подмешивает деterministic-напоминание.
+    """
+
+    def _agent(self, pid="player1", **memory):
+        cfg = make_cfg(self.table, self.logs, 1)
+        if memory:
+            cfg.read_dict({"memory": {k: str(v) for k, v in memory.items()}})
+        os.makedirs(self.table, exist_ok=True)
+        return PlayerAgent(pid, self.table, cfg)
+
+    def test_promise_extracted_without_an_extra_llm_call(self):
+        """"3 раунда, потом верну деньги" -> сохраняется как структурный
+        промис ОДНИМ и тем же вызовом update_checklist, без нового round-trip'а."""
+        agent = self._agent()
+        calls = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                calls.append(user)
+                return {
+                    "checklist": "ok",
+                    "promises": [{
+                        "direction": "owed_to_me", "counterparty": "player3",
+                        "amount": 20, "due_round": 5,
+                        "description": "play and return the loan", "status": "open",
+                    }],
+                }
+
+        agent.client = Spy()
+        agent.update_checklist("player3", [
+            {"from": "player3",
+             "message": "I'll play for 3 rounds and return your money",
+             "transfer": 0, "transfer_to": None},
+        ], 0, round_no=2)
+
+        self.assertEqual(len(calls), 1, "должен быть ровно один вызов LLM")
+        self.assertIn(promise_ledger.PROMPT_INSTRUCTIONS, calls[0],
+                      "инструкция по promises не попала в тот же промпт")
+        saved = promise_ledger.load_promises("player1", self.table)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["counterparty"], "player3")
+        self.assertEqual(saved[0]["due_round"], 5)
+
+    def test_reminder_is_absent_then_upcoming_then_overdue_without_any_llm_call(self):
+        """Переходы Upcoming -> DUE -> OVERDUE считаются кодом, не моделью:
+        due_reminder не дергает LLM вообще."""
+        os.makedirs(self.table, exist_ok=True)
+        promise_ledger.merge_and_save("player1", self.table, [{
+            "direction": "owed_to_me", "counterparty": "player3",
+            "amount": 20, "due_round": 5, "description": "loan", "status": "open",
+        }], round_no=2)
+
+        r3 = promise_ledger.due_reminder("player1", self.table, round_no=3)
+        self.assertIn("Upcoming", r3)
+        self.assertNotIn("OVERDUE", r3)
+
+        r5 = promise_ledger.due_reminder("player1", self.table, round_no=5)
+        self.assertIn("DUE THIS ROUND", r5)
+
+        r6 = promise_ledger.due_reminder("player1", self.table, round_no=6)
+        self.assertIn("OVERDUE", r6)
+        self.assertIn("player3 owes YOU 20c", r6)
+
+    def test_plan_round_shows_overdue_promise_in_the_actual_prompt(self):
+        """Не просто format-функция сама по себе — проверяем, что plan_round
+        реально подмешивает её в промпт, который уйдёт модели."""
+        agent = self._agent()
+        promise_ledger.merge_and_save("player1", self.table, [{
+            "direction": "owed_to_me", "counterparty": "player3",
+            "amount": 20, "due_round": 2, "description": "loan", "status": "open",
+        }], round_no=1)
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                seen.append(user)
+                return {"checklist": "ok"}
+
+        agent.client = Spy()
+        agent.plan_round(6, ["player3"])
+        self.assertIn("OVERDUE", seen[-1])
+        self.assertIn("player3 owes YOU 20c", seen[-1])
+
+    def test_settled_promise_stops_being_reminded(self):
+        agent = self._agent()
+        promise_ledger.merge_and_save("player1", self.table, [{
+            "direction": "owed_to_me", "counterparty": "player3",
+            "amount": 20, "due_round": 2, "description": "loan", "status": "open",
+        }], round_no=1)
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                return {
+                    "checklist": "ok",
+                    "promises": [{
+                        "direction": "owed_to_me", "counterparty": "player3",
+                        "amount": 20, "due_round": 2, "description": "loan",
+                        "status": "settled",
+                    }],
+                }
+
+        agent.client = Spy()
+        agent.update_checklist("player3", [], 20, round_no=7)
+        self.assertEqual(
+            promise_ledger.due_reminder("player1", self.table, round_no=8), "",
+            "settled-обещание не должно больше маячить в промпте")
+
+    def test_malformed_promises_from_model_never_crash_the_round(self):
+        """Тот же принцип, что FIX-6 для notes/persona: мусор от модели
+        отбрасывается, а не роняет игру и не портит остальные записи."""
+        agent = self._agent()
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                return {"checklist": "ok", "promises": "not a list at all"}
+
+        agent.client = Spy()
+        agent.update_checklist("player3", [], 0, round_no=1)  # не должно бросить
+        self.assertEqual(promise_ledger.load_promises("player1", self.table), [])
+
+        class SpyGarbageItems(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                return {"checklist": "ok", "promises": [
+                    {"direction": "not_a_valid_direction", "amount": 5},
+                    {"direction": "owed_to_me"},               # нет counterparty
+                    "just a string, not even a dict",
+                    {"direction": "i_owe", "counterparty": "player2",
+                     "amount": "not-an-int", "due_round": 3},
+                ]}
+
+        agent.client = SpyGarbageItems()
+        agent.update_checklist("player2", [], 0, round_no=1)
+        self.assertEqual(promise_ledger.load_promises("player1", self.table), [],
+                          "ни одна битая запись не должна была сохраниться")
+
+    def test_missing_promises_field_keeps_prior_structured_list(self):
+        """Если в этот раз модель забыла вернуть 'promises' (старый промпт,
+        сбой парсинга) — не стирать то, что уже отслеживалось."""
+        agent = self._agent()
+        promise_ledger.merge_and_save("player1", self.table, [{
+            "direction": "owed_to_me", "counterparty": "player3",
+            "amount": 20, "due_round": 5, "description": "loan", "status": "open",
+        }], round_no=2)
+
+        class SpyNoPromisesField(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                return {"checklist": "ok"}   # нет "promises" вообще
+
+        agent.client = SpyNoPromisesField()
+        agent.update_checklist("player4", [], 0, round_no=3)
+        # FIX-20a: раньше здесь утверждалось == [] — тест с именем
+        # "keeps_prior_structured_list" закреплял ровно противоположное
+        # поведение и создавал ложное ощущение, что случай покрыт.
+        kept = promise_ledger.load_promises("player1", self.table)
+        self.assertEqual(len(kept), 1,
+                         "отсутствие поля 'promises' стёрло реестр (FIX-20a)")
+        self.assertEqual(kept[0]["counterparty"], "player3")
+        self.assertEqual(kept[0]["amount"], 20)
+        self.assertEqual(kept[0]["status"], "open")
+
+    def test_hard_cap_like_the_checklist_and_persona(self):
+        """Урок FIX-12/19: любой самопишущийся список обязан иметь потолок."""
+        many = [{
+            "direction": "owed_to_me", "counterparty": f"player{i}",
+            "amount": 1, "due_round": 1, "description": "x", "status": "open",
+        } for i in range(promise_ledger.MAX_PROMISES + 10)]
+        os.makedirs(self.table, exist_ok=True)
+        saved = promise_ledger.merge_and_save("player1", self.table, many, round_no=1)
+        self.assertLessEqual(len(saved), promise_ledger.MAX_PROMISES)
+
+    def test_breaker_is_not_swallowed_during_checklist_llm_call(self):
+        """LLMUnavailable должен всплыть наверх ДО того, как promises
+        попытаются сохраниться с несуществующим resp — не тихая заглушка."""
+        agent = self._agent()
+
+        class Down(FakeLLM):
+            def chat_json(self, *a, **kw):
+                raise LLMUnavailable("server down")
+
+        agent.client = Down()
+        with self.assertRaises(LLMUnavailable):
+            agent.update_checklist("player3", [], 0, round_no=1)
+        self.assertEqual(promise_ledger.load_promises("player1", self.table), [])
+
+
+# ───────────── FIX-21: детерминированный журнал переводов между игроками ──
+
+class TestTransferLedger(GameHarness):
+    """
+    Ровно ваш сценарий: player1 просит 30 за стратегию, player2 переводит
+    20, торг о недостающих 10 не завершается сделкой — но 20 монет уже
+    ушли. До этого фикса факт перевода жил ТОЛЬКО в субъективной dsyn
+    каждого игрока (пишет LLM со своей колокольни): ничто не мешало
+    player1 записать «получил подарок», а player2 — «заплатил и ничего не
+    получил», и это два несовместимых рассказа об одном и том же переводе.
+    Эти тесты проверяют, что цифры теперь — общий, до всякого LLM
+    зафиксированный факт, одинаковый для обеих сторон.
+    """
+
+    def test_full_broken_deal_scenario_from_the_conversation(self):
+        """Именно диалог из вопроса: 20 переведено, 10 не переведено,
+        сделка не состоялась — обе стороны видят одни и те же 20/-20."""
+        os.makedirs(self.table, exist_ok=True)
+        agent1 = PlayerAgent("player1", self.table, make_cfg(self.table, self.logs, 1))
+        agent2 = PlayerAgent("player2", self.table, make_cfg(self.table, self.logs, 1))
+        agent1.balance, agent2.balance = 100, 100
+
+        class Scripted(FakeLLM):
+            script = iter([
+                {"message": "Sell you my strategy for 30", "transfer": 0,
+                 "transfer_to": None, "done": False},                       # player1
+                {"message": "Here's 20", "transfer": 20,
+                 "transfer_to": "player1", "done": False},                  # player2
+                {"message": "I said I need 10 more", "transfer": 0,
+                 "transfer_to": None, "done": False},                       # player1
+                {"message": "I paid enough, let's just play", "transfer": 0,
+                 "transfer_to": None, "done": True},                        # player2
+                {"message": "Send the rest or no deal", "transfer": 0,
+                 "transfer_to": None, "done": True},                        # player1 closing? -> но done=True у B уже был
+            ])
+
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                return next(self.script)
+
+        agent1.client = Scripted()
+        agent2.client = Scripted()
+        run_game_v2.run_dialogue(agent1, agent2, round_no=3,
+                                  logger=run_game_v2.GameLogger(self.logs),
+                                  table_dir=self.table)
+
+        e1 = transfer_ledger.load_entries("player1", self.table)
+        e2 = transfer_ledger.load_entries("player2", self.table)
+        self.assertEqual(len(e1), 1)
+        self.assertEqual(len(e2), 1)
+        # player1's side: sent 0, received 20 -> net +20
+        self.assertEqual(e1[0]["sent"], 0)
+        self.assertEqual(e1[0]["received"], 20)
+        self.assertEqual(e1[0]["net"], 20)
+        # player2's side: exactly the mirror -> net -20
+        self.assertEqual(e2[0]["sent"], 20)
+        self.assertEqual(e2[0]["received"], 0)
+        self.assertEqual(e2[0]["net"], -20)
+        # никакого сюрприза: числа буквально зеркальны друг другу
+        self.assertEqual(e1[0]["sent"], e2[0]["received"])
+        self.assertEqual(e1[0]["received"], e2[0]["sent"])
+
+    def test_no_llm_call_needed_to_produce_the_reminder(self):
+        os.makedirs(self.table, exist_ok=True)
+        transfer_ledger.record_dialogue(self.table, "player1", "player2",
+                                        round_no=3, a_sent=0, b_sent=20)
+        # player2's view: sent 20, got nothing back — visible without any LLM
+        block = transfer_ledger.format_recent("player2", self.table)
+        self.assertIn("sent 20c, received 0c (net -20c)", block)
+        # player1's view of the exact same transfer, mirrored
+        block1 = transfer_ledger.format_recent("player1", self.table)
+        self.assertIn("sent 0c, received 20c (net +20c)", block1)
+
+    def test_nothing_recorded_when_no_money_actually_moved(self):
+        """Торг сорвался, но денег не было — журнал не заводит пустых записей."""
+        os.makedirs(self.table, exist_ok=True)
+        transfer_ledger.record_dialogue(self.table, "player1", "player2",
+                                        round_no=1, a_sent=0, b_sent=0)
+        self.assertEqual(transfer_ledger.load_entries("player1", self.table), [])
+        self.assertEqual(transfer_ledger.load_entries("player2", self.table), [])
+
+    def test_replaying_a_round_replaces_not_duplicates(self):
+        """Тот же принцип, что FIX-16 для публичного журнала: одна запись
+        на пару (partner, round_no)."""
+        os.makedirs(self.table, exist_ok=True)
+        transfer_ledger.record_dialogue(self.table, "player1", "player2",
+                                        round_no=3, a_sent=0, b_sent=20)
+        transfer_ledger.record_dialogue(self.table, "player1", "player2",
+                                        round_no=3, a_sent=0, b_sent=25)
+        entries = transfer_ledger.load_entries("player2", self.table)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["sent"], 25)
+
+    def test_appears_in_plan_round_prompt(self):
+        cfg = make_cfg(self.table, self.logs, 1)
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table, cfg)
+        transfer_ledger.record_dialogue(self.table, "player1", "player2",
+                                        round_no=3, a_sent=0, b_sent=20)
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                seen.append(user)
+                return {"checklist": "ok"}
+
+        agent.client = Spy()
+        agent.plan_round(4, ["player2"])
+        self.assertIn("VERIFIED transfer history", seen[-1])
+        self.assertIn("received 20c", seen[-1])
+
+    def test_appears_inside_the_live_dialogue_with_that_partner(self):
+        """Самое важное место: пока идёт спор внутри разговора, обе стороны
+        должны видеть прошлые переводы именно ДРУГ С ДРУГОМ."""
+        cfg = make_cfg(self.table, self.logs, 1)
+        os.makedirs(self.table, exist_ok=True)
+        agent = PlayerAgent("player1", self.table, cfg)
+        transfer_ledger.record_dialogue(self.table, "player1", "player2",
+                                        round_no=3, a_sent=0, b_sent=20)
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.8, max_tokens=400):
+                seen.append(user)
+                return {"message": "m", "transfer": 0, "transfer_to": None,
+                        "done": False}
+
+        agent.client = Spy()
+        agent.dialogue_turn("player2", 100, [], round_no=4, is_initiator=True)
+        self.assertIn("VERIFIED transfer history", seen[-1])
+
+    def test_bounded_like_the_other_self_writing_ledgers(self):
+        os.makedirs(self.table, exist_ok=True)
+        for r in range(transfer_ledger.MAX_ENTRIES_PER_PLAYER + 20):
+            transfer_ledger.record_dialogue(self.table, "player1",
+                                            f"opp{r}", round_no=r,
+                                            a_sent=0, b_sent=1)
+        entries = transfer_ledger.load_entries("player1", self.table)
+        self.assertLessEqual(len(entries), transfer_ledger.MAX_ENTRIES_PER_PLAYER)
+
+
+# ───── FIX-20a..d: реестр обещаний — слияние вместо замещения ─────────────
+
+class TestPromiseMerge(GameHarness):
+
+    def _p(self, cp, amount, due, status="open", direction="owed_to_me", pid=None):
+        d = {"direction": direction, "counterparty": cp, "amount": amount,
+             "due_round": due, "description": "x", "status": status}
+        if pid is not None:
+            d["id"] = pid
+        return d
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(self.table, exist_ok=True)
+
+    def test_a_promise_survives_a_conversation_with_someone_else(self):
+        """
+        Тот самый баг: реестр заменялся целиком тем, что вернула модель, а
+        текущий список ей не показывали вовсе. Долг исчезал не когда его
+        прощали, а когда игрок поговорил с кем-то другим.
+        """
+        promise_ledger.merge_and_save("player1", self.table,
+                                      [self._p("player2", 24, 5)], round_no=4)
+        promise_ledger.merge_and_save("player1", self.table,
+                                      [self._p("player3", 8, 6, direction="i_owe")],
+                                      round_no=4)
+        got = {(p["counterparty"], p["amount"])
+               for p in promise_ledger.load_promises("player1", self.table)}
+        self.assertEqual(got, {("player2", 24), ("player3", 8)},
+                         "обещание пропало после разговора с другим (FIX-20a)")
+
+    def test_omission_means_no_change_not_deletion(self):
+        for payload in (None, [], "not a list", {"nope": 1}):
+            promise_ledger.save_promises("player1", self.table,
+                                         [dict(self._p("player2", 24, 5), id=1)])
+            promise_ledger.merge_and_save("player1", self.table, payload, 4)
+            self.assertEqual(len(promise_ledger.load_promises("player1", self.table)), 1,
+                             f"реестр стёрт при promises={payload!r} (FIX-20a)")
+
+    def test_status_change_by_id(self):
+        promise_ledger.merge_and_save("player1", self.table,
+                                      [self._p("player2", 24, 5)], 4)
+        pid = promise_ledger.load_promises("player1", self.table)[0]["id"]
+        promise_ledger.merge_and_save(
+            "player1", self.table,
+            [self._p("player2", 24, 5, status="settled", pid=pid)], 5)
+        kept = promise_ledger.load_promises("player1", self.table)
+        self.assertEqual(len(kept), 1, "смена статуса создала дубль")
+        self.assertEqual(kept[0]["status"], "settled")
+
+    def test_repeating_a_promise_without_id_does_not_duplicate(self):
+        """Модель часто не возвращает id — опознаём по отпечатку."""
+        for _ in range(4):
+            promise_ledger.merge_and_save("player1", self.table,
+                                          [self._p("player2", 24, 5)], 4)
+        self.assertEqual(len(promise_ledger.load_promises("player1", self.table)), 1,
+                         "обещание продублировалось (FIX-20a)")
+
+    def test_settled_promise_leaves_the_reminder_but_stays_recorded(self):
+        promise_ledger.merge_and_save("player1", self.table,
+                                      [self._p("player2", 24, 5)], 4)
+        pid = promise_ledger.load_promises("player1", self.table)[0]["id"]
+        promise_ledger.merge_and_save(
+            "player1", self.table,
+            [self._p("player2", 24, 5, status="settled", pid=pid)], 5)
+        self.assertEqual(promise_ledger.due_reminder("player1", self.table, 6), "")
+        self.assertEqual(len(promise_ledger.load_promises("player1", self.table)), 1)
+
+    def test_eviction_drops_closed_before_open(self):
+        """FIX-20c: закрытые вытесняются раньше открытых, срок решает порядок."""
+        closed = [self._p(f"c{i}", 1, i, status="settled")
+                  for i in range(promise_ledger.MAX_PROMISES)]
+        promise_ledger.merge_and_save("player1", self.table, closed, 1)
+        fresh = [self._p("player9", 99, 50)]
+        promise_ledger.merge_and_save("player1", self.table, fresh, 1)
+        kept = promise_ledger.load_promises("player1", self.table)
+        self.assertLessEqual(len(kept), promise_ledger.MAX_PROMISES)
+        self.assertIn("player9", [p["counterparty"] for p in kept],
+                      "открытое обещание вытеснено раньше закрытых (FIX-20c)")
+
+    def test_model_is_shown_the_ledger_with_ids(self):
+        """Без этого просьба «обнови статус» ссылаться не на что."""
+        promise_ledger.merge_and_save("player1", self.table,
+                                      [self._p("player2", 24, 5)], 4)
+        txt = promise_ledger.format_for_model("player1", self.table, 5)
+        self.assertIn("id=", txt)
+        self.assertIn("player2 owes you 24c", txt)
+        self.assertIn("due r5", txt)
+
+    def test_update_checklist_prompt_contains_the_ledger(self):
+        promise_ledger.merge_and_save("player1", self.table,
+                                      [self._p("player2", 24, 5)], 4)
+        agent = PlayerAgent("player1", self.table,
+                            make_cfg(self.table, self.logs, 1))
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                seen.append(user)
+                return {"checklist": "ok", "promises": []}
+
+        agent.client = Spy()
+        agent.update_checklist("player3", [], 0, 5)
+        self.assertIn("Your tracked promises", seen[-1],
+                      "реестр не показан модели — переносить нечего (FIX-20a)")
+        self.assertIn("id=", seen[-1])
+        self.assertIn("does not delete it", seen[-1],
+                      "модели не сказано, что пропуск записи безопасен")
+
+    def test_plan_round_can_also_close_a_promise(self):
+        """
+        FIX-20d: раньше статус менялся только в update_checklist, то есть
+        лишь в разговоре. Должник, переставший выходить на связь, оставлял
+        долг просроченным навсегда.
+        """
+        promise_ledger.merge_and_save("player1", self.table,
+                                      [self._p("player2", 24, 5)], 4)
+        pid = promise_ledger.load_promises("player1", self.table)[0]["id"]
+        agent = PlayerAgent("player1", self.table,
+                            make_cfg(self.table, self.logs, 1))
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                assert "Your tracked promises" in user, "реестр не показан в plan_round"
+                return {"checklist": "ok",
+                        "promises": [{"id": pid, "direction": "owed_to_me",
+                                      "counterparty": "player2", "amount": 24,
+                                      "due_round": 5, "description": "x",
+                                      "status": "broken"}]}
+
+        agent.client = Spy()
+        agent.plan_round(9, ["player3"])
+        self.assertEqual(
+            promise_ledger.load_promises("player1", self.table)[0]["status"], "broken")
+
+    def test_reminder_reaches_the_live_dialogue(self):
+        """
+        FIX-20b: долг требуют в разговоре. Реестр переводов там уже был,
+        реестр обещаний — нет.
+        """
+        promise_ledger.merge_and_save("player1", self.table,
+                                      [self._p("player2", 24, 5)], 4)
+        agent = PlayerAgent("player1", self.table,
+                            make_cfg(self.table, self.logs, 1))
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                seen.append(user)
+                return {"message": "pay up", "transfer": 0, "transfer_to": None,
+                        "done": True}
+
+        agent.client = Spy()
+        agent.dialogue_turn("player2", 50, [], 7, is_initiator=True)
+        self.assertIn("OVERDUE", seen[-1],
+                      "просроченный долг не виден в диалоге (FIX-20b)")
+        self.assertIn("player2 owes YOU 24c", seen[-1])
+
+    def test_full_scenario_two_partners_across_rounds(self):
+        """Сквозной: два долга, разные партнёры, погашение одного."""
+        agent = PlayerAgent("player1", self.table,
+                            make_cfg(self.table, self.logs, 1))
+        script = [
+            [self._p("player2", 24, 6)],
+            [self._p("player3", 8, 7, direction="i_owe")],
+            [],
+        ]
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                return {"checklist": "ok",
+                        "promises": script.pop(0) if script else []}
+
+        agent.client = Spy()
+        agent.update_checklist("player2", [], 0, 5)
+        agent.update_checklist("player3", [], 0, 5)
+        agent.update_checklist("player4", [], 0, 5)   # третий разговор — ничего нового
+
+        kept = promise_ledger.load_promises("player1", self.table)
+        self.assertEqual(len(kept), 2, "долги не пережили три разговора (FIX-20a)")
+        reminder = promise_ledger.due_reminder("player1", self.table, 8)
+        self.assertIn("player2 owes YOU 24c", reminder)
+        self.assertIn("YOU owe player3 8c", reminder)
+
+
+class _BailoutAgent:
+    def __init__(self):
+        self.balance = 0
+
+
+class _BailoutLog:
+    """Заглушка GameLogger: копит строки, чтобы проверить, что
+    эмиссия попала и в общий лог, и в персональный."""
+
+    def __init__(self):
+        self.lines = []
+
+    def write_global(self, msg):
+        self.lines.append(("GAME", msg))
+
+    def write(self, pid, msg):
+        self.lines.append((pid, msg))
+
+    def write_balances(self, balances):
+        self.lines.append(("BAL", str(balances)))
+
+
+class TestBailout(unittest.TestCase):
+    """Разовая эмиссия при затяжном нуле."""
+
+    def setUp(self):
+        self.table = tempfile.mkdtemp()
+        self.cfg = configparser.ConfigParser()
+        self.cfg.read_dict({"game": {"bailout_enabled": "true",
+                                     "bailout_zero_rounds": "2",
+                                     "bailout_amount": "20"}})
+        self.players = ["player1", "player2"]
+        self.agents = {p: _BailoutAgent() for p in self.players}
+        self.log = _BailoutLog()
+
+    def _bal(self, pid, v):
+        common.write_json(common.balance_file(pid, self.table), {"balance": v})
+
+    def _run(self, round_no):
+        run_game_v2.apply_bailout_if_needed(
+            self.agents, self.players, self.table, round_no, self.cfg, self.log)
+
+    def test_fires_only_after_more_than_two_zero_rounds(self):
+        self._bal("player1", 0)
+        self._bal("player2", 50)
+        for r in (1, 2):
+            self._run(r)
+            self.assertEqual(
+                run_game_v2.get_balances(self.table, self.players),
+                {"player1": 0, "player2": 50},
+                "эмиссия сработала раньше третьего нулевого раунда")
+        self._run(3)
+        self.assertEqual(
+            run_game_v2.get_balances(self.table, self.players),
+            {"player1": 20, "player2": 70},
+            "+20 не начислены ВСЕМ на третьем нулевом раунде")
+        self.assertEqual(self.agents["player2"].balance, 70,
+                         "баланс агента в памяти разошёлся с диском")
+
+    def test_not_applied_twice_after_restart(self):
+        self._bal("player1", 0)
+        self._bal("player2", 50)
+        for r in (1, 2, 3):
+            self._run(r)
+        self._run(3)            # рестарт внутри того же раунда
+        self.assertEqual(
+            run_game_v2.get_balances(self.table, self.players),
+            {"player1": 20, "player2": 70},
+            "повторный проход раунда начислил эмиссию второй раз")
+
+    def test_streak_resets_after_payout(self):
+        self._bal("player1", 0)
+        self._bal("player2", 50)
+        for r in (1, 2, 3):
+            self._run(r)
+        self._bal("player1", 0)          # снова разорился
+        for r in (4, 5):
+            self._run(r)
+        self.assertEqual(run_game_v2.get_balances(self.table, self.players)["player1"], 0,
+                         "счётчик нулей не обнулился после выплаты")
+        self._run(6)
+        self.assertEqual(run_game_v2.get_balances(self.table, self.players)["player1"], 20)
+
+    def test_notice_is_one_off_and_logged(self):
+        self._bal("player1", 0)
+        self._bal("player2", 50)
+        for r in (1, 2, 3):
+            self._run(r)
+        self.assertIn("+20", common.bailout_notice(self.table, 3))
+        self.assertIn("player1", common.bailout_notice(self.table, 3))
+        self.assertEqual(common.bailout_notice(self.table, 4), "",
+                         "объявление должно быть разовым")
+        self.assertEqual(common.bailout_notice(self.table, 2), "")
+        self.assertTrue(any("BAILOUT" in m for _, m in self.log.lines),
+                        "эмиссия не попала в лог/консоль")
+        self.assertTrue(any(pid == "player2" and "BAILOUT" in m
+                            for pid, m in self.log.lines),
+                        "нет персональной строки в логе игрока")
+
+    def test_disabled_by_config(self):
+        self.cfg["game"]["bailout_enabled"] = "false"
+        self._bal("player1", 0)
+        self._bal("player2", 50)
+        for r in (1, 2, 3, 4):
+            self._run(r)
+        self.assertEqual(run_game_v2.get_balances(self.table, self.players),
+                         {"player1": 0, "player2": 50})
+
+    def test_notice_reaches_every_prompt(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "agent_v2.py")
+        src = open(path, encoding="utf-8").read()
+        self.assertEqual(
+            src.count("+ common.bailout_notice(self.base_dir, round_no)"), 4,
+            "объявление подставлено не во все четыре промпта")
 
 
 if __name__ == "__main__":

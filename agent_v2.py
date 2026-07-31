@@ -17,6 +17,8 @@ import re
 from datetime import datetime
 
 import common
+import promise_ledger
+import transfer_ledger
 from llm_client import LLMClient, LLMUnavailable
 
 # ── thresholds (DEFAULTS — переопределяются секциями [memory]/[tokens]) ───
@@ -897,6 +899,7 @@ class PlayerAgent:
             f"of round {round_no}.\n"
             f"Your balance: {self.balance}. "
             f"Players you can talk to: {available_partners}\n\n"
+            + common.bailout_notice(self.base_dir, round_no)
             + _current_round_notice(round_no) +
             f"Casino scoreboard — VERIFIED totals of other players:\n"
             f"{_format_scoreboard(ledger, exclude_pid=self.player_id)}\n\n"
@@ -905,6 +908,8 @@ class PlayerAgent:
             f"Your own recent rounds:\n{_format_history(history, self.history_window)}\n\n"
             f"Your reputation map:\n"
             f"{_format_dsyn_for_prompt(dsyn, self.dsyn_recent, self.deals_shown, self.fails_shown)}\n\n"
+            + transfer_ledger.format_recent(self.player_id, self.base_dir)
+            + promise_ledger.due_reminder(self.player_id, self.base_dir, round_no) +
             f"Your checklist as it stands:\n---\n{checklist}\n---\n\n"
             f"{self._CHECKLIST_OWNERSHIP}\n\n"
             f"Rewrite it for this round. Carry forward anything still open, delete "
@@ -913,7 +918,15 @@ class PlayerAgent:
             f"are owed, and what you must verify against the ledger before paying "
             f"anyone. Be concrete — name players and amounts. Max "
             f"{self.checklist_chars} characters.\n"
-            f"Return ONLY JSON: {{\"checklist\": \"the full new text\"}}"
+            # FIX-20d: правка реестра доступна и здесь. Раньше статус можно
+            # было сменить только в update_checklist, то есть лишь поговорив
+            # с кем-то: если должник перестал выходить на связь, пометить
+            # долг broken было физически нечем, и он висел просроченным вечно.
+            + promise_ledger.format_for_model(self.player_id, self.base_dir, round_no)
+            + "\n" +
+            f"{promise_ledger.PROMPT_INSTRUCTIONS}\n"
+            f"Return ONLY JSON: {{\"checklist\": \"the full new text\", "
+            f"\"promises\": [...]}}"
         )
         system_prompt = self.abstract_prompt + "\nTASK: Plan your round. JSON only."
         try:
@@ -935,6 +948,8 @@ class PlayerAgent:
             return checklist
 
         save_checklist(self.player_id, self.base_dir, new)
+        promise_ledger.merge_and_save(          # FIX-20d
+            self.player_id, self.base_dir, resp.get("promises"), round_no)
         self._log(f"CHECKLIST PLANNED r{round_no} ({len(new)} chars):\n{new}")
         append_checklist_history(
             self.player_id, self.base_dir, f"PLAN_ROUND r{round_no}",
@@ -963,14 +978,24 @@ class PlayerAgent:
             f"(positive = you received).\nYour balance is now {self.balance}.\n\n"
             f"Transcript:\n{conv_txt}\n\n"
             f"Your checklist:\n---\n{checklist}\n---\n\n"
+            # FIX-20a: реестр показываем модели. Раньше её просили «перенести
+            # все открытые обещания», не показав ни одного — выполнить это
+            # было нельзя, и список каждый раз пересочинялся с нуля.
+            + promise_ledger.format_for_model(self.player_id, self.base_dir, round_no)
+            + "\n" +
             f"{self._CHECKLIST_OWNERSHIP}\n\n"
             f"Update it in light of what just happened. Record any concrete "
             f"commitment made — by them to you, and by YOU to them — with the "
-            f"player name, the amount and the round it is due. Tick off anything "
+            f"player name, the amount and the round it is due. A bet either of "
+            f"you places at the casino table is not such a commitment — it is "
+            f"owed to the wheel, not to each other; only record actual transfers "
+            f"or agreed payout splits. Tick off anything "
             f"that was actually settled just now. Note anything they claimed that "
             f"you have not yet checked against the ledger. Max "
             f"{self.checklist_chars} characters.\n"
-            f"Return ONLY JSON: {{\"checklist\": \"the full new text\"}}"
+            f"{promise_ledger.PROMPT_INSTRUCTIONS}\n"
+            f"Return ONLY JSON: {{\"checklist\": \"the full new text\", "
+            f"\"promises\": [...]}}"
         )
         system_prompt = self.abstract_prompt + "\nTASK: Update your checklist. JSON only."
         event = f"UPDATE_CHECKLIST r{round_no} after dialogue with {partner_id}"
@@ -991,6 +1016,11 @@ class PlayerAgent:
             return checklist
 
         save_checklist(self.player_id, self.base_dir, new)
+        # FIX-20: same call, one extra field — no additional LLM round trip.
+        # Malformed/missing "promises" is handled inside promise_ledger and
+        # never raises.
+        promise_ledger.merge_and_save(
+            self.player_id, self.base_dir, resp.get("promises"), round_no)
         self._log(f"CHECKLIST UPDATED after {partner_id} ({len(new)} chars)")
         append_checklist_history(
             self.player_id, self.base_dir, event, system_prompt, user_msg, new)
@@ -1153,6 +1183,7 @@ class PlayerAgent:
             f"Betting synapse:\n{notes or '(empty)'}\n\n"
             f"Dialogue synapse / reputation map of other players:\n{dsyn_txt}\n\n"
             f"Recent casino history:\n{hist_txt}\n\n"
+            + common.bailout_notice(self.base_dir, round_no)
             + _current_round_notice(round_no) +
             f"Casino scoreboard — VERIFIED totals of OTHER players over the WHOLE "
             f"game, computed from the public ledger (this is fact, not opinion, and "
@@ -1337,12 +1368,19 @@ class PlayerAgent:
             + self._checklist_block(
                 "YOUR CHECKLIST (your own agenda — this is what you came to do):") +
             f"Dialogue synapse for {partner_id}:\n{dsyn_txt}\n\n"
+            + common.bailout_notice(self.base_dir, round_no)
             + _current_round_notice(round_no) +
             f"Casino scoreboard — VERIFIED totals from the public ledger. If "
             f"{partner_id} describes their own results, check them here before "
             f"paying for anything:\n{score_txt}\n\n"
             f"Conversation so far:\n{conv_txt or '(just started)'}\n\n"
-            + _dialogue_running_totals(conversation, self.player_id, partner_id) +
+            + _dialogue_running_totals(conversation, self.player_id, partner_id)
+            # FIX-20b: раньше due_reminder стоял ТОЛЬКО в plan_round, хотя
+            # долг требуют именно в разговоре — и реестр переводов здесь уже
+            # был, а реестр обещаний нет. Асимметрия исправлена.
+            + promise_ledger.due_reminder(self.player_id, self.base_dir, round_no)
+            + transfer_ledger.format_recent(self.player_id, self.base_dir,
+                                             partner=partner_id) +
             f"Your balance: {self.balance}. Max transfer: {self.balance} coins.\n\n"
             f"Note: 'transfer' only lets YOU send coins to {partner_id}. If you want THEM "
             f"to pay you, say so in your message and wait for their turn — do not send "
@@ -1505,6 +1543,7 @@ class PlayerAgent:
             f"You are choosing your bet for round {round_no}.\n\n"
             + self._checklist_block("YOUR CHECKLIST:") +
             f"Round history:\n{hist_txt}\n\n"
+            + common.bailout_notice(self.base_dir, round_no)
             + _current_round_notice(round_no) +
             f"Casino scoreboard — VERIFIED totals of OTHER players over the WHOLE "
             f"game, computed from the public ledger. If someone sold you a strategy, "

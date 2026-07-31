@@ -17,6 +17,7 @@ import json
 import time
 
 import common
+import transfer_ledger
 from agent_v2 import PlayerAgent, load_balance, save_balance
 from croupier_v2 import run_round
 from llm_client import LLMClient, LLMUnavailable
@@ -217,6 +218,73 @@ def get_balances(base_dir, players):
     return result
 
 
+def apply_bailout_if_needed(agents, players, base_dir, round_no, cfg, logger):
+    """
+    Разовая эмиссия. Считает серии нулевых балансов и, если у хотя бы
+    одного игрока серия стала БОЛЬШЕ `bailout_zero_rounds`, зачисляет
+    `bailout_amount` монет ВСЕМ игрокам поровну.
+
+    Зачем всем, а не банкроту: точечная докапитализация одного игрока
+    ломает единственный проверяемый факт в игре — публичный журнал. Все
+    остальные видят, что у него из ниоткуда появились деньги, и любая его
+    ложь про «мне вернули долг» становится неопровержимой. Одинаковое
+    начисление всем такого зазора не создаёт, а объявление в промпте
+    (common.bailout_notice) закрывает его окончательно.
+
+    Вызывается ПОСЛЕ Фазы 0 — балансы прошлого раунда к этому моменту уже
+    начислены, — и ДО фазы диалогов, чтобы деньги были на руках у всех до
+    первого разговора.
+
+    Идемпотентность: counted_round помнит, за какой раунд серии уже
+    пересчитаны, поэтому обрыв внутри раунда и повторный запуск не
+    начислят вторую порцию.
+    """
+    if not cfg.getboolean("game", "bailout_enabled", fallback=True):
+        return
+    zero_rounds = cfg.getint("game", "bailout_zero_rounds", fallback=2)
+    amount      = cfg.getint("game", "bailout_amount",      fallback=20)
+
+    state = common.load_bailout_state(base_dir)
+    if state["counted_round"] == round_no:
+        return                                   # уже считали в этом раунде
+
+    balances = get_balances(base_dir, players)
+    streak   = dict(state["zero_streak"])
+    broke    = []
+    for pid in players:
+        if balances.get(pid, 0) <= 0:
+            streak[pid] = streak.get(pid, 0) + 1
+            if streak[pid] > zero_rounds:
+                broke.append(pid)
+        else:
+            streak[pid] = 0
+
+    if broke:
+        detail = ", ".join(f"{pid} ({streak[pid]} round(s) at zero)" for pid in broke)
+        logger.write_global(
+            f"BAILOUT: {detail} — house credits +{amount} coin(s) to EVERY "
+            f"player for round {round_no}."
+        )
+        for pid in players:
+            new_balance = balances.get(pid, 0) + amount
+            agents[pid].balance = new_balance
+            save_balance(pid, base_dir, new_balance)
+            logger.write(pid, f"BAILOUT +{amount} coins (balance "
+                              f"{balances.get(pid, 0)} → {new_balance})")
+        logger.write_balances(get_balances(base_dir, players))
+        streak = {pid: 0 for pid in players}      # серия обнуляется всем
+        state["last"] = {
+            "round_no": round_no,
+            "amount": amount,
+            "triggered_by": broke,
+            "zero_rounds": zero_rounds,
+        }
+
+    state["zero_streak"]   = streak
+    state["counted_round"] = round_no
+    common.save_bailout_state(base_dir, state)
+
+
 # ─────────────────────────────────────────── dialogue orchestration ────────
 
 def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
@@ -330,6 +398,10 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
     # Update dialogue synapses
     net_a = b_total_sent - a_total_sent   # positive = A received
     net_b = a_total_sent - b_total_sent   # positive = B received
+    # FIX-21: persist the SAME numbers for both sides before either agent's
+    # (subjective, LLM-written) dsyn gets a chance to disagree about them.
+    transfer_ledger.record_dialogue(table_dir, pid_a, pid_b, round_no,
+                                     a_total_sent, b_total_sent)
     agent_a.update_dsyn(pid_b, conversation, net_a, round_no)
     agent_b.update_dsyn(pid_a, conversation, net_b, round_no)
 
@@ -407,6 +479,10 @@ def main():
                                reflect=(round_no > start_round or last_done > 0),
                                checkpoint_round=round_no)
         clear_phase0_state(base_dir)   # FIX-15: фаза 0 пройдена целиком
+
+        # ── Phase 0b: разовая эмиссия при затяжном нуле ────────────────
+        apply_bailout_if_needed(agents, players, base_dir, round_no,
+                                cfg, logger)
 
         # ── Phase 1: dialogue phase (iterative) ─────────────────────────
         # Each player, in turn, repeatedly decides: talk to a specific

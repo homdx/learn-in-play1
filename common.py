@@ -181,6 +181,72 @@ def read_json(path):
         return json.load(f)
 
 
+
+
+# ---------------------------------------------------------------------------
+# Разовая эмиссия ("bailout"): если хотя бы один игрок сидит на нуле дольше
+# чем N раундов подряд, казино зачисляет ВСЕМ игрокам одинаковую сумму.
+# Состояние живёт в table/bailout_state.json:
+#   zero_streak   — {player_id: сколько раундов подряд баланс <= 0}
+#   counted_round — раунд, для которого серии уже пересчитаны (защита от
+#                   повторного начисления при рестарте после Ctrl+C)
+#   last          — последняя эмиссия: раунд, сумма, из-за кого сработала
+# ---------------------------------------------------------------------------
+
+def bailout_state_file(base_dir=None):
+    base = base_dir or table_dir()
+    return os.path.join(base, "bailout_state.json")
+
+
+def load_bailout_state(base_dir=None):
+    path = bailout_state_file(base_dir)
+    data = read_json(path) if os.path.exists(path) else {}
+    return {
+        "zero_streak":   data.get("zero_streak") or {},
+        "counted_round": data.get("counted_round") or 0,
+        "last":          data.get("last"),
+    }
+
+
+def save_bailout_state(base_dir, state):
+    write_json(bailout_state_file(base_dir), state)
+
+
+def bailout_notice(base_dir, round_no) -> str:
+    """
+    Объявление об эмиссии для промптов — РАЗОВО, только в том раунде, в
+    котором она действительно произошла (в следующем раунде строка снова
+    пустая, начисление уже растворилось в балансе).
+
+    Тот же приём, что и в _current_round_notice(): конкретный факт про ЭТОТ
+    раунд, поставленный вплотную к данным, вместо абзаца в правилах. Без
+    него +20 монет появляются у всех из ниоткуда посреди раунда, и агент,
+    который весь прошлый раунд требовал с кого-то долг, с высокой
+    вероятностью запишет эмиссию себе как «мне вернули» — а плательщик
+    честно скажет, что ничего не отправлял. Поэтому здесь прямо сказано,
+    что деньги пришли ОТ КАЗИНО, всем поровну, и не являются ни платежом,
+    ни возвратом долга.
+    """
+    if round_no is None:
+        return ""
+    last = load_bailout_state(base_dir).get("last") or {}
+    if last.get("round_no") != round_no:
+        return ""
+    who = ", ".join(last.get("triggered_by") or []) or "at least one player"
+    return (
+        f"HOUSE ANNOUNCEMENT — round {round_no}: the casino has just credited "
+        f"EVERY player, including you, with +{last.get('amount', 0)} coin(s). "
+        f"Reason: {who} had a zero balance for more than "
+        f"{last.get('zero_rounds')} consecutive round(s), so the house topped "
+        f"everyone up by the same amount. This is a ONE-OFF payment for round "
+        f"{round_no} only, announced once, and it was IDENTICAL for everyone — "
+        f"nobody was favoured and nobody paid for it. It did NOT come from "
+        f"another player: it is not a gift, not a loan, not a repayment of any "
+        f"debt. Do not treat it as a debt you now owe, do not thank or bill "
+        f"anyone for it, and do not count it as anyone keeping a promise. Your "
+        f"balance quoted below already includes it.\n"
+    )
+
 def write_json(path, data):
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
