@@ -17,6 +17,7 @@ import re
 from datetime import datetime
 
 import common
+import open_bets
 import promise_ledger
 import roles
 import speech_cost
@@ -970,7 +971,8 @@ class PlayerAgent:
             f"Your reputation map:\n"
             f"{_format_dsyn_for_prompt(dsyn, self.dsyn_recent, self.deals_shown, self.fails_shown)}\n\n"
             + transfer_ledger.format_recent(self.player_id, self.base_dir)
-            + promise_ledger.due_reminder(self.player_id, self.base_dir, round_no) +
+            + promise_ledger.due_reminder(self.player_id, self.base_dir, round_no)
+            + open_bets.format_for_prompt(self.base_dir, self.player_id) +
             f"Your checklist as it stands:\n---\n{checklist}\n---\n\n"
             f"{self._CHECKLIST_OWNERSHIP}\n\n"
             f"Rewrite it for this round. Carry forward anything still open, delete "
@@ -1329,6 +1331,7 @@ class PlayerAgent:
             f"(use to fact-check specific claims made in dialogue):\n{public_txt}\n\n"
             f"Dialogues already held by OTHER players this round (you were not part of "
             f"these — you can go ask one of them about it if it seems relevant):\n{others_txt}\n\n"
+            + open_bets.format_for_prompt(self.base_dir, self.player_id) +
             f"Players available to talk to right now: {available_players}\n"
             + self._checklist_block("YOUR CHECKLIST (your own agenda — act on it):") +
             f"Players you already talked to THIS round: {talked_txt}\n\n"
@@ -1534,6 +1537,7 @@ class PlayerAgent:
             # долг требуют именно в разговоре — и реестр переводов здесь уже
             # был, а реестр обещаний нет. Асимметрия исправлена.
             + promise_ledger.due_reminder(self.player_id, self.base_dir, round_no)
+            + open_bets.format_for_prompt(self.base_dir, self.player_id)
             + transfer_ledger.format_recent(self.player_id, self.base_dir,
                                              partner=partner_id)
             + self.tariff.status_text(self.speech_spent_this_dialogue, self.balance)
@@ -1707,6 +1711,7 @@ class PlayerAgent:
             f"this is where you see whether it has ever actually made them "
             f"money:\n{score_txt}\n\n"
             f"Public results — the raw ledger lines behind that scoreboard:\n{public_txt}\n\n"
+            + open_bets.format_for_prompt(self.base_dir, self.player_id) +
             f"Place your bet. Return ONLY JSON:\n"
             f"{{\"type\": \"...\", \"numbers\": [...] OR \"selection\": \"...\", "
             f"\"amount\": N, \"reasoning\": \"short reason\"}}\n"

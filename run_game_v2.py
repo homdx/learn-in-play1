@@ -17,10 +17,11 @@ import json
 import time
 
 import common
+import open_bets
 import roles
 import speech_cost
 import transfer_ledger
-from agent_v2 import PlayerAgent, load_balance, save_balance
+from agent_v2 import PlayerAgent, load_balance, load_history, save_balance
 from croupier_v2 import run_round
 from llm_client import LLMClient, LLMUnavailable
 from game_logger import GameLogger
@@ -295,6 +296,65 @@ def apply_bailout_if_needed(agents, players, base_dir, round_no, cfg, logger):
     common.save_bailout_state(base_dir, state)
 
 
+def _reflect_for_player(agent, pid, base_dir, prev_round, logger):
+    """
+    Рефлексия игрока о ПРЕДЫДУЩЕМ раунде — вызывается прямо перед его
+    собственным ходом, а не общей пачкой в начале раунда.
+
+    BET-2: до сих пор все пятеро рефлексировали до того, как хоть кто-то
+    сходил, поэтому осмысление прошлого раунда происходило в пустом
+    настоящем. Теперь игрок, выходящий третьим, обдумывает прошлый раунд,
+    уже видя ставки первых двух в этом — и его выводы могут учитывать, что
+    стол успел сделать.
+
+    Начисление выплат и запись в журналы к этому моменту уже произошли
+    (Phase 0 в начале раунда, для ВСЕХ сразу — балансы обязаны быть
+    консистентны до первого разговора и до докапитализации). Здесь только
+    LLM-осмысление, поэтому запись берём из личной истории: файл результата
+    давно удалён, а после Ctrl+C его не восстановить.
+    """
+    agent.current_round = prev_round
+    entry = None
+    if prev_round >= 1:
+        for e in reversed(load_history(pid, base_dir)):
+            if e.get("round_no") == prev_round:
+                entry = e
+                break
+        if entry is None:
+            logger.write(pid, "no bet result for last round — reflecting anyway")
+    agent.reflect_betting(entry)
+
+
+def _place_bet_for_player(agent, pid, base_dir, round_no, logger) -> bool:
+    """
+    Разместить ставку игрока. True — ставка на столе (только что
+    поставлена или уже лежала), False — не поставлена.
+
+    BET-1: вызывается сразу после того, как игрок закончил свои
+    разговоры, чтобы следующие игроки видели его ставку.
+
+    Порядок операций сохранён от FIX-3: сначала файл ставки, потом
+    списание. Обрыв между ними даёт "ставка есть, деньги не сняты",
+    и на рестарте проверка os.path.exists её пропустит. Обратный
+    порядок означал бы чистую потерю монет.
+    """
+    if os.path.exists(common.bet_file(pid, base_dir)):
+        logger.write(pid, "already has an unprocessed bet, skipping placement.")
+        return True
+    if agent.balance <= 0:
+        logger.write(pid, "balance is 0, cannot bet.")
+        return False
+
+    bet = agent.decide_bet(round_no)
+    common.write_json(common.bet_file(pid, base_dir), bet)
+    agent.balance -= bet["amount"]
+    save_balance(pid, base_dir, agent.balance)
+    bd = bet.get("numbers", bet.get("selection"))
+    logger.write(pid, f"bet: {bet['type']}({bd}) amount={bet['amount']} "
+                      f"balance_after={agent.balance}")
+    return True
+
+
 # ─────────────────────────────────────────── dialogue orchestration ────────
 
 def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
@@ -531,8 +591,14 @@ def main():
         # ── Phase 0: apply last round results + reflect ────────────────
         # результат относится к ПРЕДЫДУЩЕМУ раунду (записан крупье
         # в конце round_no - 1), а не к текущему round_no
+        # BET-2: рефлексия отсюда УЕХАЛА в фазу диалогов, к ходу каждого
+        # игрока. Здесь остаётся только начисление выплат и записи в
+        # журналы: балансы должны быть консистентны до первого разговора
+        # и до докапитализации, а вот осмысление прошлого раунда полезнее
+        # делать тогда, когда уже видно, что стол успел поставить.
+        do_reflect = (round_no > start_round or last_done > 0)
         settle_pending_results(agents, players, base_dir, round_no - 1, logger,
-                               reflect=(round_no > start_round or last_done > 0),
+                               reflect=False,
                                checkpoint_round=round_no)
         clear_phase0_state(base_dir)   # FIX-15: фаза 0 пройдена целиком
 
@@ -603,6 +669,12 @@ def main():
                 incoming_used, outgoing_used, dialogues_this_round
             )
 
+            # BET-2: рефлексия о прошлом раунде — здесь, а не общей пачкой
+            # в Phase 0. Игрок, выходящий не первым, осмысляет прошлый раунд,
+            # уже видя ставки тех, кто сходил до него.
+            if do_reflect:
+                _reflect_for_player(agent, pid, base_dir, round_no - 1, logger)
+
             # FIX-19: планирование ПЕРЕД диалогами этого игрока. Ставим здесь,
             # а не в начале всей фазы, чтобы агент видел уже состоявшиеся
             # чужие разговоры этого раунда — та же информация, что и при
@@ -671,33 +743,31 @@ def main():
                     incoming_used, outgoing_used, dialogues_this_round
                 )
 
+            # BET-1: игрок отговорил — ставит НЕМЕДЛЕННО, чтобы все,
+            # кто ходит после него, увидели ставку до своих диалогов.
+            _place_bet_for_player(agent, pid, base_dir, round_no, logger)
+
+            # Указатель переводим на СЛЕДУЮЩЕГО игрока: этот и отговорил,
+            # и поставил. Иначе рестарт после Ctrl+C вернул бы нас в
+            # его ход, и он получил бы вторую порцию диалогов
+            # сверх MAX_DIALOGUES_PER_PLAYER.
+            save_dialogue_phase_state(
+                base_dir, round_no, player_index + 1, [],
+                incoming_used, outgoing_used, dialogues_this_round
+            )
+
         # фаза диалогов раунда полностью пройдена — прогресс больше не нужен
         clear_dialogue_phase_state(base_dir)
 
 
 
-        # ── Phase 2: place bets ────────────────────────────────────────
+        # ── Phase 2: страховочная сетка ────────────────────────────
+        # BET-1: в норме все уже поставили внутри фазы диалогов. Сюда
+        # попадают только те, у кого ставка не встала: нулевой баланс на
+        # момент своего хода, сбой LLM, ручное вмешательство. Проход
+        # дешёвый — у поставивших он мгновенно уходит в return.
         for pid in players:
-            agent = agents[pid]
-            if os.path.exists(common.bet_file(pid, base_dir)):
-                logger.write(pid, "already has an unprocessed bet, skipping placement.")
-                continue
-            if agent.balance <= 0:
-                logger.write(pid, "balance is 0, cannot bet.")
-                continue
-
-            bet = agent.decide_bet(round_no)
-            # FIX-3: сначала файл ставки, потом списание. Обрыв между двумя
-            # операциями раньше означал "деньги списаны, ставки нет" —
-            # чистая потеря. Теперь худший случай обратный: ставка есть,
-            # списание не прошло, и на рестарте Фаза 2 её пропустит по
-            # `if os.path.exists(bet_file)`. Деньги не исчезают.
-            common.write_json(common.bet_file(pid, base_dir), bet)
-            agent.balance -= bet["amount"]
-            save_balance(pid, base_dir, agent.balance)
-            bd = bet.get("numbers", bet.get("selection"))
-            logger.write(pid, f"bet: {bet['type']}({bd}) amount={bet['amount']} "
-                             f"balance_after={agent.balance}")
+            _place_bet_for_player(agents[pid], pid, base_dir, round_no, logger)
 
         # ── Phase 3: croupier ─────────────────────────────────────────
         wn_arg = args.winning_number if round_no == 1 else None
