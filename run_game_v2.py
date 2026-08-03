@@ -18,6 +18,7 @@ import time
 
 import common
 import open_bets
+import promise_ledger
 import roles
 import speech_cost
 import transfer_ledger
@@ -32,7 +33,7 @@ MAX_DIALOGUE_TURNS = 4
 # either as the one who initiates (outgoing) or as the one being talked to
 # (incoming). Tracked separately so a popular target doesn't accidentally
 # eat into its own budget for initiating conversations.
-MAX_DIALOGUES_PER_PLAYER = 2
+MAX_DIALOGUES_PER_PLAYER = 3
 
 
 def load_config(path):
@@ -296,6 +297,89 @@ def apply_bailout_if_needed(agents, players, base_dir, round_no, cfg, logger):
     common.save_bailout_state(base_dir, state)
 
 
+def _opening_allowance(agent, default=10) -> int:
+    """Свободная сумма для открывающей реплики из [player] конфига агента."""
+    cfg = getattr(agent, "cfg", None)
+    if cfg is None:
+        return default
+    try:
+        return cfg.getint("player", "opening_transfer_free", fallback=default)
+    except Exception:
+        return default
+
+
+def _cap_opening_transfer(agent, pid, partner_id, requested, conversation,
+                          base_dir, round_no, logger, free_allowance=10):
+    """
+    OPEN-1: перевод в САМОЙ ПЕРВОЙ реплике диалога ограничен размером
+    открытого долга перед этим партнёром — либо небольшой свободной суммой,
+    если долга нет. Что больше, то и разрешено.
+
+    Зачем: в реальном прогоне игрок открыл разговор словами "обсудим за 50
+    монет" и в этой же реплике перевёл половину капитала — до всякого
+    ответа, когда согласовывать было ещё нечего. Ответом было "я
+    стратегиями не торгую".
+
+    Почему не запрет: расчёт по договорённости прошлого раунда выглядит
+    ровно так же и совершенно законен — первая реплика это самое
+    естественное место, чтобы заплатить по обещанию. Такие расчёты видно в
+    реестре обещаний, и они проходят полностью.
+
+    Почему остаётся свободная сумма: небольшой аванс или чаевые в открывающей
+    реплике — осмысленный ход, и реестр обещаний ведёт сама модель, так что
+    подлинная договорённость могла в него просто не попасть. Ограничение
+    целится не в жест, а в его размер: десять монет — приглашение к сделке,
+    пятьдесят из ста — разорение до первого ответа.
+
+    Строго `created_round < round_no`: обещание, взятое в этом же раунде,
+    не могло появиться раньше первого диалога раунда.
+    """
+    if conversation:
+        return requested          # не первая реплика — не наше дело
+    if requested <= 0:
+        return requested
+    debt = promise_ledger.open_debt_to(pid, base_dir, partner_id, round_no)
+    allowed = max(debt, free_allowance)
+    if requested <= allowed:
+        return requested
+    reason = (f"open promise to {partner_id} is {debt}c" if debt
+              else f"no open promise to {partner_id} from an earlier round")
+    logger.write(pid, f"opening-message transfer of {requested} coins CAPPED to "
+                      f"{allowed} — {reason}, and nothing has been agreed in "
+                      f"this dialogue yet")
+    return allowed
+
+
+def _cap_transfer(agent, pid, requested, logger):
+    """
+    SPEND-1: сколько игрок МОЖЕТ отдать в этом раунде сверх уже отданного.
+
+    Ограничение на раунд, а не на реплику. В реальном прогоне игрок за один
+    раунд, до единого вращения, отдал 135 монет из стартовых ста: 75 за
+    "стратегию", которой не получил, 30 в погашение долга, которого не
+    существовало, и 30 тому, кто прямо сказал, что ничего не утверждал.
+    Каждый перевод по отдельности был в пределах баланса — суммарно это
+    разорение за один раунд по несуществующим обязательствам.
+
+    Порог берётся от баланса на НАЧАЛО раунда: иначе полученные в диалоге
+    монеты тут же расширяли бы лимит, и цепочка "получил — отдал больше"
+    воспроизводила бы ту же дыру.
+    """
+    limit = getattr(agent, "transfer_budget_this_round", None)
+    if limit is None:
+        return requested
+    left = max(0, limit - getattr(agent, "sent_this_round", 0))
+    if requested <= left:
+        return requested
+    if left == 0:
+        logger.write(pid, f"transfer of {requested} coins BLOCKED — "
+                          f"round transfer budget ({limit}) already spent")
+    else:
+        logger.write(pid, f"transfer of {requested} coins CAPPED to {left} — "
+                          f"round transfer budget {limit}")
+    return left
+
+
 def _reflect_for_player(agent, pid, base_dir, prev_round, logger):
     """
     Рефлексия игрока о ПРЕДЫДУЩЕМ раунде — вызывается прямо перед его
@@ -403,6 +487,15 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
         # деньги не двигались, но обе стороны видели "[+N coins]" —
         # фантомная сделка, отравлявшая репутацию.
         requested_a = min(turn_a["transfer"], agent_a.balance)
+        # OPEN-1: порядок важен — сначала правило первой реплики, потом
+        # бюджет раунда. Иначе предоплата за воздух съедала бы бюджет,
+        # даже будучи затем обнулённой.
+        # `conversation` здесь ещё не содержит реплику A — она добавляется
+        # ниже, — поэтому пустой список означает именно открывающий ход.
+        requested_a = _cap_opening_transfer(agent_a, pid_a, pid_b, requested_a,
+                                           conversation, table_dir, round_no,
+                                           logger, _opening_allowance(agent_a))
+        requested_a = _cap_transfer(agent_a, pid_a, requested_a, logger)
         transfer_a = 0
         if requested_a > 0 and turn_a.get("transfer_to") == pid_b:
             agent_a.balance -= requested_a
@@ -411,6 +504,7 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             save_balance(pid_b, table_dir, agent_b.balance)
             transfer_a = requested_a
             a_total_sent += requested_a
+            agent_a.sent_this_round = getattr(agent_a, "sent_this_round", 0) + requested_a
         elif requested_a > 0:
             logger.write(pid_a, f"transfer of {requested_a} coins DROPPED "
                                 f"(transfer_to={turn_a.get('transfer_to')!r}, expected {pid_b!r})")
@@ -437,6 +531,14 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
 
         if a_is_closing:
             break                       # закрывающий ход A отыгран — конец
+        if turn_a.get("loop_break"):
+            # LOOP-1: петля — обрыв для ОБОИХ, без закрывающего хода.
+            # Закрывающий ход существует, чтобы доплатить по согласованной
+            # сделке; в зациклившемся споре согласованной сделки нет, и
+            # партнёр использовал этот ход для перевода "в никуда".
+            logger.write_global(f"Dialogue {pid_a}↔{pid_b}: loop — both sides stop, "
+                                f"no closing turn.")
+            break
         if turn_a.get("done"):
             closing_for = pid_b         # B получает один закрывающий ход
 
@@ -452,6 +554,7 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
         )
         # FIX-1 (симметрично для B)
         requested_b = min(turn_b["transfer"], agent_b.balance)
+        requested_b = _cap_transfer(agent_b, pid_b, requested_b, logger)
         transfer_b = 0
         if requested_b > 0 and turn_b.get("transfer_to") == pid_a:
             agent_b.balance -= requested_b
@@ -460,6 +563,7 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             save_balance(pid_a, table_dir, agent_a.balance)
             transfer_b = requested_b
             b_total_sent += requested_b
+            agent_b.sent_this_round = getattr(agent_b, "sent_this_round", 0) + requested_b
         elif requested_b > 0:
             logger.write(pid_b, f"transfer of {requested_b} coins DROPPED "
                                 f"(transfer_to={turn_b.get('transfer_to')!r}, expected {pid_a!r})")
@@ -482,6 +586,10 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
 
         if b_is_closing:
             break                       # закрывающий ход B отыгран — конец
+        if turn_b.get("loop_break"):
+            logger.write_global(f"Dialogue {pid_a}↔{pid_b}: loop — both sides stop, "
+                                f"no closing turn.")
+            break
         if turn_b.get("done"):
             closing_for = pid_a         # A получает закрывающий ход
 
@@ -501,8 +609,13 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
     # (subjective, LLM-written) dsyn gets a chance to disagree about them.
     transfer_ledger.record_dialogue(table_dir, pid_a, pid_b, round_no,
                                      a_total_sent, b_total_sent)
-    agent_a.update_dsyn(pid_b, conversation, net_a, round_no)
-    agent_b.update_dsyn(pid_a, conversation, net_b, round_no)
+    # DSYN-1: передаём ФАКТИЧЕСКИЕ обороты, а не только нетто — те же числа,
+    # что уходят в transfer_ledger строкой выше. Иначе при встречных переводах
+    # синапса показывала бы "отдал 8, получил 0" вместо "отдал 31, получил 23".
+    agent_a.update_dsyn(pid_b, conversation, net_a, round_no,
+                        sent=a_total_sent, received=b_total_sent)
+    agent_b.update_dsyn(pid_a, conversation, net_b, round_no,
+                        sent=b_total_sent, received=a_total_sent)
 
     speech_note = ""
     if tariff.enabled:
@@ -622,6 +735,16 @@ def main():
         # виден всем игрокам, чтобы можно было пойти спросить участника
         # о разговоре, свидетелем которого ты не был
         dialogues_this_round: list[tuple] = []
+
+        # SPEND-1: бюджет переводов на раунд, от баланса на начало раунда.
+        # frac <= 0 или >= 1 отключает ограничение (прежнее поведение).
+        _frac = cfg.getfloat("player", "max_transfer_fraction_round", fallback=0.5)
+        for _pid in players:
+            _ag = agents[_pid]
+            _ag.sent_this_round = 0
+            _ag.transfer_budget_this_round = (
+                None if _frac <= 0 or _frac >= 1 else int(_ag.balance * _frac)
+            )
 
         # FIX-10: порядок хода сдвигается на одного каждый раунд, чтобы
         # позиция «ходит первым вслепую» / «ходит последним со всей

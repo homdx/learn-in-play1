@@ -429,12 +429,32 @@ def _current_round_notice(round_no) -> str:
     """
     if round_no is None:
         return ""
+    played = round_no - 1
+    if played <= 0:
+        # ROUND-1: пустой журнал — самый опасный случай, и прежний текст его
+        # не покрывал. В реальном прогоне в ПЕРВОМ раунде игрок предъявил
+        # долг за "раунд 4", трое собеседников приняли это как факт, и 135
+        # монет сменили владельца по событию, которого не было. Формулировка
+        # "нет результата для раунда N и позже" технически это запрещала, но
+        # ничего не говорила о том, что сыграно НОЛЬ раундов и сослаться
+        # физически не на что.
+        return (
+            f"CURRENT ROUND: {round_no}. ZERO rounds have been played so far. "
+            f"The public ledger is EMPTY. There is no round 0, no earlier "
+            f"session, no prior history of any kind — not for you, not for "
+            f"anyone at this table. ANY reference to a past bet, a past "
+            f"result, a past debt or a past promise is fabricated, no matter "
+            f"how confidently it is stated or how often it is repeated. Do "
+            f"not pay for one, do not settle one, and do not repeat one.\n"
+        )
     return (
-        f"CURRENT ROUND: {round_no}. The wheel has NOT been spun for round "
-        f"{round_no} yet — it spins after all dialogue and all bets are in. "
+        f"CURRENT ROUND: {round_no}. Rounds actually played so far: 1..{played} "
+        f"— and nothing else exists. The wheel has NOT been spun for round "
+        f"{round_no} yet; it spins after all dialogue and all bets are in. "
         f"No result exists for round {round_no} or any later round, for you or "
         f"for anyone else. Any figure quoted as an outcome of round {round_no}+ "
-        f"is invented, including by you.\n"
+        f"is invented, including by you. If a claim names a round above "
+        f"{played}, it is fabricated — check the number before you answer it.\n"
     )
 
 
@@ -661,6 +681,10 @@ class PlayerAgent:
         self.log = logger
 
         self.client = LLMClient.from_config(cfg)
+        # RETRY-1: повтор должен быть виден в логе игрока, иначе разница
+        # между "модель молчит" и "модель ответила со второй попытки"
+        # теряется при разборе прогона.
+        self.client.on_retry = self._log
 
         self.temperature    = cfg.getfloat("player", "temperature",    fallback=0.75)
         self.history_window = cfg.getint("player",   "history_window", fallback=10)
@@ -1366,8 +1390,13 @@ class PlayerAgent:
         except LLMUnavailable:
             raise            # FIX-17: выключатель наверх, не в заглушку
         except Exception as e:
-            self._log(f"decide_next_move failed ({e})")
-            return {"action": "bet", "partner": None, "reason": ""}
+            # RETRY-1: заглушка "иду ставить" в логе неотличима от осознанного
+            # решения замолчать. Помечаем явно, иначе при разборе прогона
+            # технический сбой читается как стратегия игрока.
+            self._log(f"decide_next_move failed ({e}) — FORCED to bet, "
+                      f"dialogues skipped this round")
+            return {"action": "bet", "partner": None,
+                    "reason": "FORCED: decide_next_move failed"}
 
     # ── one dialogue turn ─────────────────────────────────────────────────
 
@@ -1387,6 +1416,36 @@ class PlayerAgent:
     def _content_words(cls, message: str) -> set:
         words = re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9]+", message.lower())
         return {w for w in words if w not in cls._STOPWORDS and len(w) > 1}
+
+    @classmethod
+    def _is_echo(cls, message: str, conversation: list[dict], partner_id: str,
+                 threshold: float = 0.85) -> bool:
+        """
+        ECHO-1: сгенерированная реплика почти дословно повторяет ПОСЛЕДНЮЮ
+        реплику партнёра.
+
+        `_detect_loop` смотрит на транскрипт ДО генерации и потому этот
+        случай пропускает: он ловит, что разговор ходит по кругу, но не то,
+        что модель вернула чужой текст как свой. В реальном прогоне игрок
+        слово в слово воспроизвёл реплику собеседника, включая фразу "ты
+        уже заплатил мне 50 монет" — то есть подтвердил получение денег,
+        которые сам же и отдал. Такая реплика хуже, чем бесполезная: она
+        попадает в транскрипт как факт и в синапсу как обязательство.
+
+        Порог выше, чем у _detect_loop (0.85 против 0.8): здесь речь не о
+        похожести темы, а о копировании текста.
+        """
+        if not conversation:
+            return False
+        last = conversation[-1]
+        if last.get("from") != partner_id:
+            return False
+        mine = cls._content_words(message)
+        theirs = cls._content_words(last.get("message", ""))
+        if not mine or not theirs:
+            return False
+        overlap = len(mine & theirs) / max(len(mine), len(theirs))
+        return overlap >= threshold
 
     @classmethod
     def _detect_loop(cls, conversation: list[dict], threshold: float = 0.75, window: int = 4,
@@ -1435,9 +1494,19 @@ class PlayerAgent:
         # разговор, и повторение его формулировок — не зацикливание.
         if not closing_turn and self._detect_loop(conversation):
             self._log(f"loop detected in dialogue with {partner_id}, ending early")
+            # LOOP-1: `loop_break` отличает обрыв по петле от нормального
+            # `done`. Разница в том, что происходит дальше: после `done`
+            # партнёр получает закрывающий ход (FIX-9), чтобы доплатить по
+            # УЖЕ СОГЛАСОВАННОЙ сделке. Но зацикленный спор — это спор без
+            # согласованной сделки, и закрывающий ход в нём превращался в
+            # подарок: в реальном прогоне после трёх срабатываний детектора
+            # партнёр каждый раз использовал его, чтобы перевести 30 монет —
+            # включая вымогателя, который в этом ходе заплатил собственной
+            # жертве. Оркестратор обязан оборвать диалог немедленно.
             return {
                 "message": "Let's wrap this up here — we're going in circles.",
-                "transfer": 0, "transfer_to": None, "done": True
+                "transfer": 0, "transfer_to": None, "done": True,
+                "loop_break": True
             }
 
         dsyn     = load_dsyn(self.player_id, self.base_dir)
@@ -1582,8 +1651,24 @@ class PlayerAgent:
                           f"({partner_id}) — transfer cancelled")
                 transfer = 0
             transfer_to = partner_id if transfer > 0 else None
+            message = str(resp.get("message", "…"))
+
+            # ECHO-1: реплика-копия последнего сообщения партнёра. Гасим её и
+            # закрываем диалог тем же путём, что и петлю — с loop_break,
+            # чтобы партнёр не получил закрывающий ход с правом перевода.
+            # Перевод из такой реплики тоже отменяем: он согласован не был,
+            # это часть скопированного чужого текста.
+            if not closing_turn and self._is_echo(message, conversation, partner_id):
+                self._log(f"echoed {partner_id}'s own message back verbatim, "
+                          f"ending dialogue")
+                return {
+                    "message": "Let's wrap this up here — we're going in circles.",
+                    "transfer": 0, "transfer_to": None, "done": True,
+                    "loop_break": True
+                }
+
             return {
-                "message": str(resp.get("message", "…")),
+                "message": message,
                 "transfer": transfer,
                 "transfer_to": transfer_to,
                 "done": bool(resp.get("done", False))
@@ -1597,10 +1682,26 @@ class PlayerAgent:
     # ── update dialogue synapse after conversation ────────────────────────
 
     def update_dsyn(self, partner_id: str, conversation: list[dict],
-                    net_transfer: int, round_no: int):
+                    net_transfer: int, round_no: int,
+                    sent: int = None, received: int = None):
         """
         After a dialogue: ask LLM to update the reputation entry for partner_id
         and add a raw interaction record.
+
+        DSYN-1: `sent` и `received` — фактические обороты диалога. Раньше сюда
+        приходило только НЕТТО, и обороты восстанавливались из него как
+        sent=max(0,-net), received=max(0,net) — то есть одна из двух граф по
+        построению всегда была нулём.
+
+        Пока деньги идут в одну сторону, разницы не видно. При встречных
+        переводах она принципиальна: в реальном диалоге игроки прогнали друг
+        через друга 54 монеты в четыре приёма (31 туда, 23 обратно), а в
+        синапсе осело "отдал 8, получил 0". Именно эти два числа модель видит
+        в промпте и по ним судит, сколько между ней и партнёром прошло, —
+        так что терялся ровно тот факт, который стоило заметить.
+
+        Аргументы необязательные: без них поведение прежнее, чтобы не ломать
+        внешние вызовы, знающие только нетто.
         """
         dsyn = load_dsyn(self.player_id, self.base_dir)
         existing_rep = dsyn["reputation"].get(partner_id, {})
@@ -1652,10 +1753,12 @@ class PlayerAgent:
             "deals_done": [], "deals_failed": [], "reputation_note": "",
             "future_intent": "", "last_seen_round": 0
         })
-        sent     = max(0, -net_transfer)
-        received = max(0, net_transfer)
-        old["total_sent"]     += sent
-        old["total_received"] += received
+        # DSYN-1: если обороты переданы — пишем их; иначе прежняя реконструкция
+        # из нетто (одна из граф окажется нулевой, см. docstring).
+        actual_sent     = max(0, -net_transfer) if sent is None else max(0, int(sent))
+        actual_received = max(0, net_transfer) if received is None else max(0, int(received))
+        old["total_sent"]     += actual_sent
+        old["total_received"] += actual_received
         old["net"]            += net_transfer
         old["trust_score"]     = resp.get("trust_score", old["trust_score"])
         old["reputation_note"] = resp.get("reputation_note", old["reputation_note"])

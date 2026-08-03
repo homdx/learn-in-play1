@@ -81,7 +81,24 @@ class LLMUnavailable(RuntimeError):
     """
 
 
+def _is_timeout(exc) -> bool:
+    """
+    Истёкший таймаут — это медленный сервер, а не мёртвый.
+
+    RETRY-1: раньше таймаут увеличивал счётчик предохранителя наравне с
+    разрывом связи, и шесть подряд роняли весь прогон с LLMUnavailable —
+    хотя ollama жив и просто долго думает над промптом в несколько тысяч
+    токенов. На CPU-ноутбуке это штатный режим, а не авария.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    # socket.timeout -> OSError с характерным текстом на старых версиях
+    return isinstance(exc, OSError) and "timed out" in str(exc).lower()
+
+
 def _note_failure(exc):
+    if _is_timeout(exc):
+        return
     _Breaker.failures += 1
     if _Breaker.failures >= _Breaker.threshold:
         raise LLMUnavailable(
@@ -117,7 +134,7 @@ class LLMClient:
     def __init__(self, base_url: str, api_key: str, model: str,
                  api_format: str = "ollama", verify_ssl: bool = True,
                  num_ctx: int = 0, think: "bool | None" = None,
-                 timeout: int = 120):
+                 timeout: int = 120, retries: int = 1, on_retry=None):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -125,6 +142,12 @@ class LLMClient:
         self.num_ctx = num_ctx
         self.think = think
         self.timeout = timeout
+        # RETRY-1: сколько ДОПОЛНИТЕЛЬНЫХ попыток делать при сбое.
+        # 0 — прежнее поведение (одна попытка, дальше заглушка).
+        self.retries = max(0, int(retries))
+        # Необязательный колбэк log(str): клиент не знает про логгер игры,
+        # но вызывающий может подставить свой, чтобы повторы были видны.
+        self.on_retry = on_retry
         self._ssl_context = None if verify_ssl else _make_unverified_context()
 
     @classmethod
@@ -147,10 +170,12 @@ class LLMClient:
         think_raw = cfg.get(api_section, "think", fallback=None)
         think = None if think_raw is None else cfg.getboolean(api_section, "think")
         timeout = cfg.getint("api", "timeout_seconds", fallback=120)
+        retries = cfg.getint("api", "retries", fallback=1)
 
         return cls(base_url=base_url, api_key=api_key, model=model,
                     api_format=api_format, verify_ssl=verify_ssl,
-                    num_ctx=num_ctx, think=think, timeout=timeout)
+                    num_ctx=num_ctx, think=think, timeout=timeout,
+                    retries=retries)
 
     def _build_request(self, system: str, user: str, temperature: float,
                         max_tokens: int):
@@ -234,20 +259,53 @@ class LLMClient:
 
     def chat_json(self, system: str, user: str, temperature: float = 0.4,
                   max_tokens: int = 400) -> dict:
-        """Как chat(), но парсит ответ как JSON (снимая ``` обёртку при необходимости)."""
-        try:
-            text = self.chat(system, user, temperature=temperature,
-                             max_tokens=max_tokens)
-            cleaned = strip_json_fence(text)
-            result = json.loads(cleaned)
-        except LLMUnavailable:
-            raise
-        except Exception as e:
-            # FIX-17: разрыв связи и битый JSON считаем по-разному. Битый JSON
-            # означает, что сервер жив и отвечает — модель просто не попала в
-            # формат, это штатная ситуация с ретраем, а не повод рвать раунд.
-            if not isinstance(e, (json.JSONDecodeError, ValueError)):
-                _note_failure(e)
-            raise
-        _Breaker.failures = 0
-        return result
+        """
+        Как chat(), но парсит ответ как JSON (снимая ``` обёртку при
+        необходимости).
+
+        RETRY-1: при сбое делает ещё self.retries попыток. Повторяем всё,
+        что может пройти со второго раза — таймаут, битый JSON, временную
+        ошибку сервера. НЕ повторяем LLMUnavailable: предохранитель уже
+        решил, что сервера нет, и долбиться в него бессмысленно.
+
+        Цена повтора на CPU-ноутбуке — ещё один таймаут стены, до 15 минут.
+        Это осознанный размен: пропущенный вызов молча превращается в
+        заглушку ("иду ставить", "оставляю старый чек-лист"), и в логе
+        неотличим от осознанного решения игрока. Лучше подождать, чем
+        получить раунд, где молчание игрока — на самом деле сбой связи.
+        """
+        # getattr, а не self.retries: подклассы-заглушки в тестах и в
+        # stub-режиме создаются без вызова __init__, и жёсткое обращение к
+        # атрибуту ломало бы их на ровном месте. Без него — прежнее
+        # поведение: одна попытка.
+        retries = getattr(self, "retries", 0)
+        attempts = retries + 1
+        last = None
+        for attempt in range(1, attempts + 1):
+            try:
+                text = self.chat(system, user, temperature=temperature,
+                                 max_tokens=max_tokens)
+                cleaned = strip_json_fence(text)
+                result = json.loads(cleaned)
+            except LLMUnavailable:
+                raise
+            except Exception as e:
+                last = e
+                if attempt < attempts:
+                    on_retry = getattr(self, "on_retry", None)
+                    if on_retry:
+                        kind = "timeout" if _is_timeout(e) else type(e).__name__
+                        on_retry(f"LLM call failed ({kind}: {e}), "
+                                 f"retry {attempt}/{retries}")
+                    continue
+                # FIX-17: разрыв связи и битый JSON считаем по-разному. Битый
+                # JSON означает, что сервер жив и отвечает — модель просто не
+                # попала в формат, это штатная ситуация, а не повод рвать
+                # раунд. RETRY-1 добавил к этому таймаут: медленный сервер
+                # тоже живой (см. _is_timeout).
+                if not isinstance(e, (json.JSONDecodeError, ValueError)):
+                    _note_failure(e)
+                raise
+            _Breaker.failures = 0
+            return result
+        raise last   # недостижимо, но пусть будет явно

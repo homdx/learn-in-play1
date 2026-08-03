@@ -168,6 +168,40 @@ def merge_and_save(pid, base_dir, model_promises, round_no: int) -> list[dict]:
     return existing
 
 
+def open_debt_to(pid, base_dir, partner: str, before_round: int) -> int:
+    """
+    OPEN-1: сколько `pid` СЕЙЧАС должен `partner` по обещаниям, взятым в
+    ПРЕДЫДУЩИХ раундах.
+
+    Нужно, чтобы отличить погашение прошлой договорённости от предоплаты за
+    ничто. В реальном прогоне игрок открыл диалог словами "обсудим за 50
+    монет" и тут же перевёл половину своего капитала — до всякого ответа,
+    когда согласовывать было ещё нечего. Запрещать перевод в первой реплике
+    целиком нельзя: расчёт по обещанию прошлого раунда выглядит точно так
+    же и является совершенно законным. Различает их именно реестр: у
+    расчёта есть открытая запись `i_owe`, у предоплаты за воздух её нет.
+
+    `before_round` строго: обещание, взятое в ЭТОМ же раунде, ещё не могло
+    появиться до начала первого диалога раунда.
+    """
+    total = 0
+    for p in load_promises(pid, base_dir):
+        if p.get("status") != "open":
+            continue
+        if p.get("direction") != "i_owe":
+            continue
+        if p.get("counterparty") != partner:
+            continue
+        created = int(p.get("created_round", before_round))
+        # Раунды нумеруются с 1. created_round=0 (или меньше) — мусор от
+        # модели: раунда 0 не существует, ровно эту выдумку и ловит
+        # ROUND-1. Такая запись не может обосновать расчёт.
+        if created < 1 or created >= before_round:
+            continue
+        total += int(p.get("amount", 0))
+    return total
+
+
 def format_for_model(pid, base_dir, round_no: int) -> str:
     """
     FIX-20a: текущий реестр, показываемый модели ВМЕСТЕ с id — без этого
