@@ -29,6 +29,13 @@ from game_logger import GameLogger
 
 
 MAX_DIALOGUE_TURNS = 4
+
+# XFER-1: сколько переводов одна сторона может сделать за один диалог.
+# Двух хватает на любую честную сделку — заплатить и, если нужно, доплатить.
+# Третий почти всегда означает, что стороны потеряли нить: в прогонах игрок
+# трижды платил за одну и ту же "схему" (10+10+20) и не получил ничего.
+# 0 или меньше — без ограничения.
+MAX_TRANSFERS_PER_DIALOGUE = 2
 # Safety cap: how many dialogues a single player may have in one round —
 # either as the one who initiates (outgoing) or as the one being talked to
 # (incoming). Tracked separately so a popular target doesn't accidentally
@@ -297,6 +304,32 @@ def apply_bailout_if_needed(agents, players, base_dir, round_no, cfg, logger):
     common.save_bailout_state(base_dir, state)
 
 
+def _cap_dialogue_transfers(agent, pid, requested, made_so_far, limit, logger):
+    """
+    XFER-1: сколько переводов игрок может сделать В ОДНОМ диалоге.
+
+    Ограничение по числу, а не по сумме — SPEND-1 уже держит сумму за раунд.
+    Ловит другой паттерн: деньги ходят туда-сюда вокруг одного и того же
+    пункта, каждый перевод сам по себе законен, а вместе они бессмысленны.
+
+    Два реальных случая из прогонов. Первый: игрок трижды за диалог платил
+    за одну и ту же "схему ставок" (10 + 10 + 20) и не получил ничего.
+    Второй: тот, кто ТРЕБОВАЛ 30 монет, сам их и перевёл, а собеседник
+    перевёл 30 обратно — шестьдесят монет прогнано за два хода при нулевом
+    итоге. Модель теряет направление сделки, и чем больше у неё попыток,
+    тем дороже это обходится.
+
+    Два перевода на диалог хватает на любую честную сделку: заплатить и,
+    если понадобилось, доплатить. Третий почти всегда означает, что стороны
+    потеряли нить.
+    """
+    if limit <= 0 or made_so_far < limit:
+        return requested
+    logger.write(pid, f"transfer of {requested} coins BLOCKED — already made "
+                      f"{made_so_far} transfer(s) in this dialogue (limit {limit})")
+    return 0
+
+
 def _opening_allowance(agent, default=10) -> int:
     """Свободная сумма для открывающей реплики из [player] конфига агента."""
     cfg = getattr(agent, "cfg", None)
@@ -453,6 +486,8 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
     conversation = []
     a_total_sent = 0
     b_total_sent = 0
+    a_transfers  = 0        # XFER-1: число переводов, а не сумма
+    b_transfers  = 0
     # TALK-1: плата за слова, уходящая казино. Счётчики обнуляются на каждый
     # диалог: агент должен видеть расход именно этого разговора, иначе
     # цифра быстро становится фоновой и перестаёт влиять на решение.
@@ -495,6 +530,9 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
         requested_a = _cap_opening_transfer(agent_a, pid_a, pid_b, requested_a,
                                            conversation, table_dir, round_no,
                                            logger, _opening_allowance(agent_a))
+        requested_a = _cap_dialogue_transfers(
+            agent_a, pid_a, requested_a, a_transfers,
+            MAX_TRANSFERS_PER_DIALOGUE, logger)
         requested_a = _cap_transfer(agent_a, pid_a, requested_a, logger)
         transfer_a = 0
         if requested_a > 0 and turn_a.get("transfer_to") == pid_b:
@@ -505,6 +543,7 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             transfer_a = requested_a
             a_total_sent += requested_a
             agent_a.sent_this_round = getattr(agent_a, "sent_this_round", 0) + requested_a
+            a_transfers += 1
         elif requested_a > 0:
             logger.write(pid_a, f"transfer of {requested_a} coins DROPPED "
                                 f"(transfer_to={turn_a.get('transfer_to')!r}, expected {pid_b!r})")
@@ -554,6 +593,9 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
         )
         # FIX-1 (симметрично для B)
         requested_b = min(turn_b["transfer"], agent_b.balance)
+        requested_b = _cap_dialogue_transfers(
+            agent_b, pid_b, requested_b, b_transfers,
+            MAX_TRANSFERS_PER_DIALOGUE, logger)
         requested_b = _cap_transfer(agent_b, pid_b, requested_b, logger)
         transfer_b = 0
         if requested_b > 0 and turn_b.get("transfer_to") == pid_a:
@@ -564,6 +606,7 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             transfer_b = requested_b
             b_total_sent += requested_b
             agent_b.sent_this_round = getattr(agent_b, "sent_this_round", 0) + requested_b
+            b_transfers += 1
         elif requested_b > 0:
             logger.write(pid_b, f"transfer of {requested_b} coins DROPPED "
                                 f"(transfer_to={turn_b.get('transfer_to')!r}, expected {pid_a!r})")

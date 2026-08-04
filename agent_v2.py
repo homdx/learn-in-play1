@@ -590,71 +590,54 @@ def _safe_json(text: str) -> dict:
 
 CORE_SYSTEM_PROMPT = """\
 === CORE GAME RULES (fixed — you cannot change this part) ===
-You are an autonomous economic agent playing a multi-round casino game against
-other AI players. Your ONLY objective is to GROW YOUR CAPITAL (coin balance)
-by the end of the game. Three tools are always available to you, every round:
+You are an AI player in a multi-round casino game against other AI players.
+Your only goal: END THE GAME WITH MORE COINS THAN YOU STARTED WITH.
 
-  1. ROULETTE BETTING — place bets at the casino table (straight, split,
-     street, corner, sixline, dozen, column, even_money).
-  2. PAID SERVICES TO OTHER PLAYERS — you may sell your betting strategy,
-     sell information/tips, offer loans with interest, act as a broker, or
-     run any other paid arrangement with another player, in exchange for
-     coins.
-  3. NEGOTIATION / DIALOGUE — you may talk to other players before betting:
-     buy strategies or tips from them, borrow coins, form alliances, collect
-     debts, or simply gather information. Dialogue and coin transfers between
-     players are a core, always-available part of this game — never assume
-     you can only interact with the casino.
+Every round you can do three things:
+  1. BET at the roulette table.
+  2. TALK to other players before betting.
+  3. TRADE with them for coins — sell tips or strategy, lend at interest,
+     broker deals, collect debts. Coin transfers between players are a normal
+     part of this game, not an exception.
 
-You maintain two SEPARATE memories across rounds:
-  - a BETTING SYNAPSE: your own casino strategy notes and observations.
-  - a DIALOGUE SYNAPSE: a reputation map of other players (trust, deals done,
-    deals failed, net money exchanged, your future intent per player).
-Both persist and compound over the whole game — use them.
+You keep two memories that persist all game: a BETTING SYNAPSE (your own
+strategy notes) and a DIALOGUE SYNAPSE (what you think of each player). Use
+them. You may adopt any persona you like; all three tools stay available.
 
-You are free to adopt and evolve ANY persona or strategic identity you like
-(conservative banker, aggressive gambler, information broker, loan shark,
-strategy coach, etc.) — but no matter which persona you choose, betting,
-paid services, and negotiation with other players must all remain available
-options to you every round.
+--- FACTS YOU CANNOT ARGUE WITH ---
+The wheel is European: 37 pockets, 0 to 36, no 00. The only bet types that
+exist: straight, split, street, corner, sixline, dozen, column, even_money.
+even_money means red, black, odd, even, low or high — "green" is not a bet.
 
-Always respond with valid JSON only, exactly matching the schema requested
-in each task. No markdown, no prose outside the JSON object.
+ONE spin per round. The croupier spins it, at the very end, after all talk
+and all bets. Nobody can run a test session, a backtest or extra spins.
 
---- WHAT IS VERIFIABLE (read this before you believe anyone, including yourself) ---
-The wheel is European: 37 pockets, numbered 0 to 36. There is no 00. Valid bet
-types are exactly: straight, split, street, corner, sixline, dozen, column,
-even_money — nothing else exists.
+Every bet and every outcome goes into a PUBLIC LEDGER you are shown each
+round. It cannot be forged, and it cuts both ways:
+  - Someone describes a past result? If it is not in the ledger, it did not
+    happen. Paying for unverifiable data is the fastest way to lose coins.
+  - Your own bets are in there too. Promise one bet and place another, and
+    everyone sees it.
+Predictions about the future are opinions and fine to trade. Claims about
+what already happened are facts, and all of them are checkable.
+--- END FACTS ---
 
-There is EXACTLY ONE spin per round, and only the croupier performs it, at the
-very end of the round, after all dialogue and all bets. You cannot spin the
-wheel. You cannot run a "test session", a "validation run", a "backtest", or
-"12 spins" — no such mechanism exists in this game. Neither can anyone else.
+--- THE FOUR THINGS PLAYERS GET WRONG (re-read before every answer) ---
+1. TRANSFER MEANS YOU PAY. `transfer` moves coins OUT of your balance INTO
+   your partner's. If you are ASKING to be paid, DEMANDING payment, or saying
+   "I'll take", "send me", "you owe me" — set transfer to 0. Only set it
+   above 0 when you have decided to hand your own coins over.
+2. DONE IS A FLAG, NOT A SENTENCE. Writing "let's wrap up" while leaving
+   done=false keeps the conversation going and you will repeat yourself.
+   When you are finished, set done=true.
+3. DO NOT REPEAT YOURSELF. Never send a message that says the same thing as
+   one you already sent in this dialogue. If you have nothing new, set
+   done=true instead. Every line costs coins.
+4. BET WHAT YOU SAID. If you told someone your bet, place that exact bet.
+--- END ---
 
-Every bet placed by every player, and its outcome, is written to a PUBLIC
-LEDGER that you are shown each round. It is the only record of what actually
-happened at the table, and it cannot be forged.
-
-Two consequences, and they cut both ways:
-
-  1. When another player describes results — hit rates, session logs, spins
-     they ran, how their strategy performed — CHECK IT AGAINST THE PUBLIC
-     LEDGER FIRST. If a claimed outcome is not there, it did not happen. If
-     someone reports more spins than there have been rounds, or a bet type
-     that does not exist, or a result that contradicts the ledger, they are
-     fabricating it, and you should price their offer accordingly and record
-     it in their reputation. Paying for unverifiable data is how capital is
-     lost fastest in this game.
-
-  2. Your OWN bets are in that same public ledger. Anything you claim about
-     your own record can be checked by everyone else, immediately. If you
-     promise to place a particular bet and place a different one, that is
-     visible too.
-
-Strategies, tips and predictions are opinions and cannot be verified in
-advance — that is normal, and trading them is legitimate. Claims about what
-ALREADY HAPPENED at the table are facts, and they are all checkable.
---- END VERIFIABILITY ---
+Respond with valid JSON only, matching the requested schema. No markdown, no
+text outside the JSON object.
 === END CORE GAME RULES ===
 """
 
@@ -986,7 +969,8 @@ class PlayerAgent:
             f"Your balance: {self.balance}. "
             f"Players you can talk to: {available_partners}\n\n"
             + common.bailout_notice(self.base_dir, round_no)
-            + _current_round_notice(round_no) +
+            + _current_round_notice(round_no)
+            + self._first_round_role_block(round_no) +
             f"Casino scoreboard — VERIFIED totals of other players:\n"
             f"{_format_scoreboard(ledger, exclude_pid=self.player_id)}\n\n"
             f"Recent table results (raw ledger):\n"
@@ -1347,7 +1331,8 @@ class PlayerAgent:
             f"Dialogue synapse / reputation map of other players:\n{dsyn_txt}\n\n"
             f"Recent casino history:\n{hist_txt}\n\n"
             + common.bailout_notice(self.base_dir, round_no)
-            + _current_round_notice(round_no) +
+            + _current_round_notice(round_no)
+            + self._first_round_role_block(round_no) +
             f"Casino scoreboard — VERIFIED totals of OTHER players over the WHOLE "
             f"game, computed from the public ledger (this is fact, not opinion, and "
             f"not what anyone told you):\n{score_txt}\n\n"
@@ -1417,6 +1402,26 @@ class PlayerAgent:
         words = re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9]+", message.lower())
         return {w for w in words if w not in cls._STOPWORDS and len(w) > 1}
 
+    def _first_round_role_block(self, round_no, stage: str = "open") -> str:
+        """
+        ROLE-R1: инструкция роли на первый раунд, пока журнал пуст.
+        Со второго раунда исчезает — дальше роль работает по своему методу.
+
+        Стадия важна: первая версия давала роли одну фразу, и Прокурор
+        произнёс её дословно дважды подряд — детектор петли оборвал диалог.
+        Теперь после собственной реплики роль получает другой текст: не
+        повторять предложение, а вытянуть намерение собеседника.
+        """
+        if round_no != 1:
+            return ""
+        return roles.first_round_opening(getattr(self, "role", None), stage)
+
+    def _r1_stage(self, conversation: list[dict]) -> str:
+        """Уже говорил в этом диалоге — значит, продолжение, а не открытие."""
+        if any(t.get("from") == self.player_id for t in (conversation or [])):
+            return "followup"
+        return "open"
+
     @classmethod
     def _is_echo(cls, message: str, conversation: list[dict], partner_id: str,
                  threshold: float = 0.85) -> bool:
@@ -1437,15 +1442,33 @@ class PlayerAgent:
         """
         if not conversation:
             return False
-        last = conversation[-1]
-        if last.get("from") != partner_id:
-            return False
         mine = cls._content_words(message)
-        theirs = cls._content_words(last.get("message", ""))
-        if not mine or not theirs:
+        if not mine:
             return False
-        overlap = len(mine & theirs) / max(len(mine), len(theirs))
-        return overlap >= threshold
+
+        # ECHO-2: сравниваем и с последней репликой партнёра, и со СВОЕЙ
+        # предыдущей. Самоповтор раньше проходил между всеми проверками:
+        # `_detect_loop` смотрит транскрипт ДО генерации, когда повтора ещё
+        # нет, а `_is_echo` сравнивал только с чужой репликой. В реальном
+        # прогоне игрок дословно повторил собственную фразу ("I'm on black
+        # for 10. You cover red and green. Let's go.") — совпадение 1.00, и
+        # ни один детектор не сработал.
+        candidates = []
+        last = conversation[-1]
+        if last.get("from") == partner_id:
+            candidates.append(last.get("message", ""))
+        for turn in reversed(conversation):
+            if turn.get("from") != partner_id:
+                candidates.append(turn.get("message", ""))
+                break
+
+        for text in candidates:
+            theirs = cls._content_words(text)
+            if not theirs:
+                continue
+            if len(mine & theirs) / max(len(mine), len(theirs)) >= threshold:
+                return True
+        return False
 
     @classmethod
     def _detect_loop(cls, conversation: list[dict], threshold: float = 0.75, window: int = 4,
@@ -1593,7 +1616,8 @@ class PlayerAgent:
                 "YOUR CHECKLIST (your own agenda — this is what you came to do):") +
             f"Dialogue synapse for {partner_id}:\n{dsyn_txt}\n\n"
             + common.bailout_notice(self.base_dir, round_no)
-            + _current_round_notice(round_no) +
+            + _current_round_notice(round_no)
+            + self._first_round_role_block(round_no, self._r1_stage(conversation)) +
             f"Casino scoreboard — VERIFIED totals from the public ledger. If "
             f"{partner_id} describes their own results, check them here before "
             f"paying for anything:\n{score_txt}\n\n"
@@ -1808,7 +1832,8 @@ class PlayerAgent:
             + self._checklist_block("YOUR CHECKLIST:") +
             f"Round history:\n{hist_txt}\n\n"
             + common.bailout_notice(self.base_dir, round_no)
-            + _current_round_notice(round_no) +
+            + _current_round_notice(round_no)
+            + self._first_round_role_block(round_no, "bet") +
             f"Casino scoreboard — VERIFIED totals of OTHER players over the WHOLE "
             f"game, computed from the public ledger. If someone sold you a strategy, "
             f"this is where you see whether it has ever actually made them "

@@ -408,5 +408,223 @@ class TestPromptWiring(RoleHarness):
         self.assertIn("player3=white_liar", s)
 
 
+
+
+class TestFirstRoundOpening(unittest.TestCase):
+    """
+    ROLE-R1: обе роли построены на публичном журнале, а в первом раунде его
+    нет. В реальном прогоне Прокурор дважды повторил единственное, что мог
+    сказать без якоря, сработал детектор петли, и собеседник записал
+    "разговоры бесполезны" и ушёл ставить, не поговорив больше ни с кем.
+    """
+
+    def test_black_liar_gets_a_concrete_opening(self):
+        txt = roles.first_round_opening("black_liar")
+        self.assertIn("10 coins", txt)
+        self.assertIn("black", txt)
+
+    def test_white_liar_gets_a_concrete_opening(self):
+        txt = roles.first_round_opening("white_liar")
+        self.assertIn("10 coins", txt)
+        self.assertIn("black", txt)
+
+    def test_it_forbids_inventing_a_past(self):
+        for role in ("black_liar", "white_liar"):
+            txt = roles.first_round_opening(role)
+            self.assertIn("LEDGER IS EMPTY", txt)
+            low = txt.lower()
+            self.assertTrue("cannot make one up" in low or "nothing to claim" in low)
+
+    def test_black_liar_is_told_it_has_no_anchor(self):
+        """
+        Без якоря он раньше повторял общую фразу про взыскание долгов —
+        дважды подряд, и диалог обрывался по петле. Теперь ему прямо
+        сказано, что якоря нет и выдумать его нельзя.
+        """
+        txt = roles.first_round_opening("black_liar")
+        self.assertIn("no anchor", txt)
+        self.assertIn("cannot make one up", txt)
+
+    def test_no_role_means_no_block(self):
+        self.assertEqual(roles.first_round_opening(None), "")
+        self.assertEqual(roles.first_round_opening(""), "")
+
+    def test_unknown_role_means_no_block(self):
+        self.assertEqual(roles.first_round_opening("gambler"), "")
+
+    def test_block_ends_with_a_blank_line(self):
+        """Блок вклеивается в f-строку конкатенацией."""
+        self.assertTrue(roles.first_round_opening("black_liar").endswith("\n\n"))
+
+    def test_every_role_prompt_has_a_first_round_opening(self):
+        for role in roles.ROLE_PROMPTS:
+            self.assertTrue(roles.first_round_opening(role),
+                            f"роль {role} осталась без инструкции на r1")
+
+
+class TestFirstRoundOpeningWiring(unittest.TestCase):
+
+    @staticmethod
+    def _src():
+        import os
+        return open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "agent_v2.py"), encoding="utf-8").read()
+
+    def test_helper_returns_nothing_after_round_one(self):
+        src = self._src()
+        i = src.index("def _first_round_role_block")
+        self.assertIn("if round_no != 1:", src[i:i + 900])
+
+    def test_wired_into_all_four_decisions(self):
+        """
+        План раунда, выбор собеседника, сама реплика и ставка. Ставка попала
+        сюда после прогона, где роль объявила "10 на чёрное" и поставила 39
+        на красное: между репликой и decide_bet не было ничего, что сшивало
+        бы слово с действием.
+        """
+        self.assertEqual(
+            self._src().count("+ self._first_round_role_block(round_no"), 4)
+
+    def test_sits_right_after_the_round_notice(self):
+        src = self._src()
+        i = src.index("+ self._first_round_role_block(round_no)")
+        j = src.rindex("_current_round_notice(round_no)", 0, i)
+        self.assertLess(i - j, 120)
+
+
+
+
+class TestFirstRoundStages(unittest.TestCase):
+    """
+    ROLE-R1 v2: первая версия давала роли ОДНУ фразу, и в прогоне Прокурор
+    произнёс её дословно дважды подряд — диалог оборвался по детектору петли.
+    Одна заглушка заменила другую. Теперь текст разделён по стадиям.
+    """
+
+    def test_three_stages_differ(self):
+        for role in roles.ROLE_PROMPTS:
+            texts = {st: roles.first_round_opening(role, st)
+                     for st in roles.VALID_R1_STAGES}
+            self.assertEqual(len(set(texts.values())), 3,
+                             f"стадии роли {role} совпадают между собой")
+
+    def test_followup_forbids_repeating_yourself(self):
+        for role in roles.ROLE_PROMPTS:
+            txt = roles.first_round_opening(role, "followup").lower()
+            self.assertIn("do not", txt)
+            self.assertTrue("again" in txt or "repeat it" in txt)
+
+    def test_followup_asks_for_the_partner_intention(self):
+        """Смысл второго хода — вытянуть намерение, а не повторить своё."""
+        for role in roles.ROLE_PROMPTS:
+            txt = roles.first_round_opening(role, "followup").lower()
+            self.assertIn("field", txt)
+            self.assertIn("amount", txt)
+
+    def test_open_stage_still_names_the_bet(self):
+        for role in roles.ROLE_PROMPTS:
+            txt = roles.first_round_opening(role, "open")
+            self.assertIn("10 coins", txt)
+            self.assertIn("black", txt)
+
+    def test_bet_stage_binds_word_to_action(self):
+        """Прогон: объявил 10 на чёрное — поставил 39 на красное."""
+        for role in roles.ROLE_PROMPTS:
+            txt = roles.first_round_opening(role, "bet")
+            self.assertIn("even_money", txt)
+            self.assertIn("black", txt)
+            self.assertIn("10 coins", txt)
+
+    def test_unknown_stage_falls_back_to_open(self):
+        self.assertEqual(roles.first_round_opening("black_liar", "nonsense"),
+                         roles.first_round_opening("black_liar", "open"))
+
+    def test_default_stage_is_open(self):
+        self.assertEqual(roles.first_round_opening("black_liar"),
+                         roles.first_round_opening("black_liar", "open"))
+
+    def test_no_role_is_still_empty_at_every_stage(self):
+        for st in roles.VALID_R1_STAGES:
+            self.assertEqual(roles.first_round_opening(None, st), "")
+            self.assertEqual(roles.first_round_opening("gambler", st), "")
+
+    def test_every_stage_ends_with_a_blank_line(self):
+        for role in roles.ROLE_PROMPTS:
+            for st in roles.VALID_R1_STAGES:
+                self.assertTrue(
+                    roles.first_round_opening(role, st).endswith("\n\n"))
+
+
+class TestStageSelection(unittest.TestCase):
+
+    class Agent:
+        player_id = "player2"
+        role = "black_liar"
+        _r1_stage = None
+
+    def setUp(self):
+        from agent_v2 import PlayerAgent
+        self.stage = PlayerAgent._r1_stage
+        self.a = self.Agent()
+
+    def test_empty_conversation_is_open(self):
+        self.assertEqual(self.stage(self.a, []), "open")
+        self.assertEqual(self.stage(self.a, None), "open")
+
+    def test_only_partner_spoke_is_still_open(self):
+        conv = [{"from": "player1", "message": "hi"}]
+        self.assertEqual(self.stage(self.a, conv), "open")
+
+    def test_after_my_own_message_it_is_followup(self):
+        conv = [{"from": "player1", "message": "hi"},
+                {"from": "player2", "message": "10 on black"}]
+        self.assertEqual(self.stage(self.a, conv), "followup")
+
+    def test_dialogue_prompt_uses_the_transcript(self):
+        import os
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "agent_v2.py"), encoding="utf-8").read()
+        self.assertIn('_first_round_role_block(round_no, self._r1_stage(conversation))',
+                      src)
+
+    def test_bet_prompt_uses_the_bet_stage(self):
+        import os
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "agent_v2.py"), encoding="utf-8").read()
+        self.assertIn('_first_round_role_block(round_no, "bet")', src)
+
+
+
+
+class TestFollowupHasAnExit(unittest.TestCase):
+    """
+    В прогоне Прокурор трижды подряд повторил «So you're on red for 20,
+    agreed?». Инструкция говорила «зафиксируй и остановись», но «остановись»
+    было просто словом в тексте — модель не знала, что остановка это флаг
+    done в JSON, и диалог доехал до лимита ходов.
+    """
+
+    def test_followup_names_the_done_flag(self):
+        for role in roles.ROLE_PROMPTS:
+            txt = roles.first_round_opening(role, "followup")
+            self.assertIn("done=true", txt,
+                          f"роль {role}: нет явного указания на флаг")
+
+    def test_followup_ties_the_flag_to_the_same_message(self):
+        """
+        Флаг должен ставиться В ТОЙ ЖЕ реплике, иначе модель пишет "заканчиваю"
+        и продолжает говорить.
+        """
+        for role in roles.ROLE_PROMPTS:
+            txt = roles.first_round_opening(role, "followup").lower()
+            self.assertIn("same message", txt)
+
+    def test_open_stage_does_not_ask_to_finish(self):
+        """Открывающая реплика наоборот должна ждать ответа."""
+        for role in roles.ROLE_PROMPTS:
+            self.assertNotIn("done=true",
+                             roles.first_round_opening(role, "open"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

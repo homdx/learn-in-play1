@@ -1045,20 +1045,20 @@ class TestVerifiability(unittest.TestCase):
         # промпт — свёрстанный текст, поэтому сравниваем по нормализованным
         # пробелам: иначе тест ловит перенос строки, а не отсутствие правила
         core = " ".join(agent_v2.CORE_SYSTEM_PROMPT.split())
-        for fragment in ("EXACTLY ONE spin per round", "PUBLIC LEDGER",
-                         "There is no 00", "37 pockets"):
+        for fragment in ("ONE spin per round", "PUBLIC LEDGER",
+                         "no 00", "37 pockets"):
             self.assertIn(fragment, core, f"в ядре нет: {fragment!r} (FIX-13)")
 
     def test_core_prompt_covers_both_directions(self):
         """Проверять чужие заявления И знать, что твои собственные проверяемы."""
         core = " ".join(agent_v2.CORE_SYSTEM_PROMPT.split())
-        self.assertIn("CHECK IT AGAINST THE PUBLIC LEDGER", core)
-        self.assertIn("Your OWN bets are in that same public ledger", core)
+        self.assertIn("If it is not in the ledger, it did not happen", core)
+        self.assertIn("Your own bets are in there too", core)
 
     def test_core_prompt_still_allows_trading_opinions(self):
         """Запрещать торговлю прогнозами нельзя — в ней вся игра."""
         core = " ".join(agent_v2.CORE_SYSTEM_PROMPT.split())
-        self.assertIn("trading them is legitimate", core)
+        self.assertIn("opinions and fine to trade", core)
 
 
 class TestScoreboard(unittest.TestCase):
@@ -1371,8 +1371,10 @@ class TestCurrentRoundNotice(GameHarness):
     def test_notice_sits_next_to_the_scoreboard_everywhere(self):
         src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "agent_v2.py"), encoding="utf-8").read()
-        # три решения + шаг планирования чек-листа (FIX-19)
-        self.assertEqual(src.count("+ _current_round_notice(round_no) +"), 4,
+        # три решения + шаг планирования чек-листа (FIX-19).
+        # ROLE-R1 вклинил после уведомления блок роли на первый раунд, поэтому
+        # хвостовой "+" остался не у всех вхождений — считаем сам вызов.
+        self.assertEqual(src.count("+ _current_round_notice(round_no)"), 4,
                          "уведомление подставлено не везде (FIX-18)")
 
     def test_decide_bet_now_knows_the_round(self):
@@ -2437,6 +2439,60 @@ class TestReflectPromptDisambiguatesSpinVsRound(GameHarness):
         self.assertNotIn("Round result: number=35", text,
                          "старая двусмысленная формулировка не должна "
                          "оставаться в промпте (FIX-23)")
+
+
+
+
+class TestPromptDiet(unittest.TestCase):
+    """
+    PROMPT-1: у роли в системном промпте лежало ~6100 символов инструкций
+    (ядро 3713 + роль 2400). 8b следует началу и середине и теряет хвост —
+    отсюда "I'll take the 20 coins" с переводом 20 монет НАРУЖУ.
+    Критичные правила вынесены в короткий блок в КОНЕЦ ядра.
+    """
+
+    def test_core_is_substantially_shorter(self):
+        self.assertLess(len(agent_v2.CORE_SYSTEM_PROMPT), 3000)
+
+    def test_role_prompts_are_short(self):
+        import roles
+        for name, text in roles.ROLE_PROMPTS.items():
+            self.assertLess(len(text), 1400, f"роль {name} снова разрослась")
+
+    def test_pitfalls_block_sits_at_the_very_end(self):
+        core = agent_v2.CORE_SYSTEM_PROMPT
+        i = core.index("THE FOUR THINGS PLAYERS GET WRONG")
+        self.assertGreater(i / len(core), 0.6,
+                           "блок с главными правилами должен быть в конце")
+
+    def test_transfer_direction_is_spelled_out(self):
+        core = " ".join(agent_v2.CORE_SYSTEM_PROMPT.split())
+        self.assertIn("TRANSFER MEANS YOU PAY", core)
+        self.assertIn("I'll take", core)
+        self.assertIn("set transfer to 0", core)
+
+    def test_done_is_described_as_a_flag(self):
+        core = " ".join(agent_v2.CORE_SYSTEM_PROMPT.split())
+        self.assertIn("DONE IS A FLAG", core)
+        self.assertIn("done=false", core)
+
+    def test_self_repetition_is_forbidden_in_core(self):
+        core = " ".join(agent_v2.CORE_SYSTEM_PROMPT.split())
+        self.assertIn("DO NOT REPEAT YOURSELF", core)
+
+    def test_bet_what_you_said_is_in_core(self):
+        core = " ".join(agent_v2.CORE_SYSTEM_PROMPT.split())
+        self.assertIn("BET WHAT YOU SAID", core)
+
+    def test_green_is_explicitly_not_a_bet(self):
+        """В прогоне стороны договорились ставить на 'red and green'."""
+        core = " ".join(agent_v2.CORE_SYSTEM_PROMPT.split())
+        self.assertIn('"green" is not a bet', core)
+
+    def test_even_money_options_are_listed(self):
+        core = " ".join(agent_v2.CORE_SYSTEM_PROMPT.split())
+        for field in ("red", "black", "odd", "even", "low", "high"):
+            self.assertIn(field, core)
 
 
 if __name__ == "__main__":

@@ -175,5 +175,75 @@ class TestPhantomRoundNotice(unittest.TestCase):
         self.assertGreaterEqual(src.count("_current_round_notice(round_no)"), 1)
 
 
+
+
+class TestTransfersPerDialogue(unittest.TestCase):
+    """
+    XFER-1: ограничение по ЧИСЛУ переводов в одном диалоге.
+
+    Два реальных случая. Игрок трижды за диалог платил за одну и ту же
+    "схему ставок" (10 + 10 + 20) и не получил ничего. И: тот, кто ТРЕБОВАЛ
+    30 монет, сам их перевёл, а собеседник перевёл 30 обратно — шестьдесят
+    монет за два хода при нулевом итоге.
+    """
+
+    def setUp(self):
+        self.lg = FakeLogger()
+
+    def cap(self, requested, made, limit=2):
+        return run_game_v2._cap_dialogue_transfers(
+            None, "player1", requested, made, limit, self.lg)
+
+    def test_first_transfer_passes(self):
+        self.assertEqual(self.cap(20, made=0), 20)
+        self.assertEqual(self.lg.lines, [])
+
+    def test_second_transfer_passes(self):
+        self.assertEqual(self.cap(20, made=1), 20)
+        self.assertEqual(self.lg.lines, [])
+
+    def test_third_transfer_is_blocked(self):
+        self.assertEqual(self.cap(20, made=2), 0)
+        self.assertIn("BLOCKED", self.lg.lines[0][1])
+        self.assertIn("limit 2", self.lg.lines[0][1])
+
+    def test_the_real_10_10_20_case(self):
+        """Третий платёж за ту же 'схему' не проходит."""
+        made, total = 0, 0
+        for want in (10, 10, 20):
+            got = self.cap(want, made=made)
+            if got:
+                made += 1
+                total += got
+        self.assertEqual(total, 20)
+        self.assertEqual(made, 2)
+
+    def test_zero_limit_disables_the_rule(self):
+        self.assertEqual(self.cap(50, made=9, limit=0), 50)
+        self.assertEqual(self.lg.lines, [])
+
+    def test_counter_is_wired_for_both_sides(self):
+        src = open("run_game_v2.py", encoding="utf-8").read()
+        self.assertIn("a_transfers += 1", src)
+        self.assertIn("b_transfers += 1", src)
+        self.assertEqual(src.count("_cap_dialogue_transfers("), 3)
+
+    def test_counter_resets_per_dialogue(self):
+        """Счётчик локальный для диалога, а не для раунда."""
+        src = open("run_game_v2.py", encoding="utf-8").read()
+        i = src.index("a_transfers  = 0")
+        j = src.index("def run_dialogue")
+        self.assertGreater(i, j, "счётчик должен инициализироваться внутри диалога")
+
+    def test_it_runs_before_the_round_budget(self):
+        src = open("run_game_v2.py", encoding="utf-8").read()
+        i = src.index("_cap_dialogue_transfers(\n            agent_a")
+        j = src.index("_cap_transfer(agent_a", i)
+        self.assertLess(i, j)
+
+    def test_shipped_limit_is_two(self):
+        self.assertEqual(run_game_v2.MAX_TRANSFERS_PER_DIALOGUE, 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

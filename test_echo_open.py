@@ -51,10 +51,24 @@ class TestEchoDetector(unittest.TestCase):
         almost = REAL_ECHO.replace("Goodbye.", "Bye.")
         self.assertTrue(PlayerAgent._is_echo(almost, conv, "player2"))
 
-    def test_own_previous_message_is_not_an_echo(self):
-        """Повтор СВОЕЙ реплики — дело _detect_loop, не этого фильтра."""
-        conv = [{"from": "player1", "message": REAL_ECHO}]
-        self.assertFalse(PlayerAgent._is_echo(REAL_ECHO, conv, "player2"))
+    def test_own_previous_message_is_also_caught(self):
+        """
+        ECHO-2: самоповтор раньше проходил между всеми проверками.
+        `_detect_loop` смотрит транскрипт ДО генерации, когда повтора ещё
+        нет, а `_is_echo` сравнивал только с чужой репликой. В прогоне игрок
+        дословно повторил собственную фразу — совпадение 1.00, и никто не
+        сработал.
+        """
+        conv = [{"from": "player1", "message": "some unrelated question"},
+                {"from": "player2", "message": REAL_ECHO},
+                {"from": "player1", "message": "another unrelated line"}]
+        self.assertTrue(PlayerAgent._is_echo(REAL_ECHO, conv, "player1"))
+
+    def test_real_self_repeat_from_the_log(self):
+        line = "I'm on black for 10. You cover red and green. Let's go."
+        conv = [{"from": "player2", "message": line},
+                {"from": "player1", "message": "Deal confirmed, red and green."}]
+        self.assertTrue(PlayerAgent._is_echo(line, conv, "player1"))
 
     def test_normal_reply_passes(self):
         conv = [{"from": "player2", "message": "I don't trade strategies. "
