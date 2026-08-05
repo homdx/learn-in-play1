@@ -330,6 +330,38 @@ def _cap_dialogue_transfers(agent, pid, requested, made_so_far, limit, logger):
     return 0
 
 
+def _role_privileges(cfg):
+    """
+    ROLE-P: привилегии ролевых игроков, каждая отдельным флагом.
+
+    Обе роли по построению живут разговором: Прокурор продаёт репутацию
+    отсутствующих, Оракул — авторство чужих выигрышей. К седьмому раунду
+    реального прогона оба замолчали, и не от растерянности, а по расчёту:
+    "речь стоила 4 монеты при нулевых продажах", "разговоры стоили 19 монет
+    при нулевой отдаче". Тариф и лимит диалогов душат ровно ту механику,
+    ради которой роли и вводились.
+
+    Флаги врозь намеренно. `unlimited_outgoing` имеет неприятный побочный
+    эффект: два лжеца с безлимитом съедают до восьми входящих слотов, а у
+    трёх честных игроков их всего шесть — честные перестают доходить друг
+    до друга. Если это проявится, отключается один флаг, остальные остаются.
+    """
+    if not cfg.has_section("roles"):
+        return {"free_speech": False, "unlimited_outgoing": False,
+                "ignore_partner_limit": False}
+    return {
+        "free_speech": cfg.getboolean("roles", "free_speech", fallback=False),
+        "unlimited_outgoing": cfg.getboolean("roles", "unlimited_outgoing",
+                                             fallback=False),
+        "ignore_partner_limit": cfg.getboolean("roles", "ignore_partner_limit",
+                                               fallback=False),
+    }
+
+
+def _is_role(agents, pid) -> bool:
+    return bool(getattr(agents.get(pid), "role", None))
+
+
 def _opening_allowance(agent, default=10) -> int:
     """Свободная сумма для открывающей реплики из [player] конфига агента."""
     cfg = getattr(agent, "cfg", None)
@@ -781,6 +813,13 @@ def main():
 
         # SPEND-1: бюджет переводов на раунд, от баланса на начало раунда.
         # frac <= 0 или >= 1 отключает ограничение (прежнее поведение).
+        _priv = _role_privileges(cfg)
+        # ROLE-P: флаг бесплатной речи вешаем на агента — списание живёт в
+        # speech_cost.charge(), и передавать туда конфиг через пять слоёв
+        # вызовов было бы дороже, чем один атрибут.
+        for _pid in players:
+            agents[_pid].speech_is_free = (_priv["free_speech"]
+                                           and _is_role(agents, _pid))
         _frac = cfg.getfloat("player", "max_transfer_fraction_round", fallback=0.5)
         for _pid in players:
             _ag = agents[_pid]
@@ -847,20 +886,33 @@ def main():
             # выборе собеседника, но у него есть шанс записать намерение
             # прежде, чем начнёт действовать.
             if use_checklist:
+                _skip_cap = (_priv["ignore_partner_limit"] and _is_role(agents, pid))
                 avail = [p for p in players
-                         if p != pid and incoming_used[p] < MAX_DIALOGUES_PER_PLAYER]
+                         if p != pid and (_skip_cap
+                                          or incoming_used[p] < MAX_DIALOGUES_PER_PLAYER)]
                 agents[pid].plan_round(round_no, avail)
 
             while True:
-                if outgoing_used[pid] >= MAX_DIALOGUES_PER_PLAYER:
+                # ROLE-P: у роли исходящие могут быть безлимитными — иначе
+                # её метод не успевает отработать по столу.
+                _out_cap = (10 ** 6 if (_priv["unlimited_outgoing"] and _is_role(agents, pid))
+                            else MAX_DIALOGUES_PER_PLAYER)
+                if outgoing_used[pid] >= _out_cap:
                     logger.write(pid, "reached max outgoing dialogues this round, moving to betting")
                     break
 
+                # ROLE-P: `ignore_partner_limit` пускает роль к тем, кто уже
+                # выбрал свой входящий лимит. Сам лимит при этом ТРАТИТСЯ —
+                # визит роли для собеседника такой же разговор, как любой
+                # другой, и в его бюджете он учитывается.
+                _skip_partner_cap = (_priv["ignore_partner_limit"]
+                                     and _is_role(agents, pid))
                 available = [
                     p for p in players
                     if p != pid
                     and p not in talked_to
-                    and incoming_used[p] < MAX_DIALOGUES_PER_PLAYER
+                    and (_skip_partner_cap
+                         or incoming_used[p] < MAX_DIALOGUES_PER_PLAYER)
                 ]
                 if not available:
                     logger.write(pid, "no available players left to talk to, moving to betting")

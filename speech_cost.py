@@ -73,10 +73,30 @@ class SpeechTariff:
 
     # ── тексты для промптов ──────────────────────────────────────────────
 
-    def rule_text(self) -> str:
-        """Правило тарифа для системной части промпта диалога."""
+    def rule_text(self, free: bool = False) -> str:
+        """Правило тарифа для системной части промпта диалога.
+
+        ROLE-P: `free` — это `agent.speech_is_free` со стороны вызывающего.
+        Раньше эта функция вызывалась одинаково для всех, поэтому роль с
+        бесплатной речью читала «SPEECH COSTS MONEY» вместе со всеми — и в
+        реальном прогоне вкладывала эту цену в свои решения (см. комментарий
+        в charge()), хотя с неё физически ничего не снималось. Инструкция
+        должна отражать то, что происходит с ЭТИМ игроком, а не с тарифом
+        вообще.
+        """
         if not self.enabled:
             return ""
+        if free:
+            return (
+                f"YOUR SPEECH IS FREE. The casino's usual tariff — "
+                f"{self.coins_per_line} coin(s) per started {self.chars_per_line}-"
+                f"character line — does NOT apply to you: you pay 0 coins no "
+                f"matter how long or how many messages you write. (Your lines are "
+                f"still counted for the record, but never charged.) This does not "
+                f"apply to other players — they still pay for every line, so don't "
+                f"assume a partner can afford to go back and forth as freely as "
+                f"you can.\n\n"
+            )
         return (
             f"SPEECH COSTS MONEY. Every started line of {self.chars_per_line} "
             f"characters you write in a dialogue costs you "
@@ -91,20 +111,35 @@ class SpeechTariff:
             f"in the same message, so it can never block a deal you agreed to.\n\n"
         )
 
-    def status_text(self, spent_this_dialogue: int, balance: int) -> str:
+    def status_text(self, spent_this_dialogue: int, balance: int,
+                    free: bool = False) -> str:
         """Счётчик расхода — чтобы агент видел, что деньги реально уходят."""
         if not self.enabled:
             return ""
+        if free:
+            return (
+                f"Speech billing: your speech is free — you have paid 0 coin(s) "
+                f"for your messages in THIS conversation, and always will, "
+                f"regardless of length. Balance: {balance}.\n\n"
+            )
         return (
             f"Speech billing: you have already paid {spent_this_dialogue} coin(s) "
             f"to the casino for your messages in THIS conversation. Balance "
             f"after those charges: {balance}.\n\n"
         )
 
-    def move_hint(self) -> str:
+    def move_hint(self, free: bool = False) -> str:
         """Короткое напоминание на фазе выбора хода (говорить или ставить)."""
         if not self.enabled:
             return ""
+        if free:
+            return (
+                f"Note: talking costs YOU nothing — your speech is free, so the "
+                f"usual \"only talk if it's worth more than it costs\" tradeoff "
+                f"does not apply to you. Open as many dialogues as your goals "
+                f"need. (Other players still pay per line, so don't expect them "
+                f"to be as chatty.)\n\n"
+            )
         return (
             f"Note: talking is not free. Each started line of "
             f"{self.chars_per_line} characters costs {self.coins_per_line} "
@@ -151,6 +186,19 @@ def charge(agent, message: str, tariff: SpeechTariff, table_dir: str,
     отрицательный баланс сломал бы их молча. Недобор пишется в unpaid и в
     лог — это и есть сигнал «игрок наговорил больше, чем у него было».
     """
+    # ROLE-P: у роли речь может быть бесплатной. Обе роли живут разговором, а
+    # тариф загонял их в молчание: в реальном прогоне Прокурор записал себе
+    # "речь стоила 4 монеты при нулевых продажах — ввожу молчание", и метод
+    # перестал исполняться вовсе. Реплика при этом всё равно проходит через
+    # тариф для подсчёта строк, чтобы журнал и статистика не разъехались.
+    if getattr(agent, "speech_is_free", False):
+        lines = tariff.lines_in(message)
+        if logger and lines:
+            logger.write(agent.player_id,
+                         f"speech fee: {lines} line(s) → 0 coin(s) "
+                         f"(role speaks free), balance {agent.balance}")
+        return {"charged": 0, "unpaid": 0, "lines": lines}
+
     cost = tariff.cost_of(message)
     if cost <= 0:
         return {"charged": 0, "unpaid": 0, "lines": tariff.lines_in(message)}

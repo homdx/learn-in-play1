@@ -348,6 +348,57 @@ class TestVisibility(Harness):
         self.assertTrue(moves)
         self.assertIn("talking is not free", moves[0])
 
+    # ── ROLE-P: агент с speech_is_free должен ВИДЕТЬ, что это его случай,
+    # а не читать общий "SPEECH COSTS MONEY", который к нему не относится ──
+
+    def test_free_agent_sees_free_rule_not_generic_one(self):
+        FakeLLM.reset([{"message": "hi", "transfer": 0,
+                        "transfer_to": None, "done": True}])
+        a, b, _ = self.agents(ON)
+        a.speech_is_free = True
+        self.dialogue(a, b)
+        # первый вызов LLM в диалоге всегда от инициатора — player1 (A).
+        a_sys = FakeLLM.calls[0]["system"]
+        self.assertIn("YOUR SPEECH IS FREE", a_sys)
+        self.assertNotIn("SPEECH COSTS MONEY", a_sys)
+
+    def test_paying_partner_still_sees_generic_rule(self):
+        """Флаг персональный: партнёр без free_speech платит как обычно."""
+        FakeLLM.reset([
+            {"message": "hi", "transfer": 0, "transfer_to": None, "done": False},
+            {"message": "ok", "transfer": 0, "transfer_to": None, "done": True},
+        ])
+        a, b, _ = self.agents(ON)
+        a.speech_is_free = True   # только A — роль
+        self.dialogue(a, b)
+        # второй вызов в диалоге — ход B (обычный игрок)
+        b_sys = FakeLLM.calls[1]["system"]
+        self.assertIn("SPEECH COSTS MONEY", b_sys)
+        self.assertNotIn("YOUR SPEECH IS FREE", b_sys)
+
+    def test_free_agent_status_text_says_free(self):
+        FakeLLM.reset([{"message": "x" * 200, "transfer": 0,
+                        "transfer_to": None, "done": False}])
+        a, b, _ = self.agents(ON)
+        a.speech_is_free = True
+        self.dialogue(a, b)
+        a_user = FakeLLM.calls[0]["user"]
+        self.assertIn("your speech is free", a_user)
+        self.assertIn("paid 0 coin(s)", a_user)
+
+    def test_free_agent_move_hint_says_free(self):
+        cfg = make_cfg(self.table, ON)
+        a = PlayerAgent("player1", self.table, cfg,
+                        tariff=speech_cost.parse_tariff(cfg))
+        a.speech_is_free = True
+        FakeLLM.reset()
+        a.decide_next_move(["player2"], [], 1, [])
+        moves = [c["user"] for c in FakeLLM.calls
+                 if "Decide next move" in c["system"]]
+        self.assertTrue(moves)
+        self.assertIn("costs YOU nothing", moves[0])
+        self.assertNotIn("talking is not free", moves[0])
+
 
 # ─────────────────────────────────────────── 6. запись в артефакты ────────
 

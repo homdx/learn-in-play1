@@ -209,6 +209,69 @@ def prompt_file(pid, base_dir):
     return os.path.join(base_dir, f"prompt_{pid}.txt")
 
 
+def fieldnotes_file(pid, base_dir):
+    return os.path.join(base_dir, f"fieldnotes_{pid}.md")
+
+
+# ROLE-N: сколько символов полевых заметок держим. Осознанно мало: это
+# рабочий блокнот приёмов, а не вторая персона. При переполнении вытесняется
+# самая старая запись.
+FIELDNOTES_CHARS = 2500
+
+# ROLE-P: сколько наблюдений роль может добавить за один раунд. Одного было
+# мало: заметка вида "метод простаивает" фиксирует диагноз, но не то, ЧТО
+# именно попробовали, с кем и по какой цене — а именно этих подробностей и
+# не хватало, чтобы в следующий раунд зайти иначе.
+FIELDNOTES_PER_ROUND = 4
+
+
+def load_fieldnotes(pid, base_dir) -> list[str]:
+    """Полевые заметки роли — по одной строке на запись, старые первыми."""
+    text = load_text(fieldnotes_file(pid, base_dir), "")
+    return [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+
+def append_fieldnotes(pid, base_dir, notes, cap: int = FIELDNOTES_CHARS,
+                      limit: int = FIELDNOTES_PER_ROUND) -> list[str]:
+    """ROLE-P: дозапись НЕСКОЛЬКИХ наблюдений за раунд, по одному на строку."""
+    if isinstance(notes, str):
+        notes = [notes]
+    kept = load_fieldnotes(pid, base_dir)
+    for note in list(notes or [])[:limit]:
+        kept = append_fieldnote(pid, base_dir, note, cap)
+    return kept
+
+
+def append_fieldnote(pid, base_dir, note: str, cap: int = FIELDNOTES_CHARS) -> list[str]:
+    """
+    ROLE-N: дозапись наблюдения о том, ЧТО СРАБОТАЛО и что нет.
+
+    Только дозапись: прошлые строки не редактируются и не переписываются
+    моделью. Это принципиально — переписывание превратило бы блокнот в
+    очередную персону, а роль в этой игре заперта именно потому, что модель,
+    редактируя текст роли, неизбежно его смягчает.
+
+    Зачем вообще: в реальном прогоне Прокурор четыре раза подряд заходил с
+    одинаково построенным обвинением и четыре раза получал один и тот же
+    отказ ("приватные обещания не в реестре"). Нигде не было места, где
+    осел бы вывод о МЕТОДЕ: чек-лист живёт один раунд, синапса хранит
+    доверие к людям, а персона заперта. Теперь есть.
+
+    Дубликаты не копим: повторное наблюдение всплывает в конец списка, а не
+    добавляется второй строкой.
+    """
+    note = " ".join(str(note or "").split())
+    if not note:
+        return load_fieldnotes(pid, base_dir)
+    notes = [n for n in load_fieldnotes(pid, base_dir) if n.lower() != note.lower()]
+    notes.append(note)
+    # вытесняем самые старые, пока не влезем в лимит
+    while notes and len("\n".join(notes)) > cap:
+        notes.pop(0)
+    save_text(fieldnotes_file(pid, base_dir), "\n".join(notes))
+    return notes
+
+
 def load_text(path, default=""):
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
@@ -732,6 +795,10 @@ class PlayerAgent:
         # сколько монет игрок уже отдал казино за слова в ТЕКУЩЕМ диалоге;
         # обнуляется в начале каждого диалога из run_dialogue
         self.speech_spent_this_dialogue = 0
+        # ROLE-P: дефолт на случай, если агент создан не через run_game_v2
+        # (тесты, прямой вызов) — там, где флаг реально решается по ролям
+        # и конфигу, run_game_v2 перезаписывает его до первого разговора.
+        self.speech_is_free = False
 
         pf = prompt_file(player_id, base_dir)
         seeded = roles.seed_prompt_file(pf, self.roles, player_id, save_text)
@@ -771,6 +838,27 @@ class PlayerAgent:
             + "\n=== YOUR PERSONA & STRATEGY (editable by you each round) ===\n"
             + persona
             + "\n=== END PERSONA & STRATEGY ===\n"
+            + self._fieldnotes_block()
+        )
+
+    def _fieldnotes_block(self) -> str:
+        """
+        ROLE-N: блокнот приёмов. Только для ролей с запертой персоной —
+        остальные и так переписывают себя каждый раунд.
+        """
+        if not getattr(self, "role", None):
+            return ""
+        notes = load_fieldnotes(self.player_id, self.base_dir)
+        if not notes:
+            return ""
+        body = "\n".join(f"  - {n}" for n in notes)
+        return (
+            "\n=== FIELD NOTES (what you have learned about working this table) ===\n"
+            + body
+            + "\nThese are your own observations from earlier rounds. Use them:\n"
+            "do not re-run an approach that is listed here as rejected — vary the\n"
+            "angle, the target or the price. They refine HOW you work your method;\n"
+            "they never replace it.\n=== END FIELD NOTES ===\n"
         )
 
     def _log(self, msg):
@@ -1180,12 +1268,31 @@ class PlayerAgent:
         # начинает описывать этот конфликт в СИНАПСЕ — то есть роль всё равно
         # размывается, только через другой файл. Проще не спрашивать.
         if self.persona_locked:
+            # ROLE-N: персону по-прежнему не отдаём на правку, но просим одно
+            # наблюдение о приёме — что сработало, а что нет. Это единственное
+            # место, где вывод о МЕТОДЕ может осесть: чек-лист живёт один
+            # раунд, синапса хранит доверие к людям, персона заперта.
+            existing = load_fieldnotes(self.player_id, self.base_dir)
+            seen = ("\n".join(f"  - {n}" for n in existing)
+                    if existing else "  (none yet)")
             persona_block = (
                 f"Your persona/strategy text (fixed for this game — you cannot "
                 f"edit it, and you are not being asked to):\n{persona}\n\n"
-                f"Update your betting synapse only.\n"
+                f"Your field notes so far:\n{seen}\n\n"
+                f"Update your betting synapse, and add up to "
+                f"{FIELDNOTES_PER_ROUND} field notes about how your METHOD is "
+                f"landing at this table: an approach that was rejected and the "
+                f"exact reason given, a price nobody paid, a player who only "
+                f"responds to a certain kind of offer, an angle you have not "
+                f"tried yet and intend to. Be specific — name the player, the "
+                f"price, the wording that failed. One observation per entry, "
+                f"under 200 characters each. Only NEW ones: if you have nothing "
+                f"to add, return an empty list.\n"
+                f"A field note refines HOW you work your method. It never "
+                f"questions the method itself and never proposes abandoning it.\n"
                 f"Return ONLY JSON:\n"
-                f"{{\"notes\": \"updated strategy (max {self.synapse_chars} chars)\"}}"
+                f"{{\"notes\": \"updated strategy (max {self.synapse_chars} chars)\",\n"
+                f" \"field_notes\": [\"new observation\", \"...\"]}}"
             )
         else:
             persona_block = (
@@ -1249,6 +1356,19 @@ class PlayerAgent:
                 # списком или dict-ом. Раньше это молча записывалось на диск и
                 # падало позже, вне try — на len(notes) в компрессоре синапсы.
                 new_notes = _as_text(resp.get("notes"), notes)[:self.synapse_chars]
+
+                # ROLE-N: одно наблюдение за раунд, дозаписью.
+                if self.persona_locked:
+                    raw = resp.get("field_notes", resp.get("field_note"))
+                    if isinstance(raw, str):
+                        raw = [raw]
+                    fresh = [_as_text(n, "")[:250].strip()
+                             for n in (raw or []) if _as_text(n, "").strip()]
+                    if fresh:
+                        kept = append_fieldnotes(self.player_id, self.base_dir, fresh)
+                        for n in fresh[:FIELDNOTES_PER_ROUND]:
+                            self._log(f"FIELD NOTE (+1, {len(kept)} kept): {n}")
+
                 if self.persona_locked and resp.get("update_persona"):
                     # ROLE-1: модель всё равно иногда возвращает поле, которого
                     # у неё не просили. Пишем это в лог, а не игнорируем молча:
@@ -1351,7 +1471,7 @@ class PlayerAgent:
             f"against your own past interactions (deals_done / deals_failed / net transfers) "
             f"before trusting it. A high trust_score should come from actual deals and money "
             f"that changed hands, not from claims made in conversation.\n\n"
-            + self.tariff.move_hint()
+            + self.tariff.move_hint(getattr(self, "speech_is_free", False))
             + speech_cost.format_partner_costs(self.player_id, self.base_dir,
                                                self.tariff) +
             f"Decide your NEXT move:\n"
@@ -1470,6 +1590,33 @@ class PlayerAgent:
                 return True
         return False
 
+    _NUM_RE = re.compile(r"\d+")
+
+    @classmethod
+    def _terms_moved(cls, conversation: list[dict]) -> bool:
+        """
+        ECHO-3: идёт ли торг прямо сейчас.
+
+        Признак движения — новое число в последней реплике, которого не было
+        раньше в разговоре: 20 → 25 → 22 это встречные предложения, а не
+        петля. Обрывать такой обмен нельзя, даже если лексика повторяется
+        почти дословно: в торге она и обязана повторяться, меняются только
+        цифры.
+
+        Проверка намеренно грубая. Ложно разрешить один лишний ход дешевле,
+        чем зарубить сделку на середине: в реальном прогоне детектор убивал
+        две трети диалогов.
+        """
+        if len(conversation) < 2:
+            return False
+        latest = set(cls._NUM_RE.findall(conversation[-1].get("message", "")))
+        if not latest:
+            return False
+        earlier = set()
+        for turn in conversation[:-1]:
+            earlier |= set(cls._NUM_RE.findall(turn.get("message", "")))
+        return bool(latest - earlier)
+
     @classmethod
     def _detect_loop(cls, conversation: list[dict], threshold: float = 0.75, window: int = 4,
                      immediate_threshold: float = 0.8) -> bool:
@@ -1515,7 +1662,11 @@ class PlayerAgent:
         # (в первую очередь заплатить), а не открыть новый круг торга.
         # Детектор петель здесь не применяется: партнёр уже завершил
         # разговор, и повторение его формулировок — не зацикливание.
-        if not closing_turn and self._detect_loop(conversation):
+        # ECHO-3: петля при активном торге — почти всегда ложная тревога.
+        # Лексика оффера повторяется по существу дела, а меняются числа;
+        # обрыв на этом месте убивает сделку в момент сближения позиций.
+        if (not closing_turn and self._detect_loop(conversation)
+                and not self._terms_moved(conversation)):
             self._log(f"loop detected in dialogue with {partner_id}, ending early")
             # LOOP-1: `loop_break` отличает обрыв по петле от нормального
             # `done`. Разница в том, что происходит дальше: после `done`
@@ -1633,7 +1784,8 @@ class PlayerAgent:
             + open_bets.format_for_prompt(self.base_dir, self.player_id)
             + transfer_ledger.format_recent(self.player_id, self.base_dir,
                                              partner=partner_id)
-            + self.tariff.status_text(self.speech_spent_this_dialogue, self.balance)
+            + self.tariff.status_text(self.speech_spent_this_dialogue, self.balance,
+                                      getattr(self, "speech_is_free", False))
             + f"Your balance: {self.balance}. Max transfer: {self.balance} coins.\n\n"
             f"Note: 'transfer' only lets YOU send coins to {partner_id}. If you want THEM "
             f"to pay you, say so in your message and wait for their turn — do not send "
@@ -1652,12 +1804,51 @@ class PlayerAgent:
             f" \"transfer_to\": null or \"{partner_id}\",\n"
             f" \"done\": false}}"
         )
+        # ECHO-3: попугайскую реплику НЕ обрываем сразу — просим переписать.
+        #
+        # Прогон на 8b показал цену прежнего поведения: детектор убил 8 из 12
+        # диалогов на одной машине и 15 из 22 на другой. Срабатывал он верно
+        # — модель действительно копировала собеседника, — но наказание
+        # доставалось обеим сторонам, включая ту, что вела себя нормально, и
+        # торг обрывался, не начавшись.
+        #
+        # Теперь первый повтор стоит одного лишнего вызова LLM с явным
+        # указанием, что именно не так. Диалог обрывается только если модель
+        # скопировала снова: тогда ей действительно нечего сказать.
+        echo_retry_hint = (
+            "\n\nSTOP — YOUR PREVIOUS DRAFT WAS A COPY. It repeated, almost "
+            "word for word, something already said in this conversation. That "
+            "wastes a paid line and tells your partner nothing.\n"
+            "Write something genuinely NEW instead. Pick one:\n"
+            "  - accept their terms and, if you are paying, put the coins in "
+            "'transfer' now;\n"
+            "  - make a COUNTER-OFFER with a different number or a different "
+            "field;\n"
+            "  - ask one specific question you do not know the answer to;\n"
+            "  - if you have nothing left to add, say so briefly and set "
+            "done=true.\n"
+            "Do NOT restate their message, and do NOT restate your own."
+        )
+
         try:
-            resp = self.client.chat_json(
-                system=self.abstract_prompt + self.tariff.rule_text()
-                       + f"\nTASK: Dialogue turn with {partner_id}. Be concrete, no filler, no repetition.",
-                user=user_msg, temperature=0.8, max_tokens=self.tok_dialogue
-            )
+            attempt = 0
+            while True:
+                resp = self.client.chat_json(
+                    system=self.abstract_prompt
+                           + self.tariff.rule_text(getattr(self, "speech_is_free", False))
+                           + f"\nTASK: Dialogue turn with {partner_id}. Be concrete, no filler, no repetition.",
+                    user=user_msg + (echo_retry_hint if attempt else ""),
+                    temperature=0.8 + 0.1 * attempt,
+                    max_tokens=self.tok_dialogue
+                )
+                draft = str(resp.get("message", "…"))
+                if closing_turn or not self._is_echo(draft, conversation, partner_id):
+                    break
+                attempt += 1
+                if attempt > 1:
+                    break
+                self._log(f"draft echoed the conversation — asking for a new "
+                          f"line (attempt {attempt + 1})")
             try:
                 raw_transfer = int(float(resp.get("transfer", 0) or 0))
             except (TypeError, ValueError):
@@ -1677,14 +1868,18 @@ class PlayerAgent:
             transfer_to = partner_id if transfer > 0 else None
             message = str(resp.get("message", "…"))
 
-            # ECHO-1: реплика-копия последнего сообщения партнёра. Гасим её и
-            # закрываем диалог тем же путём, что и петлю — с loop_break,
-            # чтобы партнёр не получил закрывающий ход с правом перевода.
-            # Перевод из такой реплики тоже отменяем: он согласован не был,
-            # это часть скопированного чужого текста.
+            # ECHO-1/ECHO-3: сюда доходит либо нормальная реплика, либо
+            # повтор, выживший после переспроса. Второй раз — значит,
+            # сказать действительно нечего, закрываем диалог через
+            # loop_break (без закрывающего хода партнёру).
+            #
+            # Перевод из повторной реплики отменяем в любом случае: он
+            # согласован не был, это часть скопированного чужого текста.
+            # Именно так утекли 38 монет в реальном прогоне — копия чужой
+            # фразы "let's split the risk" пришла вместе с переводом.
             if not closing_turn and self._is_echo(message, conversation, partner_id):
-                self._log(f"echoed {partner_id}'s own message back verbatim, "
-                          f"ending dialogue")
+                self._log(f"echoed the conversation twice in a row "
+                          f"(with {partner_id}) — ending dialogue")
                 return {
                     "message": "Let's wrap this up here — we're going in circles.",
                     "transfer": 0, "transfer_to": None, "done": True,

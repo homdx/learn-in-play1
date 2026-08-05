@@ -93,7 +93,7 @@ class TestEchoDetector(unittest.TestCase):
 
     def test_echo_path_returns_loop_break_and_zero_transfer(self):
         src = open("agent_v2.py", encoding="utf-8").read()
-        i = src.index("echoed {partner_id}'s own message back verbatim")
+        i = src.index("echoed the conversation twice in a row")
         window = src[i:i + 400]
         self.assertIn('"loop_break": True', window)
         self.assertIn('"transfer": 0', window)
@@ -311,6 +311,89 @@ class TestDsynGrossFlows(unittest.TestCase):
         src = open("run_game_v2.py", encoding="utf-8").read()
         self.assertIn("sent=a_total_sent, received=b_total_sent", src)
         self.assertIn("sent=b_total_sent, received=a_total_sent", src)
+
+
+
+
+class TestEchoRetryAndBargaining(unittest.TestCase):
+    """
+    ECHO-3. Прогон на 8b: детектор убил 8 диалогов из 12 на одной машине и
+    15 из 22 на другой. Срабатывал он верно — модель действительно копировала
+    собеседника, — но наказание доставалось обеим сторонам, и торг обрывался,
+    не начавшись.
+    """
+
+    @staticmethod
+    def _src():
+        return open("agent_v2.py", encoding="utf-8").read()
+
+    def test_echo_triggers_a_redraft_not_an_immediate_break(self):
+        src = self._src()
+        self.assertIn("draft echoed the conversation — asking for a new", src)
+        self.assertIn("echo_retry_hint", src)
+
+    def test_only_one_redraft(self):
+        """Второй повтор означает, что сказать действительно нечего."""
+        src = self._src()
+        i = src.index("attempt += 1")
+        self.assertIn("if attempt > 1:", src[i:i + 200])
+
+    def test_redraft_hint_offers_concrete_alternatives(self):
+        src = self._src()
+        i = src.index("echo_retry_hint = (")
+        hint = src[i:i + 1200]
+        for word in ("COUNTER-OFFER", "done=true", "question"):
+            self.assertIn(word, hint)
+
+    def test_closing_turn_is_never_redrafted(self):
+        """Закрывающий ход пересказывает согласованное — это не копия."""
+        self.assertIn("if closing_turn or not self._is_echo(draft,", self._src())
+
+    def test_transfer_is_dropped_on_a_surviving_echo(self):
+        src = self._src()
+        i = src.index("echoed the conversation twice in a row")
+        self.assertIn('"transfer": 0', src[i:i + 400])
+
+
+class TestBargainingExemption(unittest.TestCase):
+
+    @staticmethod
+    def conv(*msgs):
+        return [{"from": "a" if i % 2 == 0 else "b", "message": m}
+                for i, m in enumerate(msgs)]
+
+    def test_new_number_means_the_terms_moved(self):
+        c = self.conv("I offer 20 coins for the tip.",
+                      "I want 30 coins for the tip.",
+                      "I offer 25 coins for the tip.")
+        self.assertTrue(PlayerAgent._terms_moved(c))
+
+    def test_same_numbers_are_not_movement(self):
+        c = self.conv("I offer 20 coins for the tip.",
+                      "I want 20 coins for the tip.",
+                      "I offer 20 coins for the tip.")
+        self.assertFalse(PlayerAgent._terms_moved(c))
+
+    def test_no_numbers_at_all_is_not_movement(self):
+        c = self.conv("Let's work together.", "Sure, let's work together.")
+        self.assertFalse(PlayerAgent._terms_moved(c))
+
+    def test_short_conversation_is_not_movement(self):
+        self.assertFalse(PlayerAgent._terms_moved([]))
+        self.assertFalse(PlayerAgent._terms_moved(
+            self.conv("I offer 20 coins.")))
+
+    def test_stalled_bargaining_still_counts_as_a_loop(self):
+        c = self.conv("I offer 20 coins for the tip.",
+                      "I want 20 coins for the tip.",
+                      "I offer 20 coins for the tip.")
+        self.assertTrue(PlayerAgent._detect_loop(c))
+        self.assertFalse(PlayerAgent._terms_moved(c))
+
+    def test_loop_break_is_gated_on_movement(self):
+        src = open("agent_v2.py", encoding="utf-8").read()
+        i = src.index("self._detect_loop(conversation)")
+        self.assertIn("not self._terms_moved(conversation)", src[i:i + 200])
 
 
 if __name__ == "__main__":

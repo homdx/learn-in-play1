@@ -40,7 +40,9 @@ from __future__ import annotations
 import os
 
 # ключи секции [roles], которые НЕ являются идентификаторами игроков
-RESERVED_KEYS = {"enabled", "lock_persona", "overwrite_existing"}
+RESERVED_KEYS = {"enabled", "lock_persona", "overwrite_existing",
+                 # ROLE-P: флаги привилегий — не идентификаторы игроков
+                 "free_speech", "unlimited_outgoing", "ignore_partner_limit"}
 
 # синонимы «роли нет» — чтобы можно было отключить одного игрока,
 # не вычищая строку из конфига

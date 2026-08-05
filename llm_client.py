@@ -19,10 +19,23 @@ tools/llm_stream.py проекта https://github.com/homdx/jan-auto-agent
 from __future__ import annotations
 
 import json
+import os
 import re
 import ssl
 import urllib.error
 import urllib.request
+
+# ── DEBUG ────────────────────────────────────────────────────────────────────
+# Включается переменной окружения:  LLM_DEBUG=1 python run_game_v2.py ...
+# Или жёстко:  _LLM_DEBUG = True
+_LLM_DEBUG: bool = os.environ.get("LLM_DEBUG", "0").strip() not in ("0", "", "false", "no")
+
+def _dbg(*args):
+    if _LLM_DEBUG:
+        import sys, datetime
+        ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        print(f"[LLM_DEBUG {ts}]", *args, file=sys.stderr, flush=True)
+# ─────────────────────────────────────────────────────────────────────────────
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
@@ -178,7 +191,7 @@ class LLMClient:
                     retries=retries)
 
     def _build_request(self, system: str, user: str, temperature: float,
-                        max_tokens: int):
+                        max_tokens: int, json_mode: bool = False):
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -196,6 +209,11 @@ class LLMClient:
                        "stream": False, "options": options}
             if self.think is not None:
                 payload["think"] = self.think
+            # EOS-2: грамматика JSON запрещает EOS первым токеном. Пустой
+            # ответ (eval_count=1, eval_duration отсутствует) физически
+            # невозможен: сэмплер обязан начать с '{'.
+            if json_mode:
+                payload["format"] = "json"
         else:
             url = f"{self.base_url}/chat/completions"
             payload = {
@@ -205,24 +223,89 @@ class LLMClient:
                 "messages": messages,
                 "stream": False,
             }
+            if json_mode:
+                payload["response_format"] = {"type": "json_object"}
+        _dbg(f"_build_request: url={url!r}, model={self.model!r}, "
+             f"api_format={self.api_format!r}, think={self.think!r}, "
+             f"num_ctx={self.num_ctx}, max_tokens={max_tokens}, temp={temperature}, "
+             f"json_mode={json_mode}")
+        _dbg(f"  payload keys: {list(payload.keys())}")
         return url, headers, payload
 
     def _extract_content(self, raw: dict) -> str:
+        _dbg(f"_extract_content: api_format={self.api_format!r}")
+        _dbg(f"  raw keys: {list(raw.keys())}")
         if self.api_format == "ollama":
-            return raw["message"]["content"].strip()
+            msg = raw.get("message", {})
+            _dbg(f"  ollama message keys: {list(msg.keys())}")
+            content = msg.get("content", "")
+            # Некоторые thinking-модели в Ollama кладут reasoning в message.thinking
+            # а content оставляют пустым
+            thinking = msg.get("thinking", "")
+            _dbg(f"  content repr (first 200): {content[:200]!r}")
+            _dbg(f"  thinking present: {bool(thinking)}, len={len(thinking)}")
+
+            # DIAG-CTX: prompt_eval_count/eval_count — единственный способ
+            # отличить "модель подумала пустым <think> блоком" от "промпт
+            # занял весь num_ctx, генерировать было некуда". Раньше _dbg
+            # печатал только list(raw.keys()) — по нему оба случая выглядят
+            # одинаково пусто, а причины и фикс у них разные.
+            prompt_eval_count = raw.get("prompt_eval_count")
+            eval_count = raw.get("eval_count")
+            has_eval_duration = "eval_duration" in raw
+            _dbg(f"  prompt_eval_count={prompt_eval_count}, "
+                 f"eval_count={eval_count}, num_ctx={self.num_ctx}, "
+                 f"has_eval_duration={has_eval_duration}")
+
+            if not content.strip() and not thinking:
+                if eval_count == 0 or (eval_count is not None and not has_eval_duration):
+                    near_limit = (
+                        self.num_ctx and prompt_eval_count is not None
+                        and prompt_eval_count >= self.num_ctx - 64
+                    )
+                    _dbg(
+                        "  WARNING: 0 completion tokens generated "
+                        f"(prompt_eval_count={prompt_eval_count}/{self.num_ctx}). "
+                        + ("Prompt has filled the context window — this is "
+                           "context overflow, NOT a thinking-only glitch. "
+                           "Shrink dsyn/checklist/history sizes or raise num_ctx."
+                           if near_limit else
+                           "eval_count=0 but prompt is not near num_ctx limit — "
+                           "investigate server-side (stop token / filter?).")
+                    )
+                elif thinking:
+                    _dbg("  WARNING: content is empty but thinking is not — "
+                         "model returned only a <think> block, no JSON output!")
+            return content.strip()
         choices = raw.get("choices") or []
+        _dbg(f"  openai choices count: {len(choices)}")
         if not choices:
+            _dbg(f"  ERROR: empty choices. Full raw: {json.dumps(raw)[:500]}")
             raise ValueError(
                 f"Пустой ответ LLM (choices=[]) - возможно, запрос был "
                 f"отфильтрован сервером. Ключи ответа: {list(raw.keys())}"
             )
-        return choices[0]["message"]["content"].strip()
+        msg = choices[0].get("message", {})
+        _dbg(f"  openai message keys: {list(msg.keys())}")
+        content = msg.get("content", "") or ""
+        # OpenAI-совместимые серверы с thinking иногда кладут reasoning_content
+        # в отдельное поле, а content остаётся пустым
+        reasoning = msg.get("reasoning_content", "") or ""
+        finish_reason = choices[0].get("finish_reason", "")
+        _dbg(f"  finish_reason: {finish_reason!r}")
+        _dbg(f"  content repr (first 200): {content[:200]!r}")
+        _dbg(f"  reasoning_content present: {bool(reasoning)}, len={len(reasoning)}")
+        if not content.strip() and reasoning:
+            _dbg("  WARNING: content is empty but reasoning_content is not — "
+                 "model returned only thinking, no actual JSON output!")
+        return content.strip()
 
     def chat(self, system: str, user: str, temperature: float = 0.4,
-             max_tokens: int = 400) -> str:
-        """Блокирующий вызов чат-комплишена. Возвращает текст ответа
+             max_tokens: int = 400, json_mode: bool = False) -> str:
+        """Блокинг-вызов чат-комплишена. Возвращает текст ответа
         (с уже вырезанным <think>...</think>, если он был)."""
-        url, headers, payload = self._build_request(system, user, temperature, max_tokens)
+        url, headers, payload = self._build_request(system, user, temperature,
+                                                    max_tokens, json_mode)
         req = urllib.request.Request(
             url, data=json.dumps(payload).encode("utf-8"),
             headers=headers, method="POST",
@@ -246,7 +329,13 @@ class LLMClient:
             ) from None
 
         text = self._extract_content(raw)
-        return strip_think(text)
+        _dbg(f"chat(): raw text len={len(text)}, repr(first 300): {text[:300]!r}")
+        stripped = strip_think(text)
+        _dbg(f"chat(): after strip_think len={len(stripped)}, repr(first 300): {stripped[:300]!r}")
+        if not stripped and text:
+            _dbg("chat(): WARNING — strip_think() returned empty string! "
+                 "The model likely returned ONLY a <think> block with no content after it.")
+        return stripped
 
     @classmethod
     def configure_breaker(cls, threshold: int):
@@ -283,9 +372,41 @@ class LLMClient:
         last = None
         for attempt in range(1, attempts + 1):
             try:
-                text = self.chat(system, user, temperature=temperature,
-                                 max_tokens=max_tokens)
+                # EOS-2 (заменяет EOS-1). EOS-1 понижал temperature на
+                # повторе — и этим гарантировал повтор сбоя: если EOS уже
+                # argmax первого токена, то чем ниже температура, тем
+                # вернее он выпадет снова. В логе это видно прямо: три
+                # попытки подряд с temp 0.8 → 0.48 → 0.288, все три
+                # eval_count=1, вторая и третья за 0.8 с (промпт уже в
+                # KV-кэше, тот же префикс → тот же argmax).
+                #
+                # Теперь наоборот: температуру повышаем и заодно портим
+                # хвост промпта. Изменение последнего токена промпта
+                # сбивает и распределение, и переиспользование кэша —
+                # попытка перестаёт быть точной копией предыдущей.
+                attempt_temp = temperature
+                attempt_user = user
+                if attempt > 1:
+                    attempt_temp = min(temperature + 0.15 * (attempt - 1), 1.0)
+                    attempt_user = (
+                        user + "\n\n(Ответь ТОЛЬКО объектом JSON, "
+                        "начиная с символа '{'. Попытка "
+                        f"{attempt}.)"
+                    )
+                text = self.chat(system, attempt_user, temperature=attempt_temp,
+                                 max_tokens=max_tokens, json_mode=True)
+                _dbg(f"chat_json() attempt {attempt}: text len={len(text)}, "
+                     f"temperature={attempt_temp:.3f}")
                 cleaned = strip_json_fence(text)
+                _dbg(f"chat_json() after strip_json_fence len={len(cleaned)}, "
+                     f"repr(first 300): {cleaned[:300]!r}")
+                if not cleaned:
+                    raise json.JSONDecodeError(
+                        "chat_json got empty string after stripping — "
+                        "model sampled EOS as first token (0-1 completion "
+                        "tokens; see LLM_DEBUG prompt_eval_count/eval_count "
+                        "for context-overflow vs sampling-glitch diagnosis)",
+                        "", 0)
                 result = json.loads(cleaned)
             except LLMUnavailable:
                 raise

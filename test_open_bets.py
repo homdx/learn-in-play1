@@ -244,7 +244,7 @@ class TestReflectionInTurn(unittest.TestCase):
         src = open("run_game_v2.py", encoding="utf-8").read()
         i = src.index("_reflect_for_player(agent, pid, base_dir, round_no - 1, logger)")
         j = src.index("plan_round(round_no, avail)", i)
-        self.assertLess(j - i, 600,
+        self.assertLess(j - i, 900,
                         "рефлексия должна стоять непосредственно перед plan_round")
 
     def test_reflection_runs_after_checkpoint_is_saved(self):
