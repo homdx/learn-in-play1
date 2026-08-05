@@ -173,7 +173,8 @@ class LLMClient:
     def __init__(self, base_url: str, api_key: str, model: str,
                  api_format: str = "ollama", verify_ssl: bool = True,
                  num_ctx: int = 0, think: "bool | None" = None,
-                 timeout: int = 120, retries: int = 1, on_retry=None):
+                 timeout: int = 120, retries: int = 1, on_retry=None,
+                 json_format: bool = True):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -188,6 +189,9 @@ class LLMClient:
         # но вызывающий может подставить свой, чтобы повторы были видны.
         self.on_retry = on_retry
         self._ssl_context = None if verify_ssl else _make_unverified_context()
+        # EOS-2/COMPAT: снимается автоматически при первом HTTP 400 (см.
+        # chat()) либо принудительно через json_format=false в [api].
+        self._no_json_format = not json_format
 
     @classmethod
     def from_config(cls, cfg, section: str = None) -> "LLMClient":
@@ -210,11 +214,14 @@ class LLMClient:
         think = None if think_raw is None else cfg.getboolean(api_section, "think")
         timeout = cfg.getint("api", "timeout_seconds", fallback=120)
         retries = cfg.getint("api", "retries", fallback=1)
+        # Шлюзы перед удалённым сервером могут не знать поля format —
+        # можно отключить заранее, не дожидаясь первого 400.
+        json_format = cfg.getboolean("api", "json_format", fallback=True)
 
         return cls(base_url=base_url, api_key=api_key, model=model,
                     api_format=api_format, verify_ssl=verify_ssl,
                     num_ctx=num_ctx, think=think, timeout=timeout,
-                    retries=retries)
+                    retries=retries, json_format=json_format)
 
     def _build_request(self, system: str, user: str, temperature: float,
                         max_tokens: int, json_mode: bool = False):
@@ -238,7 +245,7 @@ class LLMClient:
             # EOS-2: грамматика JSON запрещает EOS первым токеном. Пустой
             # ответ (eval_count=1, eval_duration отсутствует) физически
             # невозможен: сэмплер обязан начать с '{'.
-            if json_mode:
+            if json_mode and not getattr(self, "_no_json_format", False):
                 payload["format"] = "json"
         else:
             url = f"{self.base_url}/chat/completions"
@@ -249,7 +256,7 @@ class LLMClient:
                 "messages": messages,
                 "stream": False,
             }
-            if json_mode:
+            if json_mode and not getattr(self, "_no_json_format", False):
                 payload["response_format"] = {"type": "json_object"}
         _dbg(f"_build_request: url={url!r}, model={self.model!r}, "
              f"api_format={self.api_format!r}, think={self.think!r}, "
@@ -346,6 +353,24 @@ class LLMClient:
                 detail = e.read().decode("utf-8", errors="replace")[:500]
             except Exception:
                 pass
+            # EOS-2/COMPAT: 400 на запросе с "format": "json" почти всегда
+            # означает шлюз, который валидирует тело строго и режет поля,
+            # которых нет в его схеме. Локальная ollama такое поле
+            # принимает, удалённый прокси — нет, поэтому поломка вылезает
+            # только на api_remote и выглядит как «работало, перестало».
+            #
+            # Отступаем один раз и запоминаем на клиенте: дальше запросы
+            # идут в прежнем виде. Теряем грамматическую защиту от EOS —
+            # но она была страховкой, а не условием работы, и падать
+            # вместо этого нельзя.
+            if (json_mode and e.code == 400
+                    and not getattr(self, "_no_json_format", False)):
+                self._no_json_format = True
+                _dbg("chat(): HTTP 400 with format=json — server rejects the "
+                     "field, retrying without it and disabling it for this "
+                     "client")
+                return self.chat(system, user, temperature=temperature,
+                                 max_tokens=max_tokens, json_mode=False)
             raise RuntimeError(f"HTTP {e.code} от {url}: {detail or e.reason}") from None
         except urllib.error.URLError as e:
             raise RuntimeError(
