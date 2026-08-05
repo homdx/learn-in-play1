@@ -147,6 +147,37 @@ def _chat_takes_json_mode(fn) -> bool:
 _JSON_MODE_CACHE: dict = {}
 
 
+class _ServerCaps:
+    """
+    Что УМЕЕТ сервер моделей. Живёт на уровне модуля по той же причине,
+    что и _Breaker: агентов много, каждый строит свой LLMClient
+    (agent_v2.py:729), а сервер за ними один.
+
+    Первая версия держала этот флаг на экземпляре — и была бесполезна.
+    Игрок, поймавший 400 на "format": "json", отключал поле себе, а
+    четверо остальных приходили со своими клиентами и ловили тот же 400
+    заново, каждый раунд. Знание, добытое ценой запроса, обязано быть
+    общим.
+
+    Ключ — base_url, а не глобальный флаг: в одном прогоне можно ходить
+    и на локальную ollama (format понимает), и на удалённый шлюз (не
+    понимает), и вывод про один сервер не должен калечить другой.
+    """
+    no_json_format: dict[str, bool] = {}
+
+    @classmethod
+    def rejects_json_format(cls, base_url: str) -> bool:
+        return cls.no_json_format.get(base_url, False)
+
+    @classmethod
+    def mark_json_format_rejected(cls, base_url: str):
+        cls.no_json_format[base_url] = True
+
+    @classmethod
+    def reset(cls):
+        cls.no_json_format.clear()
+
+
 class _Breaker:
     """
     FIX-17: состояние выключателя. Живёт ОТДЕЛЬНО от LLMClient намеренно.
@@ -189,9 +220,10 @@ class LLMClient:
         # но вызывающий может подставить свой, чтобы повторы были видны.
         self.on_retry = on_retry
         self._ssl_context = None if verify_ssl else _make_unverified_context()
-        # EOS-2/COMPAT: снимается автоматически при первом HTTP 400 (см.
-        # chat()) либо принудительно через json_format=false в [api].
-        self._no_json_format = not json_format
+        # EOS-2/COMPAT: json_format=false в [api] — это утверждение про
+        # СЕРВЕР, поэтому оно и пишется в общий кэш, а не в экземпляр.
+        if not json_format:
+            _ServerCaps.mark_json_format_rejected(self.base_url)
 
     @classmethod
     def from_config(cls, cfg, section: str = None) -> "LLMClient":
@@ -245,7 +277,7 @@ class LLMClient:
             # EOS-2: грамматика JSON запрещает EOS первым токеном. Пустой
             # ответ (eval_count=1, eval_duration отсутствует) физически
             # невозможен: сэмплер обязан начать с '{'.
-            if json_mode and not getattr(self, "_no_json_format", False):
+            if json_mode and not self._json_format_off():
                 payload["format"] = "json"
         else:
             url = f"{self.base_url}/chat/completions"
@@ -256,7 +288,7 @@ class LLMClient:
                 "messages": messages,
                 "stream": False,
             }
-            if json_mode and not getattr(self, "_no_json_format", False):
+            if json_mode and not self._json_format_off():
                 payload["response_format"] = {"type": "json_object"}
         _dbg(f"_build_request: url={url!r}, model={self.model!r}, "
              f"api_format={self.api_format!r}, think={self.think!r}, "
@@ -363,9 +395,8 @@ class LLMClient:
             # идут в прежнем виде. Теряем грамматическую защиту от EOS —
             # но она была страховкой, а не условием работы, и падать
             # вместо этого нельзя.
-            if (json_mode and e.code == 400
-                    and not getattr(self, "_no_json_format", False)):
-                self._no_json_format = True
+            if json_mode and e.code == 400 and not self._json_format_off():
+                _ServerCaps.mark_json_format_rejected(self.base_url)
                 _dbg("chat(): HTTP 400 with format=json — server rejects the "
                      "field, retrying without it and disabling it for this "
                      "client")
@@ -387,6 +418,10 @@ class LLMClient:
             _dbg("chat(): WARNING — strip_think() returned empty string! "
                  "The model likely returned ONLY a <think> block with no content after it.")
         return stripped
+
+    def _json_format_off(self) -> bool:
+        """getattr — для заглушек, созданных без __init__ (нет base_url)."""
+        return _ServerCaps.rejects_json_format(getattr(self, "base_url", ""))
 
     @classmethod
     def configure_breaker(cls, threshold: int):

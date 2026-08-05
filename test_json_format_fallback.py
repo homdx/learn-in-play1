@@ -27,6 +27,7 @@ def _ok(text='{"message":"hi"}'):
 class TestFormatFallback(unittest.TestCase):
     def setUp(self):
         llm_client._Breaker.failures = 0
+        llm_client._ServerCaps.reset()
         self.c = LLMClient("https://api.ai", "k", "m", retries=2)
         self.payloads = []
 
@@ -78,6 +79,64 @@ class TestFormatFallback(unittest.TestCase):
         c = LLMClient.from_config(cfg)
         self._patch([_ok()])
         c.chat_json("s", "u")
+        self.assertNotIn("format", self.payloads[0])
+
+
+class TestCapabilityIsShared(unittest.TestCase):
+    """Главное: вывод про сервер общий для всех агентов.
+
+    Каждый агент строит свой LLMClient (agent_v2.py:729). Пока флаг жил
+    на экземпляре, пятеро игроков ловили один и тот же 400 пять раз —
+    ровно то, что видно в логе.
+    """
+
+    def setUp(self):
+        llm_client._Breaker.failures = 0
+        llm_client._ServerCaps.reset()
+        self.payloads = []
+
+    def _patch(self, responses):
+        seq = list(responses)
+
+        def fake_urlopen(req, timeout=None, context=None):
+            self.payloads.append(json.loads(req.data.decode()))
+            nxt = seq.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+        llm_client.urllib.request.urlopen = fake_urlopen
+
+    def test_second_agent_does_not_repeat_the_400(self):
+        a = LLMClient("https://api.ai", "k", "m", retries=2)
+        b = LLMClient("https://api.ai", "k", "m", retries=2)
+        self._patch([_err400(), _ok(), _ok()])
+        a.chat_json("s", "u")          # платит за открытие
+        b.chat_json("s", "u")          # должен пользоваться готовым
+        self.assertNotIn("format", self.payloads[2],
+                         "второй агент снова отправил format")
+        self.assertEqual(len(self.payloads), 3,
+                         "второй агент потратил лишний запрос на тот же 400")
+
+    def test_other_server_unaffected(self):
+        """КОНТРФАКТ: вывод про шлюз не должен калечить локальную ollama."""
+        remote = LLMClient("https://api.ai", "k", "m", retries=2)
+        local = LLMClient("http://localhost:11434", "k", "m", retries=2)
+        self._patch([_err400(), _ok(), _ok()])
+        remote.chat_json("s", "u")
+        local.chat_json("s", "u")
+        self.assertIn("format", self.payloads[2],
+                      "локальный сервер зря лишили format")
+
+    def test_config_optout_is_also_shared(self):
+        import configparser
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({"api": {"active": "remote", "json_format": "false"},
+                       "api_remote": {"base_url": "https://api.ai",
+                                      "model": "m"}})
+        LLMClient.from_config(cfg)                       # только объявили
+        other = LLMClient("https://api.ai", "k", "m")    # другой агент
+        self._patch([_ok()])
+        other.chat_json("s", "u")
         self.assertNotIn("format", self.payloads[0])
 
 
