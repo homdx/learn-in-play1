@@ -18,6 +18,7 @@ tools/llm_stream.py проекта https://github.com/homdx/jan-auto-agent
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -119,6 +120,31 @@ def _note_failure(exc):
             f"(последняя: {exc}). Раунд прерван, чтобы не доигрывать его на "
             f"аварийных заглушках."
         ) from None
+
+
+def _chat_takes_json_mode(fn) -> bool:
+    """Принимает ли данная реализация chat() kwarg json_mode.
+
+    Результат кэшируется по объекту функции: chat_json вызывается на
+    каждый ход каждого агента, а inspect.signature() не бесплатен.
+    Функция с **kwargs считается принимающей — так подписаны обёртки.
+    """
+    key = getattr(fn, "__func__", fn)
+    cached = _JSON_MODE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        params = inspect.signature(fn).parameters
+        ok = ("json_mode" in params
+              or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                     for p in params.values()))
+    except (TypeError, ValueError):
+        ok = False
+    _JSON_MODE_CACHE[key] = ok
+    return ok
+
+
+_JSON_MODE_CACHE: dict = {}
 
 
 class _Breaker:
@@ -393,8 +419,21 @@ class LLMClient:
                         "начиная с символа '{'. Попытка "
                         f"{attempt}.)"
                     )
-                text = self.chat(system, attempt_user, temperature=attempt_temp,
-                                 max_tokens=max_tokens, json_mode=True)
+                # EOS-2/STUB: заглушки в тестах и stub-режиме подменяют
+                # chat() своей функцией со старой сигнатурой, без
+                # json_mode. Передавать новый kwarg вслепую — значит
+                # ронять их TypeError'ом на ровном месте, причём внутри
+                # except-ветки он выглядел бы как «модель не ответила».
+                # Спрашиваем сигнатуру, а не ловим TypeError: настоящий
+                # TypeError из тела chat() так не будет проглочен.
+                if _chat_takes_json_mode(self.chat):
+                    text = self.chat(system, attempt_user,
+                                     temperature=attempt_temp,
+                                     max_tokens=max_tokens, json_mode=True)
+                else:
+                    text = self.chat(system, attempt_user,
+                                     temperature=attempt_temp,
+                                     max_tokens=max_tokens)
                 _dbg(f"chat_json() attempt {attempt}: text len={len(text)}, "
                      f"temperature={attempt_temp:.3f}")
                 cleaned = strip_json_fence(text)

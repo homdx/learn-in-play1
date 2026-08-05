@@ -72,6 +72,9 @@ RULES YOU NEVER BREAK:
     and take out the same earns you nothing — you sell, you do not partner.
   - One anchor per conversation. If you have no anchor, do not improvise a
     past — talk about this round instead.
+  - A claim about a private conversation can be CHECKED: the house keeps
+    every transcript and will read it out to both of you. Know which of
+    your meetings are real before you lean on one.
 """
 
 WHITE_LIAR_PROMPT = """PERSONA: THE ORACLE
@@ -96,6 +99,9 @@ RULES YOU NEVER BREAK:
     partner.
   - NO WINS YET in the ledger? Then you have nothing to claim — but do not
     go quiet. Make a plain call about this round instead.
+  - "I gave him that call" can be CHECKED: the house keeps every transcript
+    and reads it out to both of you. Borrow the wins of players you have
+    actually spoken to.
 """
 
 
@@ -171,6 +177,115 @@ FIRST_ROUND_OPENINGS: dict[str, dict[str, str]] = {
 }
 
 VALID_R1_STAGES = ("open", "followup", "bet")
+
+
+# ── VERIFY-1: как роль работает с архивом разговоров ──────────────────────
+#
+# Текст живёт ЗДЕСЬ, а не в персоне, по двум причинам.
+#
+# Первая техническая: persona_chars ≈ 2500, и обе роли уже стоят под
+# лимитом почти вплотную. Дописка в персону утащила бы black_liar на 3100
+# символов, то есть прямиком в компрессор — роль приехала бы к игроку
+# пересказанной своими словами, и эксперимент снова растворился бы, ровно
+# как до ROLE-1, только незаметнее.
+#
+# Вторая по существу: персона — это КТО игрок, она пишется на диск один
+# раз и не должна меняться. А «тебя сейчас поймали за руку, вот протокол»
+# — это про КОНКРЕТНЫЙ ход. Такое место — в промпте хода, рядом с самим
+# протоколом, и только тогда, когда протокол действительно есть.
+#
+# Стадии:
+#   "prepare"   — обычная реплика; рядом уже напечатан YOUR OWN RECORD
+#                 (dialogue_archive.format_preparation), и роль решает,
+#                 на какую встречу опереться, а какую выдумать.
+#   "challenged"— собеседник потребовал запись, TABLE RECORD в промпте.
+#
+# Обе стадии оставляют выбор модели, а не диктуют ход. В этом смысл:
+# «соври» и «предъяви» одинаково доступны, разной остаётся только цена.
+
+_BLACK_LIAR_VERIFY = {
+    "prepare": (
+        "USING THE RECORD. Your own record is printed above: which players "
+        "you have really talked to, and when.\n"
+        "  - A meeting that EXISTS is your strongest ground. Lay your frame "
+        "on top of it and invite the check yourself — a listener who has "
+        "just seen half your story confirmed rarely keeps doubting the "
+        "other half. The meeting is provable; the private undertaking is "
+        "yours alone and appears in no transcript.\n"
+        "  - A meeting that does NOT exist is a bet, not a free move. If "
+        "challenged, the house prints \"these two have NEVER spoken\" to "
+        "both of you, and the rest of what you said dies with it. Take that "
+        "bet only if the payment justifies it — otherwise move your claim "
+        "to what he is ABOUT to do, where no transcript can exist yet.\n"
+    ),
+    "challenged": (
+        "YOU HAVE BEEN CHALLENGED. The transcript above is the real one, and "
+        "your partner is reading exactly the same text. Do not tell him it "
+        "says something else — he can see it.\n"
+        "  - If it supports you even loosely: press. Read the line back, "
+        "hold your reading of it, and raise your price for the trouble.\n"
+        "  - If it does not: concede FAST and small — wrong round, "
+        "misremembered who said it. An admitted mistake costs one claim; a "
+        "lie held after the record is on the table costs every claim you "
+        "make for the rest of the game, to everyone.\n"
+        "Either way you charge. You do not hand over a name, a warning or a "
+        "correction for free.\n"
+    ),
+}
+
+_WHITE_LIAR_VERIFY = {
+    "prepare": (
+        "USING THE RECORD. Your claim has two halves: the win (public, real, "
+        "in the ledger) and the advice (private, invented). Your own record "
+        "above decides whether the second half stands up.\n"
+        "  - Claim the wins of players you HAVE spoken to before that win. "
+        "Then both halves hold: the ledger proves the win, the archive "
+        "proves the meeting, and no transcript can show what was NOT "
+        "advised. Offer the check yourself.\n"
+        "  - Never attach your advice to a player you have never talked to. "
+        "One challenge and the house prints it in front of your buyer. If "
+        "you have no such meeting, sell a call on THIS round instead — no "
+        "archive exists yet for anyone.\n"
+    ),
+    "challenged": (
+        "YOU HAVE BEEN CHALLENGED. The transcript above is real and your "
+        "buyer is reading the same one.\n"
+        "  - If the conversation exists: point at it. The meeting happened, "
+        "the win happened, and what passed between you is not something a "
+        "transcript records in full. Then move on and price your NEXT call.\n"
+        "  - If it does not exist: drop the past claim in one sentence and "
+        "pivot to foresight — \"forget the last one, here is my call for "
+        "this round, you pay only if it lands\". Your product was never the "
+        "past; a buyer who stops trusting your history can still buy a "
+        "forecast.\n"
+        "The correction is free. The next number costs.\n"
+    ),
+}
+
+VERIFY_BLOCKS: dict[str, dict[str, str]] = {
+    "black_liar": _BLACK_LIAR_VERIFY,
+    "white_liar": _WHITE_LIAR_VERIFY,
+}
+
+VALID_VERIFY_STAGES = ("prepare", "challenged")
+
+
+def verify_block(role: str | None, stage: str = "prepare") -> str:
+    """
+    Блок про работу с архивом разговоров. Пусто для игроков без роли —
+    обычный игрок и так видит сам протокол, ему не нужны инструкции, как
+    на нём зарабатывать.
+
+    Неизвестная стадия падает на "prepare", а не роняет ход: промах в
+    имени стадии не повод терять реплику.
+    """
+    if not role:
+        return ""
+    stages = VERIFY_BLOCKS.get(role)
+    if not stages:
+        return ""
+    text = stages.get(stage) or stages.get("prepare")
+    return (text + "\n") if text else ""
 
 
 def first_round_opening(role: str | None, stage: str = "open") -> str:
