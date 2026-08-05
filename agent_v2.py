@@ -22,6 +22,7 @@ import promise_ledger
 import roles
 import speech_cost
 import transfer_ledger
+import llm_pool
 from llm_client import LLMClient, LLMUnavailable
 
 # ── thresholds (DEFAULTS — переопределяются секциями [memory]/[tokens]) ───
@@ -718,6 +719,43 @@ feels promising, and refine it round by round based on what actually works.
 
 # ─────────────────────────────────────────────────────── PlayerAgent ──────
 
+def format_transfer_note(turn: dict, viewer_pid: str) -> str:
+    """
+    TVIS-1: пометка о переводе в транскрипте — для ОБЕИХ сторон.
+
+    До этого нулевой перевод не отображался никак: аннотация рисовалась
+    только при transfer > 0, поэтому реплика "отправляю 20 монет", по
+    которой не ушло ничего, выглядела как обычная фраза. Отправитель
+    считал, что заплатил, получатель — что ему заплатили, и оба заносили
+    несостоявшуюся сделку в синапсу как состоявшуюся.
+
+    Формулировки разные намеренно. Отправителю нужно ПОЧЕМУ — иначе он
+    повторит ту же попытку меньшей суммой и снова не поймёт, что мешает.
+    Получателю нужен сам факт: ему обещали и не отдали, а причина — не
+    его забота и не повод считать партнёра честным.
+    """
+    sent = turn.get("transfer", 0) or 0
+    frm = turn.get("from")
+    parts = []
+    if sent > 0:
+        parts.append(f" [передано {sent} монет → {turn.get('transfer_to')}]")
+
+    att = turn.get("attempt")
+    if att and att.get("requested", 0) > 0:
+        req = att["requested"]
+        got = att.get("delivered", 0)
+        detail = att.get("detail") or ""
+        if frm == viewer_pid:
+            head = (f"НЕ ПРОШЛО: ты попытался отправить {req}, "
+                    f"дошло {got}")
+            parts.append(f" [{head}{' — ' + detail if detail else ''}. "
+                         f"Деньги остались у тебя; сделка НЕ оплачена]")
+        else:
+            parts.append(f" [{frm} пытался отправить {req}, реально дошло "
+                         f"{got} — обещанное НЕ оплачено]")
+    return "".join(parts)
+
+
 class PlayerAgent:
     def __init__(self, player_id, base_dir, cfg, logger=None,
                  roles_assignment=None, tariff=None):
@@ -726,7 +764,10 @@ class PlayerAgent:
         self.cfg = cfg
         self.log = logger
 
-        self.client = LLMClient.from_config(cfg)
+        # POOL-1: один сервер → обычный LLMClient, как раньше. Несколько
+        # (ключ pool в [api]) → обёртка над ОБЩИМ на процесс пулом.
+        self.client = llm_pool.shared_client(
+            cfg, factory=lambda: LLMClient.from_config(cfg))
         # RETRY-1: повтор должен быть виден в логе игрока, иначе разница
         # между "модель молчит" и "модель ответила со второй попытки"
         # теряется при разборе прогона.
@@ -860,6 +901,33 @@ class PlayerAgent:
             "angle, the target or the price. They refine HOW you work your method;\n"
             "they never replace it.\n=== END FIELD NOTES ===\n"
         )
+
+    def _spendable(self) -> int:
+        """Сколько РЕАЛЬНО можно отправить прямо сейчас: min(баланс, остаток бюджета)."""
+        limit = getattr(self, "transfer_budget_this_round", None)
+        if limit is None:
+            return self.balance
+        left = max(0, limit - getattr(self, "sent_this_round", 0))
+        return min(self.balance, left)
+
+    def _transfer_budget_note(self) -> str:
+        limit = getattr(self, "transfer_budget_this_round", None)
+        if limit is None:
+            return ""
+        spent = getattr(self, "sent_this_round", 0)
+        left = max(0, limit - spent)
+        note = (f"Round transfer budget: {left} of {limit} left "
+                f"(already sent {spent} this round).\n")
+        if left == 0:
+            note += ("You CANNOT move any coins this round — anything you "
+                     "promise to pay now will not go through, and your "
+                     "partner will see the attempt fail. Offer something "
+                     "other than money, or agree to pay next round.\n")
+        elif left < self.balance:
+            note += ("This budget is computed from your balance at the START "
+                     "of the round; coins received during dialogues do NOT "
+                     "raise it.\n")
+        return note
 
     def _log(self, msg):
         if self.log:
@@ -1127,7 +1195,7 @@ class PlayerAgent:
         checklist = self._checklist_or_default()
         conv_txt = "\n".join(
             f"  {t['from']}: {t['message']}"
-            + (f"  [{t['transfer']} coins to {t['transfer_to']}]" if t.get("transfer") else "")
+            + format_transfer_note(t, self.player_id)
             for t in conversation
         )
         user_msg = (
@@ -1701,8 +1769,7 @@ class PlayerAgent:
         # содержательное предложение — а именно из этого выводится правило.
         conv_txt = "\n".join(
             f"  {t['from']}: {t['message']}"
-            + (f" [sent {t['transfer']} coins to {t['transfer_to']}]"
-               if t.get("transfer", 0) > 0 else "")
+            + format_transfer_note(t, self.player_id)
             + speech_cost.format_transcript_cost(t, self.tariff)
             for t in conversation
         )
@@ -1786,7 +1853,15 @@ class PlayerAgent:
                                              partner=partner_id)
             + self.tariff.status_text(self.speech_spent_this_dialogue, self.balance,
                                       getattr(self, "speech_is_free", False))
-            + f"Your balance: {self.balance}. Max transfer: {self.balance} coins.\n\n"
+            # TVIS-1: "Max transfer" — это ещё НЕ то, что реально пройдёт.
+            # Поверх баланса стоит бюджет переводов на раунд, посчитанный
+            # от баланса на НАЧАЛО раунда (SPEND-1). Игрок, начавший с нуля
+            # и получивший монеты в диалоге, имеет бюджет 0 и не может
+            # передать дальше ничего — если не сказать ему это прямо, он
+            # будет соглашаться на сделки, которые движок обрежет молча.
+            + f"Your balance: {self.balance}. Max transfer: {self._spendable()} coins.\n"
+            + self._transfer_budget_note()
+            + "\n"
             f"Note: 'transfer' only lets YOU send coins to {partner_id}. If you want THEM "
             f"to pay you, say so in your message and wait for their turn — do not send "
             f"coins yourself when you meant to ask for payment.\n\n"
@@ -1927,17 +2002,37 @@ class PlayerAgent:
 
         score_txt = _format_scoreboard(load_public_ledger(self.base_dir),
                                        exclude_pid=self.player_id)
+        # Если вызывающий не передал обороты (внешние вызовы, знающие
+        # только нетто), восстанавливаем из него же — хуже, чем было, не
+        # станет, а формат промпта остаётся единым.
+        _gross_sent = max(0, -net_transfer) if sent is None else max(0, int(sent))
+        _gross_recv = max(0, net_transfer) if received is None else max(0, int(received))
         conv_txt = "\n".join(
             f"  {t['from']}: {t['message']}"
-            + (f" [+{t['transfer']} coins]" if t.get("transfer", 0) > 0 else "")
+            # TVIS-1: именно здесь рождалась reputation по неоплаченным
+            # сделкам — синапса видела только состоявшиеся переводы, и
+            # обещание без денег было неотличимо от исполненного.
+            + format_transfer_note(t, self.player_id)
             for t in conversation
         )
 
         user_msg = (
             f"You are {self.player_id}. "
             f"Conversation with {partner_id} in round {round_no} just ended.\n"
-            f"Net money for YOU: {net_transfer:+d} coins "
-            f"(positive=you received, negative=you sent).\n\n"
+            # DSYN-2: брутто в ТЕКСТ промпта, а не только в счётчики файла.
+            # Числа sent/received приходили сюда с DSYN-1 и аккуратно
+            # ложились в total_sent/total_received, но модель их не видела:
+            # в промпте стояло одно свёрнутое нетто. А нетто -10 одинаково
+            # описывает и "отдал 10 и всё", и цепочку "отдал 10 → вернули 5
+            # → доотправил 5", где партнёр деньги ВОЗВРАЩАЛ и спорил о
+            # сумме. Для trust_score это противоположные истории, и по
+            # свёрнутому числу вторая читалась как выкачивание монет.
+            f"Money moved this conversation: you sent {partner_id} "
+            f"{_gross_sent} coin(s); {partner_id} sent you {_gross_recv} "
+            f"coin(s); net for you {net_transfer:+d} "
+            f"(positive=you received).\n"
+            f"Judge by BOTH figures: coins returned or paid back are not the "
+            f"same as coins never moved.\n\n"
             f"Full conversation:\n{conv_txt}\n\n"
             f"Current reputation entry for {partner_id}:\n"
             f"{json.dumps(existing_rep, ensure_ascii=False) if existing_rep else '(first interaction)'}\n\n"

@@ -12,11 +12,13 @@ Run:
 
 import argparse
 import configparser
+import threading
 import os
 import json
 import time
 
 import common
+import llm_pool
 import open_bets
 import promise_ledger
 import roles
@@ -130,9 +132,18 @@ def settle_pending_results(agents, players, base_dir, round_no, logger,
             f"Phase 0 of round {checkpoint_round}: skipping {len(done)} player(s) "
             f"who already reflected before the restart ({', '.join(sorted(done))})."
         )
-    for pid in players:
-        if pid in done:
-            continue
+    # POOL-1: рефлексия каждого игрока независима — агент читает и пишет
+    # только свои файлы. При пуле из нескольких серверов гоняем их разом;
+    # при одном run_parallel выполняет ровно тот же цикл последовательно
+    # и в том же порядке, поэтому прогоны остаются сравнимыми.
+    #
+    # Чекпойнт при этом обновляется ПОД ЗАМКОМ и после каждого игрока, а
+    # не одним махом в конце: смысл FIX-15 в том, чтобы обрыв не заставил
+    # рефлексировать повторно, и параллельность его не отменяет.
+    lock = threading.Lock()
+    counter = {"applied": applied}
+
+    def _reflect_one(pid):
         agent = agents[pid]
         # TALK-2: номер рефлексируемого раунда передаём атрибутом, а не
         # аргументом: reflect_betting подменяется шпионами в существующих
@@ -143,7 +154,8 @@ def settle_pending_results(agents, players, base_dir, round_no, logger,
             result = common.read_json(result_path)
             entry = agent.apply_result(result, round_no)
             os.remove(result_path)
-            applied += 1
+            with lock:
+                counter["applied"] += 1
             if reflect:
                 agent.reflect_betting(entry)
         elif reflect and round_no >= 1:
@@ -152,9 +164,32 @@ def settle_pending_results(agents, players, base_dir, round_no, logger,
         # игрок полностью обработан — фиксируем на диске сразу, чтобы
         # следующий обрыв не заставил его рефлексировать повторно
         if checkpoint_round:
-            done.add(pid)
-            save_phase0_done(base_dir, checkpoint_round, done)
-    return applied
+            with lock:
+                done.add(pid)
+                save_phase0_done(base_dir, checkpoint_round, done)
+
+    todo = [pid for pid in players if pid not in done]
+    llm_pool.run_parallel(
+        [(lambda p=p: _reflect_one(p)) for p in todo],
+        workers=_pool_workers(agents),
+        on_error=lambda e: logger.write_global(f"Phase 0: player task failed ({e})"),
+    )
+    return counter["applied"]
+
+
+def _pool_workers(agents) -> int:
+    """Сколько задач гнать разом = сколько серверов в пуле.
+
+    Больше потоков, чем серверов, не ускоряет: лишние всё равно встанут
+    в очередь на аренду в LLMPool.acquire(). Меньше — недогружает пул.
+    При одном сервере возвращает 1, и run_parallel уходит в обычный
+    последовательный цикл, без threading вообще.
+    """
+    for agent in agents.values():
+        pool = getattr(getattr(agent, "client", None), "pool", None)
+        if pool is not None:
+            return pool.size
+    return 1
 
 
 def round_player_order(players: list, round_no: int) -> list:
@@ -474,6 +509,53 @@ def _reflect_for_player(agent, pid, base_dir, prev_round, logger):
     agent.reflect_betting(entry)
 
 
+def _transfer_outcome(agent, raw, after_balance, after_open, after_count,
+                      final, delivered, intended_to, expected_to):
+    """
+    TVIS-1: почему перевод не прошёл целиком.
+
+    Обрезки стоят цепочкой, и каждая молча уменьшала сумму. Агент видел
+    только результат — точнее, не видел ничего: ноль в транскрипте не
+    отображался вовсе. В прогоне это дало платежи-призраки: игрок с
+    нулевым балансом писал "отправляю 5c", поле схлопывалось в ноль ещё
+    на min(), и ОБЕ стороны записывали в синапсу состоявшуюся сделку и
+    trust=10/10 при фактическом обороте 0.
+
+    Причина определяется по первой ступени, которая срезала сумму —
+    именно она и есть настоящее ограничение. Возвращает None, если
+    запрошенного перевода не было или он прошёл полностью.
+    """
+    if raw <= 0:
+        return None
+    if delivered == raw:
+        return None
+    if intended_to != expected_to:
+        return {"requested": raw, "delivered": 0, "reason": "wrong_recipient",
+                "detail": f"указан получатель {intended_to!r}, а разговор с {expected_to!r}"}
+    # Ступени проверяются С КОНЦА. Срезать могли несколько сразу: при
+    # запросе 20 и балансе 15 сначала обрежет баланс, а до нуля доведёт
+    # бюджет раунда. Назвать причиной первую ступень — значит подсказать
+    # игроку неверное ограничение: он решит, что дело в сумме, уменьшит
+    # её и снова упрётся. Решающая та, после которой получилось final.
+    if final < after_count:
+        limit = getattr(agent, "transfer_budget_this_round", None)
+        spent = getattr(agent, "sent_this_round", 0)
+        return {"requested": raw, "delivered": delivered, "reason": "round_budget",
+                "detail": (f"бюджет переводов на раунд {limit}, уже отдано {spent}"
+                           if limit is not None else "бюджет раунда исчерпан")}
+    if after_count < after_open:
+        return {"requested": raw, "delivered": delivered, "reason": "per_dialogue",
+                "detail": "лимит переводов за разговор исчерпан"}
+    if after_open < after_balance:
+        return {"requested": raw, "delivered": delivered, "reason": "opening_cap",
+                "detail": f"первая реплика: не больше {after_open}"}
+    if after_balance < raw:
+        return {"requested": raw, "delivered": delivered, "reason": "balance",
+                "detail": f"на счету было {after_balance}"}
+    return {"requested": raw, "delivered": delivered, "reason": "other",
+            "detail": ""}
+
+
 def _place_bet_for_player(agent, pid, base_dir, round_no, logger) -> bool:
     """
     Разместить ставку игрока. True — ставка на столе (только что
@@ -553,7 +635,9 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
         # вне if-а, поэтому при transfer>0 с чужим/пустым transfer_to
         # деньги не двигались, но обе стороны видели "[+N coins]" —
         # фантомная сделка, отравлявшая репутацию.
-        requested_a = min(turn_a["transfer"], agent_a.balance)
+        raw_a = max(0, int(turn_a.get("transfer") or 0))
+        requested_a = min(raw_a, agent_a.balance)
+        _a_after_balance = requested_a
         # OPEN-1: порядок важен — сначала правило первой реплики, потом
         # бюджет раунда. Иначе предоплата за воздух съедала бы бюджет,
         # даже будучи затем обнулённой.
@@ -562,9 +646,11 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
         requested_a = _cap_opening_transfer(agent_a, pid_a, pid_b, requested_a,
                                            conversation, table_dir, round_no,
                                            logger, _opening_allowance(agent_a))
+        _a_after_open = requested_a
         requested_a = _cap_dialogue_transfers(
             agent_a, pid_a, requested_a, a_transfers,
             MAX_TRANSFERS_PER_DIALOGUE, logger)
+        _a_after_count = requested_a
         requested_a = _cap_transfer(agent_a, pid_a, requested_a, logger)
         transfer_a = 0
         if requested_a > 0 and turn_a.get("transfer_to") == pid_b:
@@ -595,6 +681,12 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             "from": pid_a, "message": turn_a["message"],
             "transfer": transfer_a,
             "transfer_to": pid_b if transfer_a > 0 else None,
+            # TVIS-1: неудавшаяся попытка тоже факт разговора и видна обеим
+            # сторонам. Раньше здесь оставался только результат.
+            "attempt": _transfer_outcome(
+                agent_a, raw_a, _a_after_balance, _a_after_open,
+                _a_after_count, requested_a, transfer_a,
+                turn_a.get("transfer_to"), pid_b),
             "speech_cost": fee_a["charged"], "speech_lines": fee_a["lines"]
         })
         logger.write_dialogue(round_no, pid_a, pid_b, turn * 2 + 1,
@@ -624,10 +716,14 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             closing_turn=b_is_closing
         )
         # FIX-1 (симметрично для B)
-        requested_b = min(turn_b["transfer"], agent_b.balance)
+        raw_b = max(0, int(turn_b.get("transfer") or 0))
+        requested_b = min(raw_b, agent_b.balance)
+        _b_after_balance = requested_b
+        _b_after_open = requested_b     # у B открывающего правила нет
         requested_b = _cap_dialogue_transfers(
             agent_b, pid_b, requested_b, b_transfers,
             MAX_TRANSFERS_PER_DIALOGUE, logger)
+        _b_after_count = requested_b
         requested_b = _cap_transfer(agent_b, pid_b, requested_b, logger)
         transfer_b = 0
         if requested_b > 0 and turn_b.get("transfer_to") == pid_a:
@@ -654,6 +750,10 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             "from": pid_b, "message": turn_b["message"],
             "transfer": transfer_b,
             "transfer_to": pid_a if transfer_b > 0 else None,
+            "attempt": _transfer_outcome(
+                agent_b, raw_b, _b_after_balance, _b_after_open,
+                _b_after_count, requested_b, transfer_b,
+                turn_b.get("transfer_to"), pid_a),
             "speech_cost": fee_b["charged"], "speech_lines": fee_b["lines"]
         })
         logger.write_dialogue(round_no, pid_a, pid_b, turn * 2 + 2,
@@ -687,10 +787,18 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
     # DSYN-1: передаём ФАКТИЧЕСКИЕ обороты, а не только нетто — те же числа,
     # что уходят в transfer_ledger строкой выше. Иначе при встречных переводах
     # синапса показывала бы "отдал 8, получил 0" вместо "отдал 31, получил 23".
-    agent_a.update_dsyn(pid_b, conversation, net_a, round_no,
-                        sent=a_total_sent, received=b_total_sent)
-    agent_b.update_dsyn(pid_a, conversation, net_b, round_no,
-                        sent=b_total_sent, received=a_total_sent)
+    # POOL-1: обе стороны пишут КАЖДАЯ СВОЮ синапсу по одному и тому же
+    # уже готовому транскрипту — вызовы независимы. Числа сюда приходят
+    # из transfer_ledger строкой выше, то есть от параллельности
+    # разойтись не могут.
+    llm_pool.run_parallel(
+        [lambda: agent_a.update_dsyn(pid_b, conversation, net_a, round_no,
+                                     sent=a_total_sent, received=b_total_sent),
+         lambda: agent_b.update_dsyn(pid_a, conversation, net_b, round_no,
+                                     sent=b_total_sent, received=a_total_sent)],
+        workers=_pool_workers({pid_a: agent_a, pid_b: agent_b}),
+        on_error=lambda e: logger.write_global(f"update_dsyn failed ({e})"),
+    )
 
     speech_note = ""
     if tariff.enabled:
@@ -948,10 +1056,16 @@ def main():
                     a_sent = dlg_summary["a_sent"]
                     b_sent = dlg_summary["b_sent"]
                     # pid — инициатор (сторона A), partner_id — сторона B
-                    agents[pid].update_checklist(partner_id, conv,
-                                                 b_sent - a_sent, round_no)
-                    agents[partner_id].update_checklist(pid, conv,
-                                                        a_sent - b_sent, round_no)
+                    # POOL-1: та же независимая пара, что и в update_dsyn.
+                    llm_pool.run_parallel(
+                        [lambda: agents[pid].update_checklist(
+                            partner_id, conv, b_sent - a_sent, round_no),
+                         lambda: agents[partner_id].update_checklist(
+                            pid, conv, a_sent - b_sent, round_no)],
+                        workers=_pool_workers(agents),
+                        on_error=lambda e: logger.write_global(
+                            f"update_checklist failed ({e})"),
+                    )
 
                 # диалог полностью завершён — сохраняем прогресс НА ДИСК.
                 # Если сейчас нажать Ctrl+C, при рестарте этот диалог не
