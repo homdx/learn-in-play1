@@ -20,6 +20,7 @@ player2 (black_liar / Prosecutor) в начале раунда 2 — именн�
 
 import argparse
 import json
+import os
 import requests
 import sys
 from datetime import datetime, timezone
@@ -215,13 +216,55 @@ def check_response(response_text: str, raw: dict) -> dict:
     }
 
 
-def _make_payload(model: str, use_json_format: bool, num_predict: int, disable_thinking: bool) -> dict:
+# ─── Абстракция над двумя API ────────────────────────────────────────────────
+# "ollama" — родной эндпоинт /api/chat (поведение по умолчанию, как раньше).
+# "openai" — OpenAI-совместимый /v1/chat/completions (его отдаёт и сам Ollama,
+#            и vLLM, llama.cpp server, LM Studio, любой OpenAI-совместимый шлюз).
+
+DEFAULT_HOSTS = {
+    "ollama": "http://localhost:11434",
+    "openai": "http://localhost:11434/v1",
+}
+
+
+def _endpoint(host: str, api: str) -> str:
+    host = host.rstrip("/")
+    if api == "openai":
+        # позволяем передать и http://host:port, и http://host:port/v1
+        if not host.endswith("/v1"):
+            host += "/v1"
+        return f"{host}/chat/completions"
+    return f"{host}/api/chat"
+
+
+def _make_payload(model: str, use_json_format: bool, num_predict: int,
+                  disable_thinking: bool, api: str = "ollama") -> dict:
+    messages = [
+        {"role": "system", "content": SYSTEM_MSG + TASK_SUFFIX},
+        {"role": "user",   "content": REFLECT_USER_MSG},
+    ]
+
+    if api == "openai":
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "temperature": 0.5,
+            "max_tokens": num_predict,
+        }
+        if use_json_format:
+            payload["response_format"] = {"type": "json_object"}
+        if disable_thinking:
+            # В OpenAI-совместимом слое Ollama нет поля think. Ближайший
+            # эквивалент — reasoning_effort (Ollama >= 0.9, vLLM, llama.cpp).
+            # Сервер, который его не знает, обычно просто игнорирует поле;
+            # если он ругается 400 — уберите --no-think.
+            payload["reasoning_effort"] = "low"
+        return payload
+
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_MSG + TASK_SUFFIX},
-            {"role": "user",   "content": REFLECT_USER_MSG},
-        ],
+        "messages": messages,
         "stream": False,
         "options": {
             "temperature": 0.5,
@@ -237,12 +280,30 @@ def _make_payload(model: str, use_json_format: bool, num_predict: int, disable_t
     return payload
 
 
-def _request(host: str, payload: dict) -> dict:
+def _extract(data: dict, api: str) -> tuple:
+    """Возвращает (content, thinking, finish_reason) для обоих API."""
+    if api == "openai":
+        choices = data.get("choices") or [{}]
+        msg = choices[0].get("message", {}) or {}
+        content = msg.get("content") or ""
+        # разные серверы кладут reasoning в разные поля
+        thinking = msg.get("reasoning_content") or msg.get("reasoning") or ""
+        return content, thinking, choices[0].get("finish_reason", "")
+    msg = data.get("message", {}) or {}
+    return msg.get("content", ""), msg.get("thinking", ""), data.get("done_reason", "")
+
+
+def _request(host: str, payload: dict, api: str = "ollama",
+             api_key: str = "ollama") -> dict:
     t_start = datetime.now(timezone.utc)
     print(f"\n🕒 Запрос отправлен: {t_start.isoformat(timespec='milliseconds')}")
 
     try:
-        r = requests.post(f"{host}/api/chat", json=payload, timeout=720)
+        headers = {"Content-Type": "application/json"}
+        if api == "openai":
+            headers["Authorization"] = f"Bearer {api_key}"
+        r = requests.post(_endpoint(host, api), json=payload,
+                          headers=headers, timeout=720)
         r.raise_for_status()
     except requests.exceptions.ConnectionError as e:
         t_end = datetime.now(timezone.utc)
@@ -274,28 +335,30 @@ def _request(host: str, payload: dict) -> dict:
     try:
         return r.json()
     except json.JSONDecodeError as e:
-        print(f"\n❌ Не удалось распарсить JSON от сервера Ollama: {e}")
+        print(f"\n❌ Не удалось распарсить JSON от сервера: {e}")
         print(f"Сырое тело ответа:\n{r.text}")
         sys.exit(1)
 
 
 def _single_call(model: str, host: str, use_json_format: bool,
-                  num_predict: int = 700, disable_thinking: bool = False) -> tuple:
-    """Делает один запрос к /api/chat и возвращает (data, content)."""
-    payload = _make_payload(model, use_json_format, num_predict, disable_thinking)
+                  num_predict: int = 700, disable_thinking: bool = False,
+                  api: str = "ollama", api_key: str = "ollama") -> tuple:
+    """Делает один запрос к чат-эндпоинту и возвращает (data, content)."""
+    payload = _make_payload(model, use_json_format, num_predict, disable_thinking, api)
 
     print(f"\n{'='*60}")
     print(f"Модель: {model}")
-    print(f"Endpoint: {host}/api/chat")
+    print(f"API: {api}")
+    print(f"Endpoint: {_endpoint(host, api)}")
     print(f"temperature=0.5  max_tokens={num_predict}  "
-          f"format={'json' if use_json_format else '(none)'}  "
+          f"json={'on' if use_json_format else 'off'}  "
           f"think={'False' if disable_thinking else 'default'}")
     print(f"{'='*60}")
     print("\n[SYSTEM (первые 200 символов)]:", (SYSTEM_MSG + TASK_SUFFIX)[:200], "...")
     print("\n[USER (первые 300 символов)]:", REFLECT_USER_MSG[:300], "...")
     print("\nОтправляю запрос...")
 
-    data = _request(host, payload)
+    data = _request(host, payload, api, api_key)
 
     # Полная выдача сервера БЕЗ купюр — включая message целиком.
     # Некоторые модели (reasoning-модели) кладут вывод в message["thinking"],
@@ -305,15 +368,13 @@ def _single_call(model: str, host: str, use_json_format: bool,
     print(f"\n[ПОЛНЫЙ RAW-ОТВЕТ СЕРВЕРА]:")
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
-    message = data.get("message", {})
-    content = message.get("content", "")
-    thinking = message.get("thinking", "")
+    content, thinking, finish_reason = _extract(data, api)
 
     print(f"\n{'─'*60}")
-    print("ОТВЕТ МОДЕЛИ (message.content, raw):")
+    print(f"ОТВЕТ МОДЕЛИ (content, raw)  [finish/done_reason={finish_reason!r}]:")
     print(repr(content))
     if thinking:
-        print(f"\n⚠️  Обнаружено поле message.thinking (reasoning) длиной {len(thinking)} символов:")
+        print(f"\n⚠️  Обнаружено reasoning-поле длиной {len(thinking)} символов:")
         print(repr(thinking[:2000]) + (" ...[обрезано]" if len(thinking) > 2000 else ""))
     print(f"{'─'*60}")
 
@@ -322,7 +383,8 @@ def _single_call(model: str, host: str, use_json_format: bool,
 
 def call_ollama(model: str, host: str = "http://localhost:11434",
                  force_no_json: bool = False, num_predict: int = 700,
-                 force_no_think: bool = False) -> dict:
+                 force_no_think: bool = False, api: str = "ollama",
+                 api_key: str = "ollama") -> dict:
     # force_no_think=True (--no-think): сразу шлём think=False с первой попытки,
     # не дожидаясь авто-fallback (Случай 1 ниже). Полезно для reasoning-моделей
     # (gemma4, qwen3-thinking и т.п.), чтобы не терять ~100+ секунд на первый
@@ -332,24 +394,27 @@ def call_ollama(model: str, host: str = "http://localhost:11434",
     if force_no_json:
         data, content = _single_call(model, host, use_json_format=False,
                                       num_predict=num_predict,
-                                      disable_thinking=force_no_think)
+                                      disable_thinking=force_no_think,
+                                      api=api, api_key=api_key)
     else:
         data, content = _single_call(model, host, use_json_format=True,
                                       num_predict=num_predict,
-                                      disable_thinking=force_no_think)
+                                      disable_thinking=force_no_think,
+                                      api=api, api_key=api_key)
 
         # Случай 1: content пуст, но thinking съел весь бюджет num_predict.
         # Это reasoning-модель — повторяем с think=False и увеличенным лимитом,
         # чтобы весь бюджет шёл прямо в content.
         # Если --no-think уже стоял на первой попытке, thinking-канал и так
         # отключён, так что это условие естественно не сработает повторно.
-        thinking = data.get("message", {}).get("thinking", "")
-        if not content.strip() and thinking and data.get("done_reason") == "length":
+        _, thinking, finish_reason = _extract(data, api)
+        if not content.strip() and thinking and finish_reason == "length":
             bigger_predict = max(num_predict * 4, 2000)
             print(f"\n⚠️  Весь бюджет ({num_predict} токенов) ушёл в 'thinking'. "
                   f"Повторяю с think=False и num_predict={bigger_predict}...")
             data2, content2 = _single_call(model, host, use_json_format=True,
-                                            num_predict=bigger_predict, disable_thinking=True)
+                                            num_predict=bigger_predict, disable_thinking=True,
+                                            api=api, api_key=api_key)
             if content2.strip():
                 print("\n👉 Вывод: проблема была именно в том, что 'thinking' поглощал весь "
                       "лимит токенов. С think=False и большим num_predict модель отвечает нормально.")
@@ -365,7 +430,8 @@ def call_ollama(model: str, host: str = "http://localhost:11434",
                   "Повторяю запрос БЕЗ format=json...")
             data2, content2 = _single_call(model, host, use_json_format=False,
                                             num_predict=num_predict,
-                                            disable_thinking=force_no_think)
+                                            disable_thinking=force_no_think,
+                                            api=api, api_key=api_key)
             if content2.strip():
                 print("\n👉 Вывод: пустой ответ был вызван именно constrained JSON-декодированием "
                       "(format=json), а не общим сбоем/таймаутом модели.")
@@ -400,23 +466,18 @@ def call_ollama(model: str, host: str = "http://localhost:11434",
     return result
 
 
-def print_curl():
-    """Выводит готовый curl-запрос для копирования."""
-    payload = {
-        "model": "YOUR_MODEL_HERE",
-        "messages": [
-            {"role": "system", "content": SYSTEM_MSG + TASK_SUFFIX},
-            {"role": "user",   "content": REFLECT_USER_MSG},
-        ],
-        "stream": False,
-        "options": {"temperature": 0.5, "num_predict": 700},
-        "format": "json",
-    }
+def print_curl(api: str = "ollama", host: str = None):
+    """Выводит готовый curl-запрос для копирования (для выбранного API)."""
+    host = host or DEFAULT_HOSTS[api]
+    payload = _make_payload("YOUR_MODEL_HERE", use_json_format=True,
+                            num_predict=700, disable_thinking=False, api=api)
     print("\n" + "="*60)
-    print("CURL КОМАНДА (замените YOUR_MODEL_HERE на название модели):")
+    print(f"CURL КОМАНДА [api={api}] (замените YOUR_MODEL_HERE на название модели):")
     print("="*60)
-    print("curl -s http://localhost:11434/api/chat \\")
+    print(f"curl -s {_endpoint(host, api)} \\")
     print("  -H 'Content-Type: application/json' \\")
+    if api == "openai":
+        print("  -H 'Authorization: Bearer ollama' \\")
     print("  -d '" + json.dumps(payload, ensure_ascii=False).replace("'", "'\\''") + "'")
     print("="*60 + "\n")
 
@@ -427,8 +488,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--model", default="qwen3:30b-a3b-instruct-2507-q4_K_M",
                         help="Модель ollama для теста")
-    parser.add_argument("--host", default="http://localhost:11434",
-                        help="Ollama server URL")
+    parser.add_argument("--api", choices=["ollama", "openai"], default="ollama",
+                        help="Какой протокол использовать: 'ollama' — родной "
+                             "/api/chat (по умолчанию, поведение не менялось); "
+                             "'openai' — OpenAI-совместимый /v1/chat/completions "
+                             "(его отдаёт Ollama, vLLM, llama.cpp, LM Studio).")
+    parser.add_argument("--host", default=None,
+                        help="URL сервера. По умолчанию http://localhost:11434 "
+                             "для --api ollama и http://localhost:11434/v1 для "
+                             "--api openai.")
+    parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", "ollama"),
+                        help="Bearer-токен для --api openai (по умолчанию берётся "
+                             "из $OPENAI_API_KEY, иначе 'ollama').")
     parser.add_argument("--curl", action="store_true",
                         help="Только вывести curl-команду")
     parser.add_argument("--no-json", action="store_true",
@@ -443,11 +514,13 @@ if __name__ == "__main__":
                              "первый заведомо провальный вызов. Без флага поведение "
                              "не меняется.")
     args = parser.parse_args()
+    host = args.host or DEFAULT_HOSTS[args.api]
 
     if args.curl:
-        print_curl()
+        print_curl(args.api, host)
         sys.exit(0)
 
-    result = call_ollama(args.model, args.host, force_no_json=args.no_json,
-                          num_predict=args.num_predict, force_no_think=args.no_think)
+    result = call_ollama(args.model, host, force_no_json=args.no_json,
+                          num_predict=args.num_predict, force_no_think=args.no_think,
+                          api=args.api, api_key=args.api_key)
     sys.exit(0 if result.get("hallucinations_found", 1) == 0 else 1)
