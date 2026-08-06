@@ -29,6 +29,17 @@ def run_round(base_dir, winning_number=None, logger=None):
             logger.write_global("No bets — round skipped.")
         return None, []
 
+    # BET-1: перед спином повторяем (ротируем) в лог ставку каждого
+    # игрока — так итоговый лог раунда содержит сводку ставок сразу
+    # перед спином, а не только в момент их размещения диалоговой фазой.
+    for pid, bet, _bet_path in bets:
+        bd = bet.get("numbers", bet.get("selection"))
+        recap_msg = f"bet recap before spin: {bet.get('type')}({bd}) amount={bet.get('amount')}"
+        if logger:
+            logger.write(pid, recap_msg)
+        else:
+            print(f"[{pid}] {recap_msg}")
+
     if winning_number is None:
         winning_number = common.spin_wheel()
 
