@@ -8,10 +8,22 @@ run_game_v2.py — Casino orchestrator with:
 
 Run:
     python3 run_game_v2.py [--config config_v2.ini] [--rounds N] [--table-dir PATH]
+                            [--start-round N]
+
+Snapshots:
+    After each round fully completes, its entire table state (balances,
+    history, notes/checklists, promise/transfer ledgers, game_state.json)
+    is copied to <table_dir>/snapshots/round_<N>/.
+
+    --start-round N restores the snapshot of round N-1 into the table dir
+    (wiping whatever is currently there, except snapshots/ itself) and then
+    resumes play from round N onward, exactly as if the earlier rounds had
+    just finished. Use --start-round 1 to reset to a completely fresh table.
 """
 
 import argparse
 import configparser
+import shutil
 import threading
 import os
 import json
@@ -66,6 +78,83 @@ def load_last_round(base_dir):
 
 def save_last_round(base_dir, round_no):
     common.write_json(state_file(base_dir), {"last_completed_round": round_no})
+
+
+SNAPSHOTS_DIRNAME = "snapshots"
+
+
+def snapshots_root(base_dir):
+    return os.path.join(base_dir, SNAPSHOTS_DIRNAME)
+
+
+def snapshot_dir(base_dir, round_no):
+    return os.path.join(snapshots_root(base_dir), f"round_{round_no}")
+
+
+def save_round_snapshot(base_dir, round_no, logger=None):
+    """
+    SNAP-1: копия ВСЕХ файлов состояния стола (балансы, история,
+    промис-леджер, transfer-леджер, заметки/чеклисты, game_state.json
+    и т.д.) сразу после того, как раунд round_no полностью завершён и
+    save_last_round() уже записал его на диск.
+
+    Снимок делается ПОСЛЕ save_last_round(), а не до — иначе при сбое
+    между копированием и записью game_state.json снимок раунда N мог
+    бы совпасть по имени с фактически недоигранным раундом N.
+
+    Каталог snapshots/ сам не копируется (иначе рекурсия и раздувание
+    на ровном месте с каждым раундом).
+    """
+    dest = snapshot_dir(base_dir, round_no)
+    if os.path.isdir(dest):
+        shutil.rmtree(dest)
+    os.makedirs(dest, exist_ok=True)
+    for name in os.listdir(base_dir):
+        if name == SNAPSHOTS_DIRNAME:
+            continue
+        src_path = os.path.join(base_dir, name)
+        dst_path = os.path.join(dest, name)
+        if os.path.isdir(src_path):
+            shutil.copytree(src_path, dst_path)
+        else:
+            shutil.copy2(src_path, dst_path)
+    if logger:
+        logger.write_global(f"Snapshot of round {round_no} saved to {dest}")
+
+
+def restore_round_snapshot(base_dir, round_no):
+    """
+    SNAP-2: восстанавливает состояние стола из снимка round_no,
+    перезаписывая ТЕКУЩИЕ файлы base_dir (кроме самого snapshots/).
+    Используется --start-round: чтобы начать заново с раунда N,
+    восстанавливаем снимок раунда N-1 (последний полностью
+    доигранный раунд перед тем, откуда хотим продолжить) — балансы,
+    заметки и леджеры становятся ровно такими, какими были сразу
+    после round N-1, а дальше игра идёт как обычный resume.
+    """
+    src = snapshot_dir(base_dir, round_no)
+    if not os.path.isdir(src):
+        raise SystemExit(
+            f"No snapshot found for round {round_no} at {src}. "
+            f"Available snapshots: {sorted(os.listdir(snapshots_root(base_dir))) if os.path.isdir(snapshots_root(base_dir)) else '(none)'}"
+        )
+    # Clear current state files (except snapshots/) before restoring,
+    # so stale files that didn't exist at snapshot time don't linger.
+    for name in os.listdir(base_dir):
+        if name == SNAPSHOTS_DIRNAME:
+            continue
+        path = os.path.join(base_dir, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+    for name in os.listdir(src):
+        src_path = os.path.join(src, name)
+        dst_path = os.path.join(base_dir, name)
+        if os.path.isdir(src_path):
+            shutil.copytree(src_path, dst_path)
+        else:
+            shutil.copy2(src_path, dst_path)
 
 
 def dialogue_phase_state_file(base_dir):
@@ -823,6 +912,12 @@ def main():
     parser.add_argument("--table-dir", default=None)
     parser.add_argument("--winning-number", type=int, default=None,
                         help="Force winning number for first round (testing)")
+    parser.add_argument("--start-round", type=int, default=None,
+                        help="Restart play from this round, restoring table "
+                             "state (balances, notes, ledgers) from the "
+                             "snapshot taken right after round (--start-round - 1) "
+                             "finished. Requires that round to have completed "
+                             "with snapshots enabled on a previous run.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -851,6 +946,28 @@ def main():
         "game", "checklist_after_each_dialogue", fallback=True)
 
     logger = GameLogger(logs_dir)
+
+    if args.start_round is not None:
+        if args.start_round < 1:
+            raise SystemExit("--start-round must be >= 1")
+        snapshot_round = args.start_round - 1
+        if snapshot_round == 0:
+            # Restarting from round 1 == a completely fresh table.
+            for name in os.listdir(base_dir):
+                if name == SNAPSHOTS_DIRNAME:
+                    continue
+                path = os.path.join(base_dir, name)
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+        else:
+            restore_round_snapshot(base_dir, snapshot_round)
+        logger.write_global(
+            f"=== --start-round {args.start_round}: restored table state from "
+            f"the snapshot of round {snapshot_round} (0 = fresh table). "
+            f"Table: {base_dir} ==="
+        )
 
     last_done = load_last_round(base_dir)
     start_round = last_done + 1
@@ -1117,6 +1234,7 @@ def main():
         # раунд полностью завершён — запоминаем это на диске,
         # чтобы при перезапуске после Ctrl+C не проходить его снова
         save_last_round(base_dir, round_no)
+        save_round_snapshot(base_dir, round_no, logger=logger)
 
         if round_delay:
             time.sleep(round_delay)
