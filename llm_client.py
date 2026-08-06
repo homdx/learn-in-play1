@@ -23,6 +23,7 @@ import json
 import os
 import re
 import ssl
+import time
 import urllib.error
 import urllib.request
 
@@ -290,6 +291,16 @@ class LLMClient:
             }
             if json_mode and not self._json_format_off():
                 payload["response_format"] = {"type": "json_object"}
+            # THINK-1: Qwen3 и другие hybrid-thinking модели за vLLM/SGLang
+            # умеют выключать <think> через chat_template_kwargs.
+            # enable_thinking. Без этого модель тратит ВЕСЬ max_tokens на
+            # рассуждения и обрывается по 'length' с пустым content —
+            # ответ уходит целиком в reasoning_content, JSON так и не
+            # начинается (см. _extract_content ниже). think=false в
+            # конфиге теперь действует и для api_format=openai, не только
+            # для ollama.
+            if self.think is not None:
+                payload["chat_template_kwargs"] = {"enable_thinking": self.think}
         _dbg(f"_build_request: url={url!r}, model={self.model!r}, "
              f"api_format={self.api_format!r}, think={self.think!r}, "
              f"num_ctx={self.num_ctx}, max_tokens={max_tokens}, temp={temperature}, "
@@ -366,7 +377,8 @@ class LLMClient:
         return content.strip()
 
     def chat(self, system: str, user: str, temperature: float = 0.4,
-             max_tokens: int = 400, json_mode: bool = False) -> str:
+             max_tokens: int = 400, json_mode: bool = False,
+             _retried_429: bool = False) -> str:
         """Блокинг-вызов чат-комплишена. Возвращает текст ответа
         (с уже вырезанным <think>...</think>, если он был)."""
         url, headers, payload = self._build_request(system, user, temperature,
@@ -385,6 +397,32 @@ class LLMClient:
                 detail = e.read().decode("utf-8", errors="replace")[:500]
             except Exception:
                 pass
+            # RATE-1: 429 у router.huggingface.co (и вообще у большинства
+            # OpenAI-совместимых шлюзов) значит "подожди и повтори", а не
+            # "сервер недоступен" — путать его с обрывом связи (RETRY-1)
+            # неверно: там повтор МЕНЯЕТ temperature/промпт, здесь нужно
+            # просто подождать и повторить ТОТ ЖЕ запрос без изменений.
+            # Ждём Retry-After из ответа, если сервер его прислал, иначе
+            # 60 сек по умолчанию. Повторяем только один раз здесь —
+            # дальше решает обычный RETRY-1 в chat_json().
+            if e.code == 429 and not _retried_429:
+                wait_s = 60
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                if retry_after:
+                    try:
+                        wait_s = max(1, int(float(retry_after)))
+                    except ValueError:
+                        pass
+                on_retry = getattr(self, "on_retry", None)
+                if on_retry:
+                    on_retry(f"HTTP 429 от {url} (rate limited), "
+                             f"жду {wait_s} сек и повторяю тот же запрос")
+                _dbg(f"chat(): HTTP 429, sleeping {wait_s}s before retry "
+                     f"(detail={detail[:200]!r})")
+                time.sleep(wait_s)
+                return self.chat(system, user, temperature=temperature,
+                                 max_tokens=max_tokens, json_mode=json_mode,
+                                 _retried_429=True)
             # EOS-2/COMPAT: 400 на запросе с "format": "json" почти всегда
             # означает шлюз, который валидирует тело строго и режет поля,
             # которых нет в его схеме. Локальная ollama такое поле
