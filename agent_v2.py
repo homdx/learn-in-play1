@@ -2127,8 +2127,16 @@ class PlayerAgent:
         old["total_received"] += actual_received
         old["net"]            += net_transfer
         old["trust_score"]     = resp.get("trust_score", old["trust_score"])
-        old["reputation_note"] = resp.get("reputation_note", old["reputation_note"])
-        old["future_intent"]   = resp.get("future_intent", "")
+        # SCHEMA-2: тот же класс бага, что уже ловили в hallucination_test.py
+        # (SCHEMA-1) — модель (реальный случай: Mistral) вернула
+        # future_intent вложенным объектом вместо строки. Раньше это
+        # писалось в dsyn как есть и падало ниже на `old['future_intent']
+        # [:60]` с "TypeError: unhashable type: 'slice'" (срез dict'а —
+        # Python пытается хэшировать slice-объект как ключ). _as_text —
+        # тот же приём, что уже используется в этом файле для notes
+        # (FIX-6), просто эта дорожка (update_dsyn) его не унаследовала.
+        old["reputation_note"] = _as_text(resp.get("reputation_note"), old["reputation_note"])
+        old["future_intent"]   = _as_text(resp.get("future_intent"), "")
         old["last_seen_round"] = round_no
         if resp.get("deal_done"):
             old["deals_done"].append(f"r{round_no}: {resp['deal_done']}")
@@ -2141,7 +2149,7 @@ class PlayerAgent:
             "round": round_no,
             "partner": partner_id,
             "net_transfer": net_transfer,
-            "summary": resp.get("summary", ""),
+            "summary": _as_text(resp.get("summary"), ""),
             "timestamp": datetime.now().isoformat()
         })
 

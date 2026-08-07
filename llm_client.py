@@ -80,6 +80,49 @@ def _ollama_chat_url(base_url: str) -> str:
     return f"{base}/api/chat"
 
 
+_RETRY_AFTER_MS_RE = re.compile(r"try again in\s+([\d.]+)\s*ms", re.IGNORECASE)
+_RETRY_AFTER_S_RE = re.compile(r"try again in\s+([\d.]+)\s*s(?:econds?)?\b", re.IGNORECASE)
+
+
+def _parse_retry_after(e: urllib.error.HTTPError, detail: str):
+    """RATE-2: сколько РЕАЛЬНО ждать перед повтором 429 — а не фиксированные
+    "60 секунд по умолчанию", когда сервер прямым текстом сказал точную
+    цифру.
+
+    Реальный случай (Groq): второй подряд 429 на тот же запрос падал уже не
+    в RATE-1 (тот срабатывает только один раз на вызов, см. `_retried_429`
+    ниже), а в общий HTTP-RETRY, который слепо спал `error_retry_wait_sec`
+    (60 сек) — хотя тело ответа содержало `"Please try again in 820ms"`.
+    Groq не всегда шлёт заголовок `Retry-After` (виден не в каждом 429), но
+    почти всегда пишет точное время текстом в теле ошибки — берём его как
+    запасной источник, если заголовка нет.
+
+    Возвращает секунды (float) или None, если число не нашлось нигде —
+    тогда вызывающий сам решает, чем заменить (обычно фиксированным
+    error_retry_wait_sec).
+    """
+    if e.headers:
+        retry_after = e.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return max(0.1, float(retry_after))
+            except ValueError:
+                pass
+    m = _RETRY_AFTER_MS_RE.search(detail)
+    if m:
+        try:
+            return max(0.1, float(m.group(1)) / 1000.0)
+        except ValueError:
+            pass
+    m = _RETRY_AFTER_S_RE.search(detail)
+    if m:
+        try:
+            return max(0.1, float(m.group(1)))
+        except ValueError:
+            pass
+    return None
+
+
 class LLMUnavailable(RuntimeError):
     """
     FIX-17: сервер моделей недоступен подряд слишком много раз.
@@ -462,18 +505,14 @@ class LLMClient:
             # 60 сек по умолчанию. Повторяем только один раз здесь —
             # дальше решает обычный RETRY-1 в chat_json().
             if e.code == 429 and not _retried_429:
-                wait_s = 60
-                retry_after = e.headers.get("Retry-After") if e.headers else None
-                if retry_after:
-                    try:
-                        wait_s = max(1, int(float(retry_after)))
-                    except ValueError:
-                        pass
+                wait_s = _parse_retry_after(e, detail)
+                if wait_s is None:
+                    wait_s = 60.0
                 on_retry = getattr(self, "on_retry", None)
                 if on_retry:
                     on_retry(f"HTTP 429 от {url} (rate limited), "
-                             f"жду {wait_s} сек и повторяю тот же запрос")
-                _dbg(f"chat(): HTTP 429, sleeping {wait_s}s before retry "
+                             f"жду {wait_s:.1f} сек и повторяю тот же запрос")
+                _dbg(f"chat(): HTTP 429, sleeping {wait_s:.1f}s before retry "
                      f"(detail={detail[:200]!r})")
                 time.sleep(wait_s)
                 return self.chat(system, user, temperature=temperature,
@@ -505,11 +544,23 @@ class LLMClient:
             # того же запроса стоят своей цены, даже если для настоящего
             # исчерпания месячной квоты они не помогут и раунд всё равно
             # прервётся, просто на 1-2 минуты позже.
+            #
+            # RATE-2: если это ВТОРОЙ подряд 429 на тот же вызов (RATE-1
+            # выше уже использовал свой единственный повтор и снова получил
+            # 429), не спим слепо error_retry_wait_sec — Groq в этот момент
+            # обычно прямо пишет реальное время в теле ответа ("Please try
+            # again in 820ms"), и ждать вместо этого фиксированную минуту —
+            # чистая потеря времени. Для остальных кодов (402/5xx), где
+            # такой точной цифры обычно нет, остаётся error_retry_wait_sec.
             if _http_retry_n < self.error_retries:
                 wait_s = self.error_retry_wait_sec
+                if e.code == 429:
+                    precise = _parse_retry_after(e, detail)
+                    if precise is not None:
+                        wait_s = precise
                 on_retry = getattr(self, "on_retry", None)
                 msg = (f"HTTP {e.code} от {url} ({detail or e.reason}), жду "
-                       f"{wait_s} сек и повторяю тот же запрос (попытка "
+                       f"{wait_s:.1f} сек и повторяю тот же запрос (попытка "
                        f"{_http_retry_n + 1}/{self.error_retries})")
                 if on_retry:
                     on_retry(msg)

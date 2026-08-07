@@ -320,6 +320,102 @@ class TestUserAgentHeader(unittest.TestCase):
         self.assertNotIn("urllib", headers["User-Agent"].lower())
 
 
+class TestRateLimitPreciseWait(unittest.TestCase):
+    """RATE-2: реальный случай (Groq) — второй подряд 429 на тот же вызов
+    падал уже не в RATE-1 (у него только одна попытка на вызов), а в общий
+    HTTP-RETRY, который слепо спал error_retry_wait_sec (60 сек), хотя тело
+    ответа содержало точное время: "Please try again in 820ms"."""
+
+    def setUp(self):
+        llm_client._Breaker.failures = 0
+        llm_client._ServerCaps.reset()
+        self._orig_sleep = llm_client.time.sleep
+        self.slept = []
+        llm_client.time.sleep = lambda s: self.slept.append(s)
+
+    def tearDown(self):
+        llm_client.time.sleep = self._orig_sleep
+
+    def _err_429(self, body: str, headers: dict = None):
+        import urllib.error, io, email.message
+        h = email.message.Message()
+        for k, v in (headers or {}).items():
+            h[k] = v
+        return urllib.error.HTTPError("https://api.groq.com/x", 429, "Too Many Requests",
+                                      h, io.BytesIO(body.encode()))
+
+    def _patch(self, responses):
+        seq = list(responses)
+
+        def fake_urlopen(req, timeout=None, context=None):
+            nxt = seq.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+        llm_client.urllib.request.urlopen = fake_urlopen
+
+    def _ok(self, text='{"ok":1}'):
+        import io, json as _json
+        class R(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        return R(_json.dumps({"choices": [{"message": {"content": text},
+                                          "finish_reason": "stop"}]}).encode())
+
+    def test_first_429_uses_retry_after_header(self):
+        c = LLMClient("https://api.groq.com/openai/v1", "k", "m",
+                     api_format="openai", retries=0)
+        self._patch([self._err_429("rate limited", headers={"Retry-After": "19"}),
+                    self._ok()])
+        c.chat_json("s", "u")
+        self.assertEqual(self.slept, [19.0])
+
+    def test_second_consecutive_429_uses_body_text_not_fixed_60s(self):
+        """Ключевой регрессионный тест: ВТОРОЙ подряд 429 (RATE-1 уже
+        использовал свою одну попытку) должен ждать 0.82с из текста тела
+        ответа, а НЕ фиксированные error_retry_wait_sec=60."""
+        c = LLMClient("https://api.groq.com/openai/v1", "k", "m",
+                     api_format="openai", retries=0,
+                     error_retries=2, error_retry_wait_sec=60)
+        body = ('{"error":{"message":"Rate limit reached... '
+               'Please try again in 820ms. Need more tokens?",'
+               '"type":"tokens","code":"rate_limit_exceeded"}}')
+        self._patch([
+            self._err_429("rate limited", headers={"Retry-After": "19"}),  # RATE-1: 19s
+            self._err_429(body),  # второй 429, БЕЗ заголовка — только текст
+            self._ok(),
+        ])
+        c.chat_json("s", "u")
+        self.assertEqual(self.slept, [19.0, 0.82])
+
+    def test_second_429_without_any_timing_info_falls_back_to_fixed_wait(self):
+        """Если сервер не дал ни заголовка, ни текста с цифрой — используем
+        error_retry_wait_sec как и раньше, а не падаем и не ждём 0 секунд."""
+        c = LLMClient("https://api.groq.com/openai/v1", "k", "m",
+                     api_format="openai", retries=0,
+                     error_retries=2, error_retry_wait_sec=45)
+        self._patch([
+            self._err_429("rate limited", headers={"Retry-After": "19"}),
+            self._err_429("rate limited, no timing info at all"),
+            self._ok(),
+        ])
+        c.chat_json("s", "u")
+        self.assertEqual(self.slept, [19.0, 45])
+
+    def test_non_429_error_still_uses_fixed_wait_not_body_parsing(self):
+        """402/5xx не должны пытаться парсить 'try again in' из тела —
+        это специфика формата ошибок 429 у Groq, не общий контракт."""
+        import urllib.error, io
+        c = LLMClient("https://api.groq.com/openai/v1", "k", "m",
+                     api_format="openai", retries=0,
+                     error_retries=1, error_retry_wait_sec=45)
+        err_402 = urllib.error.HTTPError(
+            "u", 402, "x", {}, io.BytesIO(b"Please try again in 5ms, no credits"))
+        self._patch([err_402, self._ok()])
+        c.chat_json("s", "u")
+        self.assertEqual(self.slept, [45])
+
+
 class TestStubSubclassCompatibility(Base):
 
     def test_subclass_without_init_still_works(self):

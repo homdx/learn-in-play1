@@ -193,5 +193,94 @@ class TestDsynGross(unittest.TestCase):
         self.assertNotIn("unlock free negotiation", txt)
 
 
+class TestDsynMalformedModelResponse(unittest.TestCase):
+    """SCHEMA-2: реальный случай — Mistral вернул future_intent вложенным
+    объектом вместо строки. update_dsyn писал его в dsyn как есть, и падал
+    ниже на `old['future_intent'][:60]` с "TypeError: unhashable type:
+    'slice'" (срез dict'а: Python пытается хэшировать slice как ключ).
+    Контрфактические тесты: падают на старом коде, проходят на исправленном.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+
+    def _run(self, resp: dict):
+        class Spy:
+            def chat_json(s, system, user, **kw):
+                return resp
+
+        class NullLog:
+            def write(self, *a, **k): pass
+
+        a = agent_v2.PlayerAgent.__new__(agent_v2.PlayerAgent)
+        a.player_id, a.base_dir = "p1", self.tmp
+        a.client = Spy()
+        a.balance = 100
+        a.log = NullLog()
+        a.tariff = None
+        a.temperature = 0.4
+        a.persona_chars = 2000
+        a.tok_update_dsyn = 700
+        a.update_dsyn("p2", [], 0, 1)  # не должно бросать исключение
+        return agent_v2.load_dsyn("p1", self.tmp)
+
+    def test_dict_future_intent_does_not_crash(self):
+        """Точное воспроизведение бага из реального прогона."""
+        dsyn = self._run({
+            "trust_score": 5, "deal_done": None, "deal_failed": None,
+            "reputation_note": "n",
+            "future_intent": {"plan": "avoid direct interaction", "step": 2},
+            "summary": "s",
+        })
+        stored = dsyn["reputation"]["p2"]["future_intent"]
+        self.assertIsInstance(stored, str)
+        self.assertIn("avoid direct interaction", stored)
+
+    def test_dict_reputation_note_does_not_crash(self):
+        dsyn = self._run({
+            "trust_score": 5, "deal_done": None, "deal_failed": None,
+            "reputation_note": {"note": "unreliable", "confidence": "high"},
+            "future_intent": "i", "summary": "s",
+        })
+        stored = dsyn["reputation"]["p2"]["reputation_note"]
+        self.assertIsInstance(stored, str)
+        self.assertIn("unreliable", stored)
+
+    def test_dict_summary_does_not_crash(self):
+        dsyn = self._run({
+            "trust_score": 5, "deal_done": None, "deal_failed": None,
+            "reputation_note": "n", "future_intent": "i",
+            "summary": {"outcome": "deal reached", "coins": 20},
+        })
+        stored = dsyn["interactions"][-1]["summary"]
+        self.assertIsInstance(stored, str)
+        self.assertIn("deal reached", stored)
+
+    def test_normal_string_response_unaffected(self):
+        """Регрессия: обычный корректный ответ не должен измениться."""
+        dsyn = self._run({
+            "trust_score": 7, "deal_done": None, "deal_failed": None,
+            "reputation_note": "plays fair", "future_intent": "keep trading",
+            "summary": "smooth deal",
+        })
+        rep = dsyn["reputation"]["p2"]
+        self.assertEqual(rep["reputation_note"], "plays fair")
+        self.assertEqual(rep["future_intent"], "keep trading")
+        self.assertEqual(dsyn["interactions"][-1]["summary"], "smooth deal")
+
+    def test_log_line_with_dict_future_intent_does_not_crash(self):
+        """Сам краш происходил в СТРОКЕ ЛОГА (`[:60]` на будущем интенте),
+        уже ПОСЛЕ сохранения на диск — проверяем именно этот путь целиком,
+        не только итоговое значение в файле."""
+        # Не бросает исключение — этого достаточно, self._run уже прогоняет
+        # весь метод до конца, включая self._log(...) с срезом.
+        self._run({
+            "trust_score": 5, "deal_done": None, "deal_failed": None,
+            "reputation_note": "n",
+            "future_intent": {"a": "b"} , "summary": "s",
+        })
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
