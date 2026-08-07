@@ -325,6 +325,21 @@ class LLMClient:
             # для ollama.
             if self.think is not None:
                 payload["chat_template_kwargs"] = {"enable_thinking": self.think}
+            # THINK-3: chat_template_kwargs — это vLLM/SGLang-специфика.
+            # OpenRouter (и любой gateway перед ним, включая gpt-oss —
+            # реальный случай: openai/gpt-oss-20b:free через OpenRouter
+            # сжёг все 700 max_tokens на скрытые рассуждения в отдельном
+            # канале и вернул content="" с finish_reason='length', а
+            # chat_template_kwargs.enable_thinking этот канал не трогает
+            # вообще) использует СВОЙ унифицированный параметр — вложенный
+            # объект reasoning (см. openrouter.ai/docs/use-cases/reasoning-
+            # tokens), плюс есть отдельный плоский reasoning_effort у
+            # нативного OpenAI o1/o3/gpt-5. Отправляем оба поля сразу: то,
+            # что конкретный провайдер не понимает, он молча игнорирует —
+            # дешевле, чем гадать, какое поле сработает именно здесь.
+            if self.think is False:
+                payload["reasoning_effort"] = "low"
+                payload["reasoning"] = {"effort": "low", "exclude": True}
         _dbg(f"_build_request: url={url!r}, model={self.model!r}, "
              f"api_format={self.api_format!r}, think={self.think!r}, "
              f"num_ctx={self.num_ctx}, max_tokens={max_tokens}, temp={temperature}, "
@@ -388,15 +403,21 @@ class LLMClient:
         msg = choices[0].get("message", {})
         _dbg(f"  openai message keys: {list(msg.keys())}")
         content = msg.get("content", "") or ""
-        # OpenAI-совместимые серверы с thinking иногда кладут reasoning_content
-        # в отдельное поле, а content остаётся пустым
-        reasoning = msg.get("reasoning_content", "") or ""
+        # OpenAI-совместимые серверы с thinking иногда кладут рассуждения в
+        # отдельное поле, а content остаётся пустым. Разные экосистемы
+        # называют его по-разному: vLLM/SGLang — "reasoning_content",
+        # OpenRouter (в т.ч. gpt-oss через него, реальный случай) —
+        # "reasoning". Раньше проверялось только первое имя, и
+        # LLM_DEBUG печатал "reasoning_content present: False" даже когда
+        # в raw-ответе лежало 3000+ символов рассуждений под "reasoning" —
+        # диагностика откровенно врала о причине пустого content.
+        reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
         finish_reason = choices[0].get("finish_reason", "")
         _dbg(f"  finish_reason: {finish_reason!r}")
         _dbg(f"  content repr (first 200): {content[:200]!r}")
-        _dbg(f"  reasoning_content present: {bool(reasoning)}, len={len(reasoning)}")
+        _dbg(f"  reasoning present: {bool(reasoning)}, len={len(reasoning)}")
         if not content.strip() and reasoning:
-            _dbg("  WARNING: content is empty but reasoning_content is not — "
+            _dbg("  WARNING: content is empty but reasoning is not — "
                  "model returned only thinking, no actual JSON output!")
         return content.strip()
 

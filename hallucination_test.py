@@ -346,11 +346,17 @@ def _make_payload(model: str, use_json_format: bool, num_predict: int,
         if use_json_format:
             payload["response_format"] = {"type": "json_object"}
         if disable_thinking:
-            # В OpenAI-совместимом слое Ollama нет поля think. Ближайший
-            # эквивалент — reasoning_effort (Ollama >= 0.9, vLLM, llama.cpp).
-            # Сервер, который его не знает, обычно просто игнорирует поле;
-            # если он ругается 400 — уберите --no-think.
+            # THINK-3: реальный случай — openai/gpt-oss-20b:free через
+            # OpenRouter не понимает ни chat_template_kwargs (vLLM/SGLang),
+            # ни голое reasoning_effort в одиночку так же надёжно, как
+            # унифицированный вложенный параметр OpenRouter (см.
+            # openrouter.ai/docs/use-cases/reasoning-tokens): именно он сжёг
+            # весь бюджет на скрытые рассуждения и вернул content="" при
+            # finish_reason='length', хотя reasoning_effort уже был здесь.
+            # Отправляем оба сразу — то, что провайдер не знает, он молча
+            # игнорирует; если ругается 400, уберите --no-think.
             payload["reasoning_effort"] = "low"
+            payload["reasoning"] = {"effort": "low", "exclude": True}
         return payload
 
     payload = {
