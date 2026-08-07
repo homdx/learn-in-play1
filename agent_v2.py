@@ -1581,9 +1581,16 @@ class PlayerAgent:
             )
             action  = resp.get("action", "bet")
             partner = resp.get("partner")
+            # RETRY-2: LLM иногда возвращает "reason" не строкой (dict/list/None),
+            # а вызывающий код в run_game_v2.py делает reason[:80] — на не-строке
+            # это падает с "unhashable type: 'slice'" (для dict) или TypeError
+            # (для None/list). Приводим к строке здесь же, у источника.
+            reason = resp.get("reason", "")
+            if not isinstance(reason, str):
+                reason = str(reason)
             if action == "talk" and partner in available_players:
-                return {"action": "talk", "partner": partner, "reason": resp.get("reason", "")}
-            return {"action": "bet", "partner": None, "reason": resp.get("reason", "")}
+                return {"action": "talk", "partner": partner, "reason": reason}
+            return {"action": "bet", "partner": None, "reason": reason}
         except LLMUnavailable:
             raise            # FIX-17: выключатель наверх, не в заглушку
         except Exception as e:

@@ -1238,12 +1238,12 @@ def main():
                 decision = agent.decide_next_move(available, talked_to, round_no,
                                                    dialogues_this_round)
                 if decision["action"] != "talk":
-                    logger.write(pid, f"done talking this round (reason: {decision.get('reason','')[:80]}), "
+                    logger.write(pid, f"done talking this round (reason: {str(decision.get('reason',''))[:80]}), "
                                        f"proceeding to bet")
                     break
 
                 partner_id = decision["partner"]
-                logger.write(pid, f"chooses to talk to {partner_id} — reason: {decision.get('reason','')[:80]}")
+                logger.write(pid, f"chooses to talk to {partner_id} — reason: {str(decision.get('reason',''))[:80]}")
 
                 partner_agent = agents[partner_id]
                 dlg_summary = run_dialogue(agent, partner_agent, round_no, logger, base_dir)
