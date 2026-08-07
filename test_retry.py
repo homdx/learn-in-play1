@@ -415,6 +415,63 @@ class TestRateLimitPreciseWait(unittest.TestCase):
         c.chat_json("s", "u")
         self.assertEqual(self.slept, [45])
 
+    def test_rate1_refuses_to_sleep_past_the_cap(self):
+        """RATE-3: реальный случай — Groq на дневном лимите (TPD, не TPM)
+        прислал Retry-After=1754 сек (29 минут), и по логике того же
+        прогона это росло бы вплоть до нескольких часов (TPD сбрасывается
+        раз в сутки). Раньше RATE-1 послушно спал бы все 1754 секунды,
+        блокируя весь прогон игры на одном запросе."""
+        c = LLMClient("https://api.groq.com/openai/v1", "k", "m",
+                     api_format="openai", retries=0,
+                     max_retry_after_sec=180)
+        self._patch([self._err_429("rate limited", headers={"Retry-After": "1754"})])
+        with self.assertRaises((RuntimeError, Exception)):
+            c.chat_json("s", "u")
+        self.assertEqual(self.slept, [], "не должен был спать вообще — сразу упасть")
+
+    def test_second_consecutive_429_also_respects_the_cap(self):
+        """Тот же потолок должен работать и во ВТОРОМ (общем HTTP-RETRY)
+        месте — именно там произошло реальное зависание в логе, так как
+        RATE-1 уже использовал свою одну попытку до этого."""
+        c = LLMClient("https://api.groq.com/openai/v1", "k", "m",
+                     api_format="openai", retries=0,
+                     error_retries=2, error_retry_wait_sec=60,
+                     max_retry_after_sec=180)
+        self._patch([
+            self._err_429("rate limited", headers={"Retry-After": "19"}),   # RATE-1: ok, 19s
+            self._err_429("rate limited", headers={"Retry-After": "1754"}),  # потолок!
+        ])
+        with self.assertRaises((RuntimeError, Exception)):
+            c.chat_json("s", "u")
+        self.assertEqual(self.slept, [19.0], "второй сон не должен был случиться")
+
+    def test_wait_just_under_the_cap_still_sleeps_normally(self):
+        """Регрессия: обычные короткие TPM-паузы (секунды/десятки секунд)
+        не должны ломаться потолком — только аномально длинные."""
+        c = LLMClient("https://api.groq.com/openai/v1", "k", "m",
+                     api_format="openai", retries=0,
+                     max_retry_after_sec=180)
+        self._patch([self._err_429("rate limited", headers={"Retry-After": "170"}),
+                    self._ok()])
+        c.chat_json("s", "u")
+        self.assertEqual(self.slept, [170.0])
+
+    def test_from_config_reads_max_retry_after_sec(self):
+        import configparser
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({"api": {"active": "remote", "max_retry_after_sec": "30"},
+                       "api_remote": {"base_url": "https://api.ai", "model": "m"}})
+        c = LLMClient.from_config(cfg)
+        self.assertEqual(c.max_retry_after_sec, 30)
+
+    def test_from_config_default_cap_is_180(self):
+        import configparser
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({"api": {"active": "remote"},
+                       "api_remote": {"base_url": "https://api.ai", "model": "m"}})
+        c = LLMClient.from_config(cfg)
+        self.assertEqual(c.max_retry_after_sec, 180)
+
 
 class TestStubSubclassCompatibility(Base):
 

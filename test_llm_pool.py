@@ -75,6 +75,28 @@ class TestPoolBasics(unittest.TestCase):
         self.assertEqual(clients[0].error_retries, 5)
         self.assertEqual(clients[0].error_retry_wait_sec, 15)
 
+    def test_pool_clients_default_to_max_retry_after_cap(self):
+        """RATE-3: без потолка второй подряд 429 на дневной лимит (TPD, не
+        TPM) блокировал бы весь пул, вместо мгновенного failover на другой
+        сервер — а пул строит клиентов в обход LLMClient.from_config(),
+        так что дефолт конструктора применялся бы всегда, не значение из
+        конфига."""
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({"api": {"active": "remote", "pool": "api_remote, api_r2"},
+                       "api_remote": {"base_url": "http://a", "model": "m1"},
+                       "api_r2": {"base_url": "http://b", "model": "m2"}})
+        clients, _ = llm_pool.clients_from_config(cfg)
+        for c in clients:
+            self.assertEqual(c.max_retry_after_sec, 180)
+
+    def test_pool_clients_read_custom_max_retry_after_cap(self):
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({"api": {"active": "remote", "pool": "api_remote",
+                              "max_retry_after_sec": "30"},
+                       "api_remote": {"base_url": "http://a", "model": "m1"}})
+        clients, _ = llm_pool.clients_from_config(cfg)
+        self.assertEqual(clients[0].max_retry_after_sec, 30)
+
 
 class TestLease(unittest.TestCase):
     def test_two_calls_run_concurrently_on_two_servers(self):

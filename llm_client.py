@@ -250,7 +250,8 @@ class LLMClient:
                  num_ctx: int = 0, think: "bool | None" = None,
                  timeout: int = 120, retries: int = 1, on_retry=None,
                  json_format: bool = True,
-                 error_retries: int = 0, error_retry_wait_sec: int = 60):
+                 error_retries: int = 0, error_retry_wait_sec: int = 60,
+                 max_retry_after_sec: int = 180):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -277,6 +278,18 @@ class LLMClient:
         # умолчанию — это путь реальных прогонов игры.
         self.error_retries = max(0, int(error_retries))
         self.error_retry_wait_sec = max(1, int(error_retry_wait_sec))
+        # RATE-3: реальный случай — Groq на 429 по ДНЕВНОМУ лимиту (TPD, а
+        # не TPM) прислал Retry-After=1754 сек (29 минут) и по логике этого
+        # же прогона это ещё вырастет вплоть до нескольких ЧАСОВ (TPD
+        # сбрасывается раз в сутки, а не раз в минуту). RATE-1/HTTP-RETRY
+        # честно спали ровно столько, сколько сказал сервер — блокируя ВЕСЬ
+        # прогон игры на этот срок на одном запросе, вместо того чтобы
+        # быстро сдаться и дать пулу (если настроен) переключиться на
+        # другой сервер/модель, или игре — форсировать ставку и продолжить.
+        # Потолок: если сервер просит ждать дольше max_retry_after_sec —
+        # не спим, поднимаем исключение сразу. Короткие TPM-паузы (обычно
+        # секунды-десятки секунд) под потолок не попадают и ждут как раньше.
+        self.max_retry_after_sec = max(1, int(max_retry_after_sec))
         # Необязательный колбэк log(str): клиент не знает про логгер игры,
         # но вызывающий может подставить свой, чтобы повторы были видны.
         self.on_retry = on_retry
@@ -312,6 +325,13 @@ class LLMClient:
         error_retries = cfg.getint("api", "error_retries", fallback=2)
         error_retry_wait_sec = cfg.getint("api", "error_retry_wait_sec",
                                           fallback=60)
+        # RATE-3: потолок разумного ожидания на 429 — см. докстринг
+        # __init__. 180 сек по умолчанию: перекрывает типичные TPM-паузы
+        # (обычно секунды-десятки секунд), но не даёт повторам блокировать
+        # весь прогон на десятки минут/часы, когда сервер прислал время
+        # ДО СБРОСА ДНЕВНОГО/МЕСЯЧНОГО лимита, а не минутного.
+        max_retry_after_sec = cfg.getint("api", "max_retry_after_sec",
+                                         fallback=180)
         # Шлюзы перед удалённым сервером могут не знать поля format —
         # можно отключить заранее, не дожидаясь первого 400.
         json_format = cfg.getboolean("api", "json_format", fallback=True)
@@ -321,7 +341,8 @@ class LLMClient:
                     num_ctx=num_ctx, think=think, timeout=timeout,
                     retries=retries, json_format=json_format,
                     error_retries=error_retries,
-                    error_retry_wait_sec=error_retry_wait_sec)
+                    error_retry_wait_sec=error_retry_wait_sec,
+                    max_retry_after_sec=max_retry_after_sec)
 
     def _build_request(self, system: str, user: str, temperature: float,
                         max_tokens: int, json_mode: bool = False):
@@ -508,6 +529,22 @@ class LLMClient:
                 wait_s = _parse_retry_after(e, detail)
                 if wait_s is None:
                     wait_s = 60.0
+                if wait_s > self.max_retry_after_sec:
+                    # RATE-3: сервер просит ждать дольше разумного потолка —
+                    # почти наверняка дневной/месячный лимит, а не минутный.
+                    # Не спим часами внутри одного вызова — поднимаем
+                    # исключение сразу, пусть решает вызывающий уровень
+                    # (пул переключится на другой сервер, игра форсирует
+                    # решение), а не блокируем весь прогон на этот срок.
+                    msg = (f"HTTP 429 от {url}: сервер просит ждать "
+                          f"{wait_s:.0f} сек — это дольше потолка "
+                          f"{self.max_retry_after_sec} сек (похоже на "
+                          f"дневной/месячный лимит, а не минутный), не жду")
+                    on_retry = getattr(self, "on_retry", None)
+                    if on_retry:
+                        on_retry(msg)
+                    _dbg(f"chat(): {msg}")
+                    raise RuntimeError(msg) from None
                 on_retry = getattr(self, "on_retry", None)
                 if on_retry:
                     on_retry(f"HTTP 429 от {url} (rate limited), "
@@ -558,6 +595,19 @@ class LLMClient:
                     precise = _parse_retry_after(e, detail)
                     if precise is not None:
                         wait_s = precise
+                # RATE-3: тот же потолок, что и в RATE-1 выше — см. докстринг
+                # __init__. Именно ЗДЕСЬ был реальный зависон на 1754 сек в
+                # логе (второй подряд 429 на дневной лимит Groq попал уже в
+                # эту ветку, а не в RATE-1).
+                if wait_s > self.max_retry_after_sec:
+                    msg = (f"HTTP {e.code} от {url}: сервер просит ждать "
+                          f"{wait_s:.0f} сек — это дольше потолка "
+                          f"{self.max_retry_after_sec} сек, не жду")
+                    on_retry = getattr(self, "on_retry", None)
+                    if on_retry:
+                        on_retry(msg)
+                    _dbg(f"chat(): {msg}")
+                    raise RuntimeError(msg) from None
                 on_retry = getattr(self, "on_retry", None)
                 msg = (f"HTTP {e.code} от {url} ({detail or e.reason}), жду "
                        f"{wait_s:.1f} сек и повторяю тот же запрос (попытка "

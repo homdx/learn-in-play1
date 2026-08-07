@@ -279,6 +279,13 @@ def _client_for_section(cfg, sec: str):
         error_retries=cfg.getint("api", "error_retries", fallback=2),
         error_retry_wait_sec=cfg.getint("api", "error_retry_wait_sec",
                                         fallback=60),
+        # RATE-3: тот же потолок, что и в LLMClient.from_config() — без
+        # этого клиенты пула получали бы дефолт конструктора всегда, а не
+        # значение из конфига, если оно задано явно. Реальный случай: без
+        # потолка второй подряд 429 на дневной лимит Groq блокировал бы
+        # весь пул на десятки минут/часы вместо мгновенного failover.
+        max_retry_after_sec=cfg.getint("api", "max_retry_after_sec",
+                                       fallback=180),
     )
 
 
