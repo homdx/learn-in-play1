@@ -598,7 +598,26 @@ class LLMClient:
                 last = e
                 if attempt < attempts:
                     on_retry = getattr(self, "on_retry", None)
-                    if on_retry:
+                    # HTTP-RETRY: пауза перед повтором. Раньше применялась
+                    # ТОЛЬКО к HTTPError внутри chat() (402/5xx) — а битый
+                    # JSON / EOS первым токеном (тот самый сбой HF из лога)
+                    # шёл через ЭТОТ цикл и ретраился МГНОВЕННО, без паузы,
+                    # хотя настройка error_retries/error_retry_wait_sec уже
+                    # была в конфиге и подразумевала паузу на ЛЮБОЙ сбой, не
+                    # только HTTP-код. getattr — та же причина, что и у
+                    # `retries` выше: заглушки без __init__ не должны падать
+                    # тут, а просто не паузить (0 попыток паузы по умолчанию).
+                    error_retries = getattr(self, "error_retries", 0)
+                    wait_s = getattr(self, "error_retry_wait_sec", 60)
+                    if error_retries > 0:
+                        msg = (f"LLM call failed ({type(e).__name__}: {e}), "
+                               f"жду {wait_s} сек и повторяю (попытка "
+                               f"{attempt}/{retries})")
+                        if on_retry:
+                            on_retry(msg)
+                        _dbg(f"chat_json(): {msg}")
+                        time.sleep(wait_s)
+                    elif on_retry:
                         kind = "timeout" if _is_timeout(e) else type(e).__name__
                         on_retry(f"LLM call failed ({kind}: {e}), "
                                  f"retry {attempt}/{retries}")

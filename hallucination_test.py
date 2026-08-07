@@ -8,9 +8,13 @@ player2 (black_liar / Prosecutor) в начале раунда 2 — именн�
 Модель вернула 4 field notes с несуществующими разговорами.
 
 Запуск:
-  python3 test_hallucination.py --model qwen3:30b-a3b-instruct-2507-q4_K_M
-  python3 test_hallucination.py --model gemma4:26b-a4b-it-q4_K_M
-  python3 test_hallucination.py --model mistral-small3.2
+  python3 hallucination_test.py --model qwen3:30b-a3b-instruct-2507-q4_K_M
+  python3 hallucination_test.py --model gemma4:26b-a4b-it-q4_K_M
+  python3 hallucination_test.py --model mistral-small3.2
+
+  # CONFIG-1/BATCH-1: конфиг игры + список моделей → PASS/FAIL по каждой
+  python3 hallucination_test.py --config config_v2_mistral.ini \
+      --models ministral-8b-latest,open-mistral-nemo,mistral-small-latest
 
 Ожидаемое поведение нормальной модели:
   - field_notes: [] или максимум 1 запись только про player1
@@ -19,8 +23,10 @@ player2 (black_liar / Prosecutor) в начале раунда 2 — именн�
 """
 
 import argparse
+import configparser
 import json
 import os
+import re
 import requests
 import sys
 from datetime import datetime, timezone
@@ -187,15 +193,90 @@ HALLUCINATION_KEYWORDS = [
 
 VALID_PLAYER_MENTIONS = ["player1"]  # только этот игрок существовал в раунде 1
 
+# INVENTED-NAME-1: HALLUCINATION_KEYWORDS выше — это конкретные слова из ОДНОГО
+# зафиксированного инцидента (Alpha/Beta/Gamma/Delta), и он слеп к любой другой
+# галлюцинации с другими именами. Реальный случай: mistral-small в этом же
+# промпте (round 1, В ПРОМПТЕ ВООБЩЕ НЕТ ни одного лога разговора — только
+# результат ставки) дважды подряд выдумала целые диалоги с игроками
+# "Quantum", "Vex", "Mira", "Jinx", "Dealer", "Maverick", "Ghost", "Orion",
+# "Nova" — с суммами и цитатами того, что они якобы сказали. Ни одно из этих
+# имён не входит в HALLUCINATION_KEYWORDS, и оба прогона прошли как "OK".
+#
+# Вместо конкретных слов ищем ЛЮБОЕ имя в кавычках вида 'Name'/"Name" —
+# так модели описывают собеседников в field_notes (см. и оригинальную
+# галлюцинацию, и эту: "Player 'Quantum'", "absent player 'Rigel'") — и
+# сверяем с VALID_PLAYER_MENTIONS. Не идеальный NER, но ловит именно этот
+# класс фабрикации, которую HALLUCINATION_KEYWORDS пропускает по конструкции.
+_QUOTED_NAME_RE = re.compile(r"['\u2018\u2019\"]([A-Z][a-zA-Z]{2,20})['\u2018\u2019\"]")
+
+# Слова, которые ЛЕГИТИМНО встречаются в кавычках с большой буквы и не
+# являются именами игроков — ставки, роли, персоны из самого промпта.
+_QUOTED_NON_PLAYER_WORDS = {
+    "Red", "Black", "Even", "Odd", "High", "Low",
+    "Straight", "Split", "Corner", "Sixline", "Dozen", "Column",
+    "Prosecutor", "Oracle",
+}
+
+
+def _find_invented_player_names(text: str) -> set:
+    """Возвращает множество имён в кавычках, похожих на игроков, которых не
+    было в раунде (не player1, не служебные слова из ставок/ролей)."""
+    found = set()
+    for m in _QUOTED_NAME_RE.finditer(text):
+        name = m.group(1)
+        if name in _QUOTED_NON_PLAYER_WORDS:
+            continue
+        if name.lower() in VALID_PLAYER_MENTIONS:
+            continue
+        found.add(name)
+    return found
+
 
 def check_response(response_text: str, raw: dict) -> dict:
-    """Проверяет ответ модели на галлюцинации."""
+    """Проверяет ответ модели на галлюцинации.
+
+    SCHEMA-1: поля должны быть строками (notes: str, field_notes: [str]).
+    Модель может это нарушить — заменить notes вложенным объектом вместо
+    строки, например (реальный случай: open-mistral-nemo прислал notes как
+    {"betting_synapse": {...}} вместо строки). Раньше это падало TypeError
+    внутри " ".join(...) и убивало ВЕСЬ батч-прогон на такой модели, хотя
+    сам JSON распарсился нормально — а нарушение схемы это ровно то, что
+    тест обязан ЗАФИКСИРОВАТЬ, а не превращать в необработанный traceback.
+    Приводим типы принудительно и заодно репортим само нарушение: в самой
+    игре (agent_v2._as_text, FIX-6) это уже не роняет процесс — dict/list
+    там приводится к строке тем же способом (json.dumps), — но для выбора
+    модели полезно знать, что она вообще не удерживает формат промпта.
+    """
+    issues = []
+
     field_notes = raw.get("field_notes", [])
     if isinstance(field_notes, str):
         field_notes = [field_notes]
+    elif not isinstance(field_notes, list):
+        issues.append(f"⚠️  SCHEMA VIOLATION: field_notes должен быть списком строк, "
+                      f"пришёл {type(field_notes).__name__}: {field_notes!r}")
+        field_notes = []
 
-    issues = []
-    all_text = " ".join(field_notes + [raw.get("notes", "")]).lower()
+    normalized_notes = []
+    for note in field_notes:
+        if isinstance(note, str):
+            normalized_notes.append(note)
+        else:
+            issues.append(f"⚠️  SCHEMA VIOLATION: элемент field_notes должен быть "
+                          f"строкой, пришёл {type(note).__name__}: {note!r}")
+            normalized_notes.append(json.dumps(note, ensure_ascii=False))
+    field_notes = normalized_notes
+
+    notes_field = raw.get("notes", "")
+    if not isinstance(notes_field, str):
+        issues.append(f"⚠️  SCHEMA VIOLATION: notes должен быть строкой, пришёл "
+                      f"{type(notes_field).__name__} — модель не соблюдает "
+                      f"формат промпта (в самой игре это не уронит процесс: "
+                      f"agent_v2._as_text() приводит dict/list к строке через "
+                      f"json.dumps, но это лишний повод не доверять модели формат)")
+        notes_field = json.dumps(notes_field, ensure_ascii=False)
+
+    all_text = " ".join(field_notes + [notes_field]).lower()
 
     for kw in HALLUCINATION_KEYWORDS:
         if kw in all_text:
@@ -206,6 +287,16 @@ def check_response(response_text: str, raw: dict) -> dict:
             note_lower = note.lower()
             if any(p in note_lower for p in ["player2", "player3", "player4", "player5"]):
                 issues.append(f"⚠️  HALLUCINATION: упомянут игрок которого player2 не встречал: '{note}'")
+
+    # INVENTED-NAME-1: см. комментарий у _find_invented_player_names — ловит
+    # выдуманные имена собеседников, которых HALLUCINATION_KEYWORDS не знает.
+    invented_names = _find_invented_player_names(notes_field)
+    for note in field_notes:
+        invented_names |= _find_invented_player_names(note)
+    for name in sorted(invented_names):
+        issues.append(f"⚠️  HALLUCINATION: упомянут вымышленный игрок '{name}' — "
+                      f"в раунде 1 не было ни одного разговора ни с кем, кроме "
+                      f"player1, и лога диалогов в промпте вообще нет")
 
     return {
         "field_notes_count": len(field_notes),
@@ -293,8 +384,24 @@ def _extract(data: dict, api: str) -> tuple:
     return msg.get("content", ""), msg.get("thinking", ""), data.get("done_reason", "")
 
 
+class ModelCallError(Exception):
+    """Сбой одного вызова модели: сеть, HTTP, таймаут, битый JSON от сервера
+    (не путать с галлюцинацией — та возвращается как обычный результат).
+    Нужен для батч-режима (--models / --config): один упавший сервер/модель
+    не должен убивать процесс через sys.exit и обрывать проверку остальных."""
+
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
+
+
 def _request(host: str, payload: dict, api: str = "ollama",
-             api_key: str = "ollama") -> dict:
+             api_key: str = "ollama", exit_on_error: bool = True) -> dict:
+    def _fail(kind: str, msg: str):
+        if exit_on_error:
+            sys.exit(1)
+        raise ModelCallError(kind, msg)
+
     t_start = datetime.now(timezone.utc)
     print(f"\n🕒 Запрос отправлен: {t_start.isoformat(timespec='milliseconds')}")
 
@@ -311,14 +418,14 @@ def _request(host: str, payload: dict, api: str = "ollama",
               f"(прошло {(t_end - t_start).total_seconds():.1f}s)")
         print(f"\n❌ Не могу подключиться к {host}. Запустите: ollama serve")
         print(f"Полный текст ошибки:\n{repr(e)}")
-        sys.exit(1)
+        _fail("connection", f"не могу подключиться к {host}: {e}")
     except requests.exceptions.Timeout as e:
         t_end = datetime.now(timezone.utc)
         print(f"🕒 Таймаут: {t_end.isoformat(timespec='milliseconds')} "
               f"(прошло {(t_end - t_start).total_seconds():.1f}s)")
         print("\n❌ Timeout — модель отвечает дольше 720 секунд")
         print(f"Полный текст ошибки:\n{repr(e)}")
-        sys.exit(1)
+        _fail("timeout", f"таймаут (>720s): {e}")
     except requests.exceptions.HTTPError as e:
         t_end = datetime.now(timezone.utc)
         print(f"🕒 HTTP ошибка: {t_end.isoformat(timespec='milliseconds')} "
@@ -326,7 +433,7 @@ def _request(host: str, payload: dict, api: str = "ollama",
         print(f"\n❌ HTTP ошибка от сервера: {e}")
         print(f"Статус: {r.status_code}")
         print(f"Тело ответа:\n{r.text}")
-        sys.exit(1)
+        _fail("http", f"HTTP {r.status_code}: {r.text[:300]}")
 
     t_end = datetime.now(timezone.utc)
     print(f"🕒 Ответ получен: {t_end.isoformat(timespec='milliseconds')} "
@@ -337,12 +444,13 @@ def _request(host: str, payload: dict, api: str = "ollama",
     except json.JSONDecodeError as e:
         print(f"\n❌ Не удалось распарсить JSON от сервера: {e}")
         print(f"Сырое тело ответа:\n{r.text}")
-        sys.exit(1)
+        _fail("bad_json", f"сервер вернул не-JSON: {e}")
 
 
 def _single_call(model: str, host: str, use_json_format: bool,
                   num_predict: int = 700, disable_thinking: bool = False,
-                  api: str = "ollama", api_key: str = "ollama") -> tuple:
+                  api: str = "ollama", api_key: str = "ollama",
+                  exit_on_error: bool = True) -> tuple:
     """Делает один запрос к чат-эндпоинту и возвращает (data, content)."""
     payload = _make_payload(model, use_json_format, num_predict, disable_thinking, api)
 
@@ -358,7 +466,7 @@ def _single_call(model: str, host: str, use_json_format: bool,
     print("\n[USER (первые 300 символов)]:", REFLECT_USER_MSG[:300], "...")
     print("\nОтправляю запрос...")
 
-    data = _request(host, payload, api, api_key)
+    data = _request(host, payload, api, api_key, exit_on_error=exit_on_error)
 
     # Полная выдача сервера БЕЗ купюр — включая message целиком.
     # Некоторые модели (reasoning-модели) кладут вывод в message["thinking"],
@@ -384,7 +492,7 @@ def _single_call(model: str, host: str, use_json_format: bool,
 def call_ollama(model: str, host: str = "http://localhost:11434",
                  force_no_json: bool = False, num_predict: int = 700,
                  force_no_think: bool = False, api: str = "ollama",
-                 api_key: str = "ollama") -> dict:
+                 api_key: str = "ollama", exit_on_error: bool = True) -> dict:
     # force_no_think=True (--no-think): сразу шлём think=False с первой попытки,
     # не дожидаясь авто-fallback (Случай 1 ниже). Полезно для reasoning-моделей
     # (gemma4, qwen3-thinking и т.п.), чтобы не терять ~100+ секунд на первый
@@ -395,12 +503,14 @@ def call_ollama(model: str, host: str = "http://localhost:11434",
         data, content = _single_call(model, host, use_json_format=False,
                                       num_predict=num_predict,
                                       disable_thinking=force_no_think,
-                                      api=api, api_key=api_key)
+                                      api=api, api_key=api_key,
+                                      exit_on_error=exit_on_error)
     else:
         data, content = _single_call(model, host, use_json_format=True,
                                       num_predict=num_predict,
                                       disable_thinking=force_no_think,
-                                      api=api, api_key=api_key)
+                                      api=api, api_key=api_key,
+                                      exit_on_error=exit_on_error)
 
         # Случай 1: content пуст, но thinking съел весь бюджет num_predict.
         # Это reasoning-модель — повторяем с think=False и увеличенным лимитом,
@@ -414,7 +524,8 @@ def call_ollama(model: str, host: str = "http://localhost:11434",
                   f"Повторяю с think=False и num_predict={bigger_predict}...")
             data2, content2 = _single_call(model, host, use_json_format=True,
                                             num_predict=bigger_predict, disable_thinking=True,
-                                            api=api, api_key=api_key)
+                                            api=api, api_key=api_key,
+                                            exit_on_error=exit_on_error)
             if content2.strip():
                 print("\n👉 Вывод: проблема была именно в том, что 'thinking' поглощал весь "
                       "лимит токенов. С think=False и большим num_predict модель отвечает нормально.")
@@ -431,7 +542,8 @@ def call_ollama(model: str, host: str = "http://localhost:11434",
             data2, content2 = _single_call(model, host, use_json_format=False,
                                             num_predict=num_predict,
                                             disable_thinking=force_no_think,
-                                            api=api, api_key=api_key)
+                                            api=api, api_key=api_key,
+                                            exit_on_error=exit_on_error)
             if content2.strip():
                 print("\n👉 Вывод: пустой ответ был вызван именно constrained JSON-декодированием "
                       "(format=json), а не общим сбоем/таймаутом модели.")
@@ -466,7 +578,98 @@ def call_ollama(model: str, host: str = "http://localhost:11434",
     return result
 
 
-def print_curl(api: str = "ollama", host: str = None):
+def _load_config_connection(path: str, section: str = None) -> dict:
+    """CONFIG-1: читает игровой .ini (config_v2*.ini) и достаёт из него
+    connection info — так конфиг для игры можно скормить этому скрипту
+    БЕЗ переписывания вручную host/api/api-key по отдельности.
+
+    section=None → берёт [api].active и читает секцию api_<active>, точно
+    как это делает сама игра в LLMClient.from_config — конфиг передаётся
+    1-в-1. Явный --section переопределяет это (полезно, если хочешь
+    прогнать секцию, которая сейчас НЕ активна, например запасной пул).
+
+    Необязательный кастомный ключ `models` (список через запятую) в той же
+    секции — только для ЭТОГО скрипта, в игровых .ini его обычно нет; так
+    можно один раз прописать список моделей для регресс-теста рядом с
+    остальными настройками подключения вместо --models на каждый запуск.
+    """
+    cfg = configparser.ConfigParser()
+    if not cfg.read(path):
+        print(f"❌ Не удалось прочитать конфиг: {path}")
+        sys.exit(1)
+    sec = section or f"api_{cfg.get('api', 'active', fallback='local')}"
+    if not cfg.has_section(sec):
+        print(f"❌ В конфиге {path} нет секции [{sec}] "
+              f"(доступные: {', '.join(cfg.sections())})")
+        sys.exit(1)
+    api_format = cfg.get(sec, "api_format", fallback="ollama")
+    result = {
+        "host": cfg.get(sec, "base_url", fallback=None),
+        "api_key": cfg.get(sec, "api_key", fallback=None),
+        "api": "openai" if api_format == "openai" else "ollama",
+        "model": cfg.get(sec, "model", fallback=None),
+        "models": None,
+        "think": cfg.getboolean(sec, "think") if cfg.has_option(sec, "think") else None,
+    }
+    if cfg.has_option(sec, "models"):
+        result["models"] = [m.strip() for m in cfg.get(sec, "models").split(",")
+                            if m.strip()]
+    return result
+
+
+def run_batch(models: list, host: str, api: str, api_key: str,
+              force_no_json: bool, num_predict: int,
+              force_no_think: bool) -> int:
+    """BATCH-1: прогоняет ОДИН И ТОТ ЖЕ тест галлюцинации по НЕСКОЛЬКИМ
+    моделям на ОДНОМ подключении и печатает сводную таблицу — так проверка
+    "что из этого упадёт на Mistral" не превращается в N ручных запусков
+    скрипта с грепом хвоста вывода.
+
+    Сбой ОДНОЙ модели (сеть, HTTP, битый JSON от сервера, а не от модели)
+    не прерывает прогон остальных — иначе первая же несуществующая модель
+    в списке обрывала бы всю проверку, а это ровно тот сценарий, ради
+    которого список моделей и передают одним запуском.
+    """
+    results = []
+    for i, model in enumerate(models, 1):
+        print(f"\n{'#'*70}")
+        print(f"# [{i}/{len(models)}] Модель: {model}")
+        print(f"{'#'*70}")
+        try:
+            result = call_ollama(model, host, force_no_json=force_no_json,
+                                 num_predict=num_predict,
+                                 force_no_think=force_no_think,
+                                 api=api, api_key=api_key,
+                                 exit_on_error=False)
+        except ModelCallError as e:
+            print(f"\n❌ [{model}] упала ({e.kind}): {e}")
+            results.append({"model": model, "status": "CRASH", "detail": f"{e.kind}: {e}"})
+            continue
+        if "parse_error" in result:
+            results.append({"model": model, "status": "BAD_JSON",
+                           "detail": result["parse_error"]})
+        elif result.get("hallucinations_found", 1) == 0:
+            results.append({"model": model, "status": "PASS", "detail": ""})
+        else:
+            results.append({"model": model, "status": "HALLUCINATION",
+                           "detail": "; ".join(result.get("issues", []))[:200]})
+
+    print(f"\n{'='*70}")
+    print(f"СВОДКА ПО {len(models)} МОДЕЛЯМ (host={host}, api={api})")
+    print(f"{'='*70}")
+    width = max(len(r["model"]) for r in results) if results else 10
+    icon = {"PASS": "✅", "HALLUCINATION": "⚠️ ", "BAD_JSON": "❌", "CRASH": "💥"}
+    for r in results:
+        line = f"{icon.get(r['status'], '?')} {r['model']:<{width}}  {r['status']}"
+        if r["detail"]:
+            line += f"  — {r['detail']}"
+        print(line)
+    print(f"{'='*70}\n")
+
+    return 0 if all(r["status"] == "PASS" for r in results) else 1
+
+
+def print_curl(api: str = "ollama", host: str = None, api_key: str = "ollama"):
     """Выводит готовый curl-запрос для копирования (для выбранного API)."""
     host = host or DEFAULT_HOSTS[api]
     payload = _make_payload("YOUR_MODEL_HERE", use_json_format=True,
@@ -477,7 +680,7 @@ def print_curl(api: str = "ollama", host: str = None):
     print(f"curl -s {_endpoint(host, api)} \\")
     print("  -H 'Content-Type: application/json' \\")
     if api == "openai":
-        print("  -H 'Authorization: Bearer ollama' \\")
+        print(f"  -H 'Authorization: Bearer {api_key}' \\")
     print("  -d '" + json.dumps(payload, ensure_ascii=False).replace("'", "'\\''") + "'")
     print("="*60 + "\n")
 
@@ -486,20 +689,38 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Тест галлюцинации field notes (player2 / Prosecutor)"
     )
-    parser.add_argument("--model", default="qwen3:30b-a3b-instruct-2507-q4_K_M",
-                        help="Модель ollama для теста")
-    parser.add_argument("--api", choices=["ollama", "openai"], default="ollama",
+    parser.add_argument("--model", default=None,
+                        help="Одна модель для теста (по умолчанию, если ничего "
+                             "не задано ни здесь, ни в --models/--config: "
+                             "qwen3:30b-a3b-instruct-2507-q4_K_M)")
+    parser.add_argument("--models", default=None,
+                        help="Список моделей через запятую — БАТЧ-режим: "
+                             "тест гоняется по каждой на ОДНОМ подключении, "
+                             "в конце печатается сводная таблица PASS/FAIL. "
+                             "Пример: --config config_v2_mistral.ini "
+                             "--models ministral-8b-latest,open-mistral-nemo,mistral-small-latest")
+    parser.add_argument("--config", default=None,
+                        help="CONFIG-1: путь к игровому .ini (config_v2*.ini) — "
+                             "берёт из него base_url/api_key/api_format секции "
+                             "[api_<active>] (или --section), чтобы не переносить "
+                             "их вручную. --host/--api/--api-key, если заданы, "
+                             "имеют приоритет над значениями из конфига.")
+    parser.add_argument("--section", default=None,
+                        help="Имя секции в --config вместо [api_<active>] "
+                             "(например api_remote2, если сейчас активна другая)")
+    parser.add_argument("--api", choices=["ollama", "openai"], default=None,
                         help="Какой протокол использовать: 'ollama' — родной "
-                             "/api/chat (по умолчанию, поведение не менялось); "
-                             "'openai' — OpenAI-совместимый /v1/chat/completions "
-                             "(его отдаёт Ollama, vLLM, llama.cpp, LM Studio).")
+                             "/api/chat; 'openai' — OpenAI-совместимый "
+                             "/v1/chat/completions (Mistral, HF router, vLLM, "
+                             "llama.cpp, LM Studio, сама Ollama тоже отдаёт). "
+                             "Без --config по умолчанию 'ollama'.")
     parser.add_argument("--host", default=None,
                         help="URL сервера. По умолчанию http://localhost:11434 "
                              "для --api ollama и http://localhost:11434/v1 для "
-                             "--api openai.")
-    parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", "ollama"),
-                        help="Bearer-токен для --api openai (по умолчанию берётся "
-                             "из $OPENAI_API_KEY, иначе 'ollama').")
+                             "--api openai (если не взято из --config).")
+    parser.add_argument("--api-key", default=None,
+                        help="Bearer-токен для --api openai (Mistral, HF и т.п.). "
+                             "Приоритет: --api-key > --config > $OPENAI_API_KEY > 'ollama'.")
     parser.add_argument("--curl", action="store_true",
                         help="Только вывести curl-команду")
     parser.add_argument("--no-json", action="store_true",
@@ -514,13 +735,37 @@ if __name__ == "__main__":
                              "первый заведомо провальный вызов. Без флага поведение "
                              "не меняется.")
     args = parser.parse_args()
-    host = args.host or DEFAULT_HOSTS[args.api]
+
+    cfg_conn = _load_config_connection(args.config, args.section) if args.config else None
+
+    api = args.api or (cfg_conn["api"] if cfg_conn else "ollama")
+    host = args.host or (cfg_conn["host"] if cfg_conn else None) or DEFAULT_HOSTS[api]
+    api_key = (args.api_key or (cfg_conn["api_key"] if cfg_conn else None)
+              or os.environ.get("OPENAI_API_KEY", "ollama"))
+    force_no_think = args.no_think or bool(cfg_conn and cfg_conn["think"] is False)
 
     if args.curl:
-        print_curl(args.api, host)
+        print_curl(api, host, api_key)
         sys.exit(0)
 
-    result = call_ollama(args.model, host, force_no_json=args.no_json,
-                          num_predict=args.num_predict, force_no_think=args.no_think,
-                          api=args.api, api_key=args.api_key)
+    if args.models:
+        models = [m.strip() for m in args.models.split(",") if m.strip()]
+    elif args.model:
+        models = [args.model]
+    elif cfg_conn and cfg_conn["models"]:
+        models = cfg_conn["models"]
+    elif cfg_conn and cfg_conn["model"]:
+        models = [cfg_conn["model"]]
+    else:
+        models = ["qwen3:30b-a3b-instruct-2507-q4_K_M"]
+
+    if len(models) > 1:
+        sys.exit(run_batch(models, host, api, api_key,
+                           force_no_json=args.no_json,
+                           num_predict=args.num_predict,
+                           force_no_think=force_no_think))
+
+    result = call_ollama(models[0], host, force_no_json=args.no_json,
+                          num_predict=args.num_predict, force_no_think=force_no_think,
+                          api=api, api_key=api_key)
     sys.exit(0 if result.get("hallucinations_found", 1) == 0 else 1)

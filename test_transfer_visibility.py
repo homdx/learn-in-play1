@@ -135,7 +135,7 @@ class TestBudgetNote(unittest.TestCase):
 class TestDsynGross(unittest.TestCase):
     """DSYN-2: брутто должно доходить до текста промпта, а не только до файла."""
 
-    def _prompt(self, net, sent=None, received=None):
+    def _prompt(self, net, sent=None, received=None, speech_became_free=False):
         import json as _j
         captured = {}
 
@@ -158,7 +158,8 @@ class TestDsynGross(unittest.TestCase):
         a.temperature = 0.4
         a.persona_chars = 2000
         a.tok_update_dsyn = 700
-        a.update_dsyn("p2", [], net, 1, sent=sent, received=received)
+        a.update_dsyn("p2", [], net, 1, sent=sent, received=received,
+                      speech_became_free=speech_became_free)
         # update_dsyn ловит любое исключение и молча уходит в заглушку,
         # поэтому пустой захват означает, что промпт не собрался вовсе —
         # это провал теста, а не «нет числа в строке».
@@ -178,6 +179,18 @@ class TestDsynGross(unittest.TestCase):
     def test_falls_back_to_net_when_gross_absent(self):
         txt = self._prompt(-10)
         self.assertIn("10", txt)
+
+    def test_mentions_free_speech_after_transfer(self):
+        """XFER-FREE-NOTE: дсин — про репутацию ИМЕННО ЭТОГО партнёра, так
+        что урок формулируется как наблюдение над ЕГО тактикой (мог
+        специально перевести деньги, чтобы разговорить бесплатно)."""
+        txt = self._prompt(-10, sent=15, received=5, speech_became_free=True)
+        self.assertIn("free", txt)
+        self.assertIn("p2", txt)
+
+    def test_silent_when_speech_was_not_free(self):
+        txt = self._prompt(-10, sent=15, received=5)
+        self.assertNotIn("unlock free negotiation", txt)
 
 
 if __name__ == "__main__":

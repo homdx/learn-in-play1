@@ -963,11 +963,19 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
     # уже готовому транскрипту — вызовы независимы. Числа сюда приходят
     # из transfer_ledger строкой выше, то есть от параллельности
     # разойтись не могут.
+    # XFER-FREE-NOTE: сигнал в reflect/checklist/dsyn о том, что в ЭТОМ
+    # диалоге сработала бесплатная речь после перевода — иначе игрок видит
+    # это правило только ЖИВЬЁМ, внутри самого диалога, а на пост-анализе
+    # (update_dsyn, update_checklist) этот факт нигде не всплывает и не
+    # закрепляется как урок на будущее ("отправь мелкий перевод пораньше —
+    # получишь бесплатный торг до конца разговора").
     llm_pool.run_parallel(
         [lambda: agent_a.update_dsyn(pid_b, conversation, net_a, round_no,
-                                     sent=a_total_sent, received=b_total_sent),
+                                     sent=a_total_sent, received=b_total_sent,
+                                     speech_became_free=dialogue_free),
          lambda: agent_b.update_dsyn(pid_a, conversation, net_b, round_no,
-                                     sent=b_total_sent, received=a_total_sent)],
+                                     sent=b_total_sent, received=a_total_sent,
+                                     speech_became_free=dialogue_free)],
         workers=_pool_workers({pid_a: agent_a, pid_b: agent_b}),
         on_error=lambda e: logger.write_global(f"update_dsyn failed ({e})"),
     )
@@ -983,7 +991,8 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
     )
     return {"a_sent": a_total_sent, "b_sent": b_total_sent,
             "turns": len(conversation), "conversation": conversation,
-            "a_speech_cost": a_speech_cost, "b_speech_cost": b_speech_cost}
+            "a_speech_cost": a_speech_cost, "b_speech_cost": b_speech_cost,
+            "dialogue_free": dialogue_free}
 
 
 # ─────────────────────────────────────────── main ─────────────────────────
@@ -1255,13 +1264,16 @@ def main():
                     conv   = dlg_summary["conversation"]
                     a_sent = dlg_summary["a_sent"]
                     b_sent = dlg_summary["b_sent"]
+                    speech_became_free = dlg_summary.get("dialogue_free", False)
                     # pid — инициатор (сторона A), partner_id — сторона B
                     # POOL-1: та же независимая пара, что и в update_dsyn.
                     llm_pool.run_parallel(
                         [lambda: agents[pid].update_checklist(
-                            partner_id, conv, b_sent - a_sent, round_no),
+                            partner_id, conv, b_sent - a_sent, round_no,
+                            speech_became_free=speech_became_free),
                          lambda: agents[partner_id].update_checklist(
-                            pid, conv, a_sent - b_sent, round_no)],
+                            pid, conv, a_sent - b_sent, round_no,
+                            speech_became_free=speech_became_free)],
                         workers=_pool_workers(agents),
                         on_error=lambda e: logger.write_global(
                             f"update_checklist failed ({e})"),

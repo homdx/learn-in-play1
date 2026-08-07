@@ -1184,13 +1184,24 @@ class PlayerAgent:
         return new
 
     def update_checklist(self, partner_id: str, conversation: list[dict],
-                         net_transfer: int, round_no: int) -> str:
+                         net_transfer: int, round_no: int,
+                         speech_became_free: bool = False) -> str:
         """
         FIX-19, шаг 2: обновление ПОСЛЕ каждого диалога, пока разговор свеж.
 
         Отдельно от update_dsyn намеренно: та пишет долгосрочную репутацию
         («можно ли ему верить»), эта — что конкретно теперь надо сделать
         («он обязался вернуть 24 к концу r5 — стребовать»).
+
+        XFER-FREE-NOTE: `speech_became_free` — сработало ли в ЭТОМ диалоге
+        правило "речь бесплатна после перевода" (см. speech_cost.py). Само
+        правило игрок и так видел ЖИВЬЁМ внутри диалога — этот параметр не
+        сообщает ему ничего нового про факт, а специально ПОВТОРЯЕТ его
+        здесь, на пост-анализе, чтобы игрок мог сделать из него урок на
+        будущее ("отправь мелкий перевод пораньше — весь дальнейший торг в
+        этом разговоре бесплатен"), а не просто воспользоваться моментом и
+        забыть. Без этого повторения ни в одной заметке/чек-листе за всю
+        партию это никогда не всплывало (проверено на реальном прогоне).
         """
         checklist = self._checklist_or_default()
         conv_txt = "\n".join(
@@ -1198,11 +1209,24 @@ class PlayerAgent:
             + format_transfer_note(t, self.player_id)
             for t in conversation
         )
+        free_speech_note = ""
+        if speech_became_free:
+            free_speech_note = (
+                f"\nTACTIC NOTE: partway through this conversation, a coin transfer "
+                f"happened between you and {partner_id}, and after that speech was "
+                f"free for BOTH of you for the rest of it — the casino's per-line "
+                f"tariff no longer applied. This is a repeatable lever: sending or "
+                f"agreeing to a transfer early in a future dialogue buys unlimited "
+                f"free negotiation for the rest of THAT conversation. Consider "
+                f"whether to use this deliberately next time instead of only "
+                f"noticing it after the fact.\n"
+            )
         user_msg = (
             f"You are {self.player_id}. Round {round_no}. Your conversation with "
             f"{partner_id} just ended.\n"
             f"Net coins moved between you this conversation: {net_transfer:+d} "
-            f"(positive = you received).\nYour balance is now {self.balance}.\n\n"
+            f"(positive = you received).\nYour balance is now {self.balance}.\n"
+            f"{free_speech_note}\n"
             f"Transcript:\n{conv_txt}\n\n"
             f"Your checklist:\n---\n{checklist}\n---\n\n"
             # FIX-20a: реестр показываем модели. Раньше её просили «перенести
@@ -1987,7 +2011,8 @@ class PlayerAgent:
 
     def update_dsyn(self, partner_id: str, conversation: list[dict],
                     net_transfer: int, round_no: int,
-                    sent: int = None, received: int = None):
+                    sent: int = None, received: int = None,
+                    speech_became_free: bool = False):
         """
         After a dialogue: ask LLM to update the reputation entry for partner_id
         and add a raw interaction record.
@@ -2006,6 +2031,12 @@ class PlayerAgent:
 
         Аргументы необязательные: без них поведение прежнее, чтобы не ломать
         внешние вызовы, знающие только нетто.
+
+        XFER-FREE-NOTE: `speech_became_free` — см. тот же параметр у
+        update_checklist. Здесь смысл другой: это репутационная синапса ПРО
+        ЭТОГО ПАРТНЁРА, так что урок формулируется как наблюдение о ЕГО
+        поведении — партнёр мог перевести деньги именно чтобы разговорить
+        игрока бесплатно, и это стоит учитывать при оценке его тактики.
         """
         dsyn = load_dsyn(self.player_id, self.base_dir)
         existing_rep = dsyn["reputation"].get(partner_id, {})
@@ -2026,6 +2057,16 @@ class PlayerAgent:
             for t in conversation
         )
 
+        free_speech_note = ""
+        if speech_became_free:
+            free_speech_note = (
+                f"\nNote: partway through this conversation, a transfer happened "
+                f"between you and {partner_id}, which made speech free for BOTH "
+                f"of you for the rest of it. Consider whether {partner_id} timed "
+                f"that transfer deliberately to unlock free negotiation room, and "
+                f"factor that into how you read their tactics.\n"
+            )
+
         user_msg = (
             f"You are {self.player_id}. "
             f"Conversation with {partner_id} in round {round_no} just ended.\n"
@@ -2042,7 +2083,8 @@ class PlayerAgent:
             f"coin(s); net for you {net_transfer:+d} "
             f"(positive=you received).\n"
             f"Judge by BOTH figures: coins returned or paid back are not the "
-            f"same as coins never moved.\n\n"
+            f"same as coins never moved.\n"
+            f"{free_speech_note}\n"
             f"Full conversation:\n{conv_txt}\n\n"
             f"Current reputation entry for {partner_id}:\n"
             f"{json.dumps(existing_rep, ensure_ascii=False) if existing_rep else '(first interaction)'}\n\n"

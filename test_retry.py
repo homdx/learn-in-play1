@@ -274,6 +274,28 @@ class TestHttpErrorRetry(unittest.TestCase):
         self.assertIn("402", seen[0])
         self.assertIn("60", seen[0])
 
+    def test_empty_completion_is_also_paused_and_retried(self):
+        """Ключевой кейс: 'model sampled EOS as first token' — это
+        JSONDecodeError, ретраится ДРУГИМ циклом (chat_json, RETRY-1), не
+        через HTTPError-ветку в chat(). Пауза должна применяться и тут —
+        настройка error_retries/error_retry_wait_sec касается ЛЮБОГО сбоя,
+        не только HTTP-кода."""
+        c = LLMClient("https://api.ai", "k", "m", retries=2,
+                     error_retries=2, error_retry_wait_sec=60)
+        self._patch([self._ok(text=""), self._ok(text=""), self._ok('{"ok":1}')])
+        result = c.chat_json("s", "u")
+        self.assertEqual(result, {"ok": 1})
+        self.assertEqual(self.slept, [60, 60])
+
+    def test_empty_completion_without_error_retries_is_instant(self):
+        """Регрессия: без настройки (конструктор по умолчанию) — как
+        раньше, повтор без всякой паузы."""
+        c = LLMClient("https://api.ai", "k", "m", retries=2)
+        self._patch([self._ok(text=""), self._ok(text=""), self._ok('{"ok":1}')])
+        result = c.chat_json("s", "u")
+        self.assertEqual(result, {"ok": 1})
+        self.assertEqual(self.slept, [])
+
 
 class TestStubSubclassCompatibility(Base):
 

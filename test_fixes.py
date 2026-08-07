@@ -1591,7 +1591,8 @@ class TestChecklist(GameHarness):
         calls = []
         orig = PlayerAgent.update_checklist
         PlayerAgent.update_checklist = (
-            lambda self, p, c, n, r: calls.append((self.player_id, p)) or "x")
+            lambda self, p, c, n, r, speech_became_free=False:
+                calls.append((self.player_id, p)) or "x")
         try:
             FakeLLM.behaviour = {
                 "next_move": lambda u: (
@@ -2052,6 +2053,43 @@ class TestPromiseMerge(GameHarness):
         self.assertIn("id=", seen[-1])
         self.assertIn("does not delete it", seen[-1],
                       "модели не сказано, что пропуск записи безопасен")
+
+    def test_update_checklist_mentions_free_speech_after_transfer(self):
+        """XFER-FREE-NOTE: без этого параметра игрок ЖИВЬЁМ видел правило
+        внутри диалога, но нигде не встречал его повторно на пост-анализе —
+        и урок на будущее ("отправь перевод пораньше — торг бесплатен")
+        никогда не закреплялся в чек-листе (подтверждено на реальном
+        прогоне: ни одна заметка за всю партию это не упомянула)."""
+        agent = PlayerAgent("player1", self.table,
+                            make_cfg(self.table, self.logs, 1))
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                seen.append(user)
+                return {"checklist": "ok", "promises": []}
+
+        agent.client = Spy()
+        agent.update_checklist("player3", [], 0, 5, speech_became_free=True)
+        self.assertIn("speech was", seen[-1])
+        self.assertIn("free", seen[-1])
+        self.assertIn("player3", seen[-1])
+
+    def test_update_checklist_silent_when_speech_was_not_free(self):
+        """Регрессия: без срабатывания правила в промпте не должно быть
+        никакого упоминания — иначе ложный сигнал на КАЖДЫЙ диалог."""
+        agent = PlayerAgent("player1", self.table,
+                            make_cfg(self.table, self.logs, 1))
+        seen = []
+
+        class Spy(FakeLLM):
+            def chat_json(self, system, user, temperature=0.4, max_tokens=400):
+                seen.append(user)
+                return {"checklist": "ok", "promises": []}
+
+        agent.client = Spy()
+        agent.update_checklist("player3", [], 0, 5)  # speech_became_free по умолчанию False
+        self.assertNotIn("TACTIC NOTE", seen[-1])
 
     def test_plan_round_can_also_close_a_promise(self):
         """
