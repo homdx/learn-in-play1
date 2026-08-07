@@ -52,6 +52,29 @@ class TestPoolBasics(unittest.TestCase):
         with self.assertRaises(ValueError):
             llm_pool.build_client(cfg)
 
+    def test_pool_clients_default_to_http_error_retry(self):
+        """HTTP-RETRY: без явной настройки клиент пула всё равно должен
+        получить error_retries/error_retry_wait_sec — иначе пауза перед
+        повтором на 402/5xx не применяется вовсе (терялась в обход
+        LLMClient.from_config, см. _client_for_section)."""
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({"api": {"active": "remote", "pool": "api_remote, api_r2"},
+                       "api_remote": {"base_url": "http://a", "model": "m1"},
+                       "api_r2": {"base_url": "http://b", "model": "m2"}})
+        clients, _ = llm_pool.clients_from_config(cfg)
+        for c in clients:
+            self.assertEqual(c.error_retries, 2)
+            self.assertEqual(c.error_retry_wait_sec, 60)
+
+    def test_pool_clients_read_custom_error_retry_settings(self):
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({"api": {"active": "remote", "pool": "api_remote",
+                              "error_retries": "5", "error_retry_wait_sec": "15"},
+                       "api_remote": {"base_url": "http://a", "model": "m1"}})
+        clients, _ = llm_pool.clients_from_config(cfg)
+        self.assertEqual(clients[0].error_retries, 5)
+        self.assertEqual(clients[0].error_retry_wait_sec, 15)
+
 
 class TestLease(unittest.TestCase):
     def test_two_calls_run_concurrently_on_two_servers(self):

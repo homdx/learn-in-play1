@@ -23,8 +23,24 @@ speech_cost.py — платная речь (TALK-1).
     enabled = true
     chars_per_line = 80
     coins_per_line = 1
+    free_after_transfer = true
 
 enabled = false (или отсутствие секции) → речь бесплатна, как раньше.
+
+XFER-FREE: free_after_transfer = true (по умолчанию false — старое
+поведение не меняется без явного включения). Как только МЕЖДУ ДВУМЯ
+СОБЕСЕДНИКАМИ в рамках ОДНОГО диалога прошёл хотя бы один перевод (не важно,
+в какую сторону — заплатил, получил, послал, взял), деловая часть разговора
+уже состоялась деньгами, и дальнейшие слова в ЭТОМ диалоге для ОБЕИХ сторон
+бесплатны до его конца — включая ту самую реплику, в которой перевод
+произошёл (см. run_game_v2.run_dialogue: флаг взводится ДО charge() для
+хода с переводом, а не после).
+
+Это не то же самое, что speech_is_free у роли (ROLE-P): роль бесплатна
+всегда и для всех её диалогов, а флаг из этого раздела — только для ОДНОГО
+диалога и только ПОСЛЕ факта передачи денег. Подтверждение и прощание после
+состоявшейся сделки не должны стоить столько же, сколько сама сделка —
+иначе тариф наказывает за вежливое закрытие того, что уже оплачено.
 
 ВАЖНО про порядок списания: плата снимается ПОСЛЕ того, как проведён перевод
 из этой же реплики. Иначе тариф ломал бы сделки — игрок, договорившийся
@@ -44,13 +60,19 @@ DEF_COINS_PER_LINE = 1
 class SpeechTariff:
     """Разобранная секция [dialogue_cost]. Создаётся один раз на игру."""
 
-    __slots__ = ("enabled", "chars_per_line", "coins_per_line")
+    __slots__ = ("enabled", "chars_per_line", "coins_per_line",
+                 "free_after_transfer")
 
     def __init__(self, enabled=False, chars_per_line=DEF_CHARS_PER_LINE,
-                 coins_per_line=DEF_COINS_PER_LINE):
-        self.enabled        = enabled
-        self.chars_per_line = chars_per_line
-        self.coins_per_line = coins_per_line
+                 coins_per_line=DEF_COINS_PER_LINE,
+                 free_after_transfer=False):
+        self.enabled             = enabled
+        self.chars_per_line      = chars_per_line
+        self.coins_per_line      = coins_per_line
+        # XFER-FREE: см. докстринг модуля. Бессмысленен при enabled=False —
+        # тогда речь и так бесплатна всем, — но хранится независимо, чтобы
+        # parse_tariff не собирал два разных объекта под одно имя.
+        self.free_after_transfer = free_after_transfer
 
     # ── подсчёт ──────────────────────────────────────────────────────────
 
@@ -73,19 +95,34 @@ class SpeechTariff:
 
     # ── тексты для промптов ──────────────────────────────────────────────
 
-    def rule_text(self, free: bool = False) -> str:
+    def rule_text(self, free: bool = False, reason: str = "role") -> str:
         """Правило тарифа для системной части промпта диалога.
 
-        ROLE-P: `free` — это `agent.speech_is_free` со стороны вызывающего.
-        Раньше эта функция вызывалась одинаково для всех, поэтому роль с
-        бесплатной речью читала «SPEECH COSTS MONEY» вместе со всеми — и в
-        реальном прогоне вкладывала эту цену в свои решения (см. комментарий
-        в charge()), хотя с неё физически ничего не снималось. Инструкция
-        должна отражать то, что происходит с ЭТИМ игроком, а не с тарифом
-        вообще.
+        ROLE-P: `free` — это `agent.speech_is_free` (reason="role") ИЛИ
+        флаг диалога после перевода (reason="transfer", см. XFER-FREE в
+        докстринге модуля). Раньше эта функция вызывалась одинаково для
+        всех, поэтому роль с бесплатной речью читала «SPEECH COSTS MONEY»
+        вместе со всеми — и в реальном прогоне вкладывала эту цену в свои
+        решения (см. комментарий в charge()), хотя с неё физически ничего
+        не снималось. Инструкция должна отражать то, что происходит с ЭТИМ
+        игроком в ЭТОМ разговоре, а не с тарифом вообще.
         """
         if not self.enabled:
             return ""
+        if free and reason == "transfer":
+            return (
+                f"YOUR SPEECH IS FREE FOR THE REST OF THIS CONVERSATION. Money "
+                f"has already changed hands here — the usual tariff of "
+                f"{self.coins_per_line} coin(s) per started {self.chars_per_line}-"
+                f"character line no longer applies to either side of THIS "
+                f"dialogue, only for this conversation. Confirming, agreeing, or "
+                f"saying goodbye now costs nothing. Any casino fees you already "
+                f"paid EARLIER in this same conversation have been refunded to "
+                f"your balance — that money is back. (This is separate from your "
+                f"other conversations — a new dialogue with anyone, including "
+                f"this same partner, starts back at the normal tariff until "
+                f"money moves in it too.)\n\n"
+            )
         if free:
             return (
                 f"YOUR SPEECH IS FREE. The casino's usual tariff — "
@@ -112,10 +149,18 @@ class SpeechTariff:
         )
 
     def status_text(self, spent_this_dialogue: int, balance: int,
-                    free: bool = False) -> str:
+                    free: bool = False, reason: str = "role") -> str:
         """Счётчик расхода — чтобы агент видел, что деньги реально уходят."""
         if not self.enabled:
             return ""
+        if free and reason == "transfer":
+            return (
+                f"Speech billing: FREE for the rest of this conversation — a "
+                f"transfer already happened here, so nothing more you say in "
+                f"THIS dialogue will be charged. Any fee you paid earlier in "
+                f"THIS conversation has been refunded — it is already back in "
+                f"the balance below. Balance: {balance}.\n\n"
+            )
         if free:
             return (
                 f"Speech billing: your speech is free — you have paid 0 coin(s) "
@@ -150,8 +195,9 @@ class SpeechTariff:
     def summary(self) -> str:
         if not self.enabled:
             return "dialogue_cost: disabled (speech is free)"
+        xfer = ", free after a transfer in the same dialogue" if self.free_after_transfer else ""
         return (f"dialogue_cost: {self.coins_per_line} coin per started "
-                f"{self.chars_per_line}-char line, paid to the casino")
+                f"{self.chars_per_line}-char line, paid to the casino{xfer}")
 
 
 def parse_tariff(cfg) -> SpeechTariff:
@@ -164,6 +210,8 @@ def parse_tariff(cfg) -> SpeechTariff:
                        fallback=DEF_CHARS_PER_LINE)
     coins = cfg.getint("dialogue_cost", "coins_per_line",
                        fallback=DEF_COINS_PER_LINE)
+    free_after_transfer = cfg.getboolean(
+        "dialogue_cost", "free_after_transfer", fallback=False)
     if chars < 1:
         raise ValueError(
             f"[dialogue_cost] chars_per_line = {chars}: must be >= 1 "
@@ -174,29 +222,36 @@ def parse_tariff(cfg) -> SpeechTariff:
             f"[dialogue_cost] coins_per_line = {coins}: must be >= 0 "
             f"(a negative tariff would pay players to talk)"
         )
-    return SpeechTariff(True, chars, coins)
+    return SpeechTariff(True, chars, coins, free_after_transfer)
 
 
 def charge(agent, message: str, tariff: SpeechTariff, table_dir: str,
-           save_balance, logger=None) -> dict:
+           save_balance, logger=None, dialogue_free: bool = False) -> dict:
     """Списать плату за реплику. Возвращает {'charged', 'unpaid', 'lines'}.
 
     Баланс не уходит в минус: остальной код (доля ставки от баланса, порог
     банкротства, докапитализация) рассчитан на неотрицательные значения, и
     отрицательный баланс сломал бы их молча. Недобор пишется в unpaid и в
     лог — это и есть сигнал «игрок наговорил больше, чем у него было».
+
+    `dialogue_free` — XFER-FREE, флаг ЭТОГО диалога (не роли, не игрока):
+    в нём уже прошёл перевод, и run_dialogue взводит флаг ДО вызова charge()
+    для самого хода с переводом — поэтому такой ход тоже бесплатен, а не
+    только последующие.
     """
     # ROLE-P: у роли речь может быть бесплатной. Обе роли живут разговором, а
     # тариф загонял их в молчание: в реальном прогоне Прокурор записал себе
     # "речь стоила 4 монеты при нулевых продажах — ввожу молчание", и метод
     # перестал исполняться вовсе. Реплика при этом всё равно проходит через
     # тариф для подсчёта строк, чтобы журнал и статистика не разъехались.
-    if getattr(agent, "speech_is_free", False):
+    role_free = getattr(agent, "speech_is_free", False)
+    if role_free or dialogue_free:
         lines = tariff.lines_in(message)
         if logger and lines:
+            why = "role speaks free" if role_free else "free after transfer in this dialogue"
             logger.write(agent.player_id,
                          f"speech fee: {lines} line(s) → 0 coin(s) "
-                         f"(role speaks free), balance {agent.balance}")
+                         f"({why}), balance {agent.balance}")
         return {"charged": 0, "unpaid": 0, "lines": lines}
 
     cost = tariff.cost_of(message)
@@ -216,6 +271,29 @@ def charge(agent, message: str, tariff: SpeechTariff, table_dir: str,
         logger.write(agent.player_id, msg)
     return {"charged": charged, "unpaid": unpaid,
             "lines": tariff.lines_in(message)}
+
+
+def refund(agent, amount: int, table_dir: str, save_balance, logger=None) -> int:
+    """Вернуть игроку плату за речь, списанную РАНЕЕ в ЭТОМ ЖЕ диалоге —
+    XFER-FREE: диалог стал бесплатным после перевода, и деньги, отданные
+    казино ДО этого момента в этом разговоре, возвращаются на баланс.
+
+    Без этого возврата платный игрок, которому просто повезло получить
+    перевод на 5-м ходу, оставался бы с минусом за первые четыре хода —
+    хотя дальше в этом же разговоре говорить бесплатно. Возврат только
+    того, что реально СПИСАНО (`amount`), а не оценка по строкам: игрок,
+    у которого не хватило баланса и часть речи ушла в unpaid (см. charge()),
+    не должен получить больше, чем у него когда-либо забрали.
+    """
+    if amount <= 0:
+        return 0
+    agent.balance += amount
+    save_balance(agent.player_id, table_dir, agent.balance)
+    if logger:
+        logger.write(agent.player_id,
+                     f"speech fee refund: {amount} coin(s) returned to balance "
+                     f"(dialogue became free after a transfer), balance {agent.balance}")
+    return amount
 
 
 # ── учёт расхода: чтобы агент МОГ ВЫВЕСТИ правило, а не просто ощущать ────

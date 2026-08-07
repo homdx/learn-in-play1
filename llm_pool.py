@@ -270,6 +270,15 @@ def _client_for_section(cfg, sec: str):
         timeout=cfg.getint("api", "timeout_seconds", fallback=120),
         retries=cfg.getint("api", "retries", fallback=1),
         json_format=cfg.getboolean("api", "json_format", fallback=True),
+        # HTTP-RETRY: без этих двух строк каждый клиент пула строился с
+        # error_retries=0 (дефолт конструктора — см. llm_client.py), и
+        # пауза перед повтором на 402/5xx НЕ применялась вообще: пул сразу
+        # уходил в failover на следующий сервер (см. LLMPool ниже), не
+        # подождав ни секунды. LLMClient.from_config() этот же кейс уже
+        # учитывал (fallback=2/60) — здесь просто зеркалим то же самое.
+        error_retries=cfg.getint("api", "error_retries", fallback=2),
+        error_retry_wait_sec=cfg.getint("api", "error_retry_wait_sec",
+                                        fallback=60),
     )
 
 

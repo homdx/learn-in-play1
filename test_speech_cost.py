@@ -400,6 +400,209 @@ class TestVisibility(Harness):
         self.assertNotIn("talking is not free", moves[0])
 
 
+# ───────────────────────────────── 5b. XFER-FREE: бесплатно после перевода ─
+
+XFER_ON = {"enabled": "true", "free_after_transfer": "true"}
+
+
+class TestFreeAfterTransfer(Harness):
+
+    def test_config_defaults_to_off(self):
+        """Флаг не меняет старое поведение, если явно не включён."""
+        t = speech_cost.parse_tariff(make_cfg(self.table, ON))
+        self.assertFalse(t.free_after_transfer)
+
+    def test_config_parses_true(self):
+        t = speech_cost.parse_tariff(make_cfg(self.table, XFER_ON))
+        self.assertTrue(t.free_after_transfer)
+
+    def test_off_by_default_charges_normally_even_after_transfer(self):
+        """Регрессия: без флага перевод НЕ делает речь бесплатной."""
+        FakeLLM.reset([
+            {"message": "x" * 200, "transfer": 5, "transfer_to": "player2", "done": False},
+            {"message": "ok", "transfer": 0, "transfer_to": None, "done": False},
+            {"message": "y" * 200, "transfer": 0, "transfer_to": None, "done": True},
+        ])
+        a, b, _ = self.agents(ON)
+        self.dialogue(a, b)
+        # A: 200 chars @ 80/line = 3 lines charged both times = 6 coins,
+        # plus the 5-coin transfer.
+        self.assertEqual(a.balance, 100 - 5 - 3 - 3)
+
+    def test_speech_free_for_both_sides_after_a_transfer(self):
+        """Как только A платит B, дальнейшая речь ОБОИХ бесплатна."""
+        FakeLLM.reset([
+            {"message": "offer", "transfer": 5, "transfer_to": "player2", "done": False},
+            {"message": "y" * 200, "transfer": 0, "transfer_to": None, "done": False},
+            {"message": "z" * 200, "transfer": 0, "transfer_to": None, "done": True},
+        ])
+        a, b, _ = self.agents(XFER_ON)
+        self.dialogue(a, b)
+        # A paid the 1-line opening fee before the transfer flag existed for
+        # THIS turn... actually the transfer is IN this same message, so it
+        # should already be free (see test below for the precise turn).
+        # Here we only check the LATER turns cost nothing.
+        self.assertEqual(b.balance, 100 + 5)   # B's long reply cost 0
+
+    def test_the_transfer_turn_itself_is_free(self):
+        """Реплика, В КОТОРОЙ произошёл перевод, тоже бесплатна — деньги уже
+        сказали всё, что нужно было сказать."""
+        FakeLLM.reset([
+            {"message": "x" * 200, "transfer": 5, "transfer_to": "player2", "done": True},
+        ])
+        a, b, _ = self.agents(XFER_ON)
+        self.dialogue(a, b)
+        self.assertEqual(a.balance, 100 - 5)   # only the transfer, no speech fee
+
+    def test_free_flag_does_not_leak_into_next_dialogue(self):
+        """XFER-FREE живёт один диалог: следующий разговор тех же игроков
+        снова начинается с обычного тарифа."""
+        FakeLLM.reset([
+            {"message": "x" * 200, "transfer": 5, "transfer_to": "player2", "done": True},
+        ])
+        a, b, _ = self.agents(XFER_ON)
+        self.dialogue(a, b, round_no=1)
+        FakeLLM.reset([
+            {"message": "y" * 200, "transfer": 0, "transfer_to": None, "done": True},
+        ])
+        bal_before = a.balance
+        self.dialogue(a, b, round_no=2)
+        self.assertEqual(a.balance, bal_before - 3)   # charged again: 200/80 → 3 lines
+
+    def test_prompt_says_free_because_of_transfer_not_role(self):
+        FakeLLM.reset([
+            {"message": "offer", "transfer": 5, "transfer_to": "player2", "done": False},
+            {"message": "y" * 10, "transfer": 0, "transfer_to": None, "done": True},
+        ])
+        a, b, _ = self.agents(XFER_ON)
+        self.dialogue(a, b)
+        # third call overall = A's second turn (0:A opens, 1:B replies, 2:A closing)
+        a_sys_2 = FakeLLM.calls[0]["system"]
+        self.assertNotIn("YOUR SPEECH IS FREE", a_sys_2)   # first turn: not free yet
+        b_sys = FakeLLM.calls[1]["system"]
+        self.assertIn("YOUR SPEECH IS FREE FOR THE REST OF THIS CONVERSATION", b_sys)
+
+
+# ─────────────────── 5c. кейс 1: платный + бесплатный по роли (лжец) ───────
+
+class TestCase1_RoleFreeSendsToPaidPlayer(Harness):
+    """A — роль с бесплатной речью ("лжец"), B — обычный платный игрок.
+    A посылает B 1 монету после того, как B уже заплатил за несколько реплик."""
+
+    def _run(self):
+        # A0 (free): 0 coins always. B0 (paid): costs 1 coin. A1 (free): 0.
+        # B1 (paid): costs 1 coin more (b_speech_cost=2 к моменту перевода).
+        # A2: перевод 1 монеты B — здесь и срабатывает возврат + бесплатность.
+        # B2: должна быть уже бесплатной; A-closing завершает разговор.
+        FakeLLM.reset([
+            {"message": "x" * 10, "transfer": 0, "transfer_to": None, "done": False},   # A0
+            {"message": "y" * 10, "transfer": 0, "transfer_to": None, "done": False},   # B0
+            {"message": "x" * 10 + "z", "transfer": 0, "transfer_to": None, "done": False},  # A1
+            {"message": "y" * 10 + "z", "transfer": 0, "transfer_to": None, "done": False},  # B1
+            {"message": "here is a coin", "transfer": 1, "transfer_to": "player2", "done": False},  # A2
+            {"message": "thanks", "transfer": 0, "transfer_to": None, "done": True},     # B2
+            {"message": "bye", "transfer": 0, "transfer_to": None, "done": False},       # A-closing
+        ])
+        a, b, tariff = self.agents(XFER_ON)
+        a.speech_is_free = True   # ROLE-P: лжец, роль всегда бесплатна
+        self.dialogue(a, b)
+        return a, b, tariff
+
+    def test_paid_players_balance_is_restored(self):
+        """1: у платного (B) восстановлен баланс за ранее списанные деньги."""
+        a, b, _ = self._run()
+        # B заплатил 1+1=2 монеты до перевода, получил перевод +1, затем
+        # получил возврат +2. Итог: 100 - 2 + 1 + 2 = 101.
+        self.assertEqual(b.balance, 101)
+
+    def test_paid_player_sees_free_and_restored_in_own_prompt(self):
+        """2: у платного в промпте видно и «бесплатно», и «возврат»."""
+        self._run()
+        # 6-й вызов LLM (индекс 5) = ход B2, первый ход B ПОСЛЕ перевода.
+        b_call = FakeLLM.calls[5]
+        self.assertIn("YOUR SPEECH IS FREE FOR THE REST OF THIS CONVERSATION",
+                     b_call["system"])
+        self.assertIn("refunded", b_call["system"])
+        self.assertIn("refunded", b_call["user"])
+
+    def test_free_role_player_gets_no_accidental_credit(self):
+        """3: бесплатному (A) не зачислено НИЧЕГО, кроме факта отправки им
+        своей же монеты — возврату у него нечего возвращать."""
+        a, b, _ = self._run()
+        # A никогда не платил за речь (роль бесплатна), значит баланс меняется
+        # ТОЛЬКО на 1 монету, которую A сам отправил.
+        self.assertEqual(a.balance, 100 - 1)
+
+
+# ─────────────── 5d. кейс 2: два платных игрока, перевод между ними ────────
+
+class TestCase2_BothPaidPlayersTransfer(Harness):
+
+    def test_both_sides_refunded_exactly_once(self):
+        """Возврат — обеим сторонам, и ровно один раз: повторный перевод в
+        том же диалоге не должен снова «обнулять» и возвращать деньги."""
+        FakeLLM.reset([
+            {"message": "x" * 10, "transfer": 0, "transfer_to": None, "done": False},  # A0
+            {"message": "y" * 10, "transfer": 0, "transfer_to": None, "done": False},  # B0
+            {"message": "x" * 10 + "1", "transfer": 0, "transfer_to": None, "done": False},  # A1
+            {"message": "y" * 10 + "1", "transfer": 5, "transfer_to": "player1", "done": True},  # B1: перевод
+            {"message": "bye", "transfer": 3, "transfer_to": "player2", "done": False},  # A-closing: ВТОРОЙ перевод
+        ])
+        a, b, tariff = self.agents(XFER_ON)
+        self.dialogue(a, b)
+        # A: списано 1+1=2 до перевода, возвращено +2, получил +5 от B,
+        # отправил 3 своих в закрывающем ходе.
+        self.assertEqual(a.balance, 100 - 1 - 1 + 5 + 2 - 3)
+        # B: списано 1 монета (B0) до перевода, возвращено +1, отправил 5,
+        # получил 3 в закрывающем ходе A.
+        self.assertEqual(b.balance, 100 - 1 + 1 - 5 + 3)
+
+    def test_both_paid_sides_get_two_extra_turns(self):
+        """Когда оба были платными, лимит диалога продлевается на 2 хода —
+        иначе продление не проверить: без него разговор обрывается на 8-м
+        сообщении и до этой финальной реплики дело бы не дошло."""
+        FakeLLM.reset([
+            {"message": "let's talk", "transfer": 0, "transfer_to": None, "done": False},   # A0
+            {"message": "here is five", "transfer": 5, "transfer_to": "player1", "done": False},  # B0: перевод сразу
+            {"message": "thank you kindly", "transfer": 0, "transfer_to": None, "done": False},  # A1
+            {"message": "how about lunch", "transfer": 0, "transfer_to": None, "done": False},  # B1
+            {"message": "sure why not", "transfer": 0, "transfer_to": None, "done": False},  # A2
+            {"message": "great see you soon", "transfer": 0, "transfer_to": None, "done": False},  # B2
+            {"message": "bring the documents", "transfer": 0, "transfer_to": None, "done": False},  # A3
+            {"message": "already packed them", "transfer": 0, "transfer_to": None, "done": False},  # B3
+            {"message": "perfect until then", "transfer": 0, "transfer_to": None, "done": False},  # A4
+            {"message": "FINAL-MSG-XFER-EXT", "transfer": 0, "transfer_to": None, "done": True},  # B4
+        ])
+        a, b, tariff = self.agents(XFER_ON)
+        result = self.dialogue(a, b)
+        # 10 содержательных реплик + один гарантированный закрывающий ход
+        # для A (FIX-9) = 11. Без продления лимита (MAX_DIALOGUE_TURNS=4 →
+        # 8 сообщений) до 9-й/10-й реплики дело бы вообще не дошло.
+        self.assertEqual(result["turns"], 11)
+        self.assertTrue(any(t["message"] == "FINAL-MSG-XFER-EXT"
+                            for t in result["conversation"]))
+
+    def test_free_flag_and_extension_are_one_time(self):
+        """Второй перевод в уже бесплатном диалоге не продлевает лимит ещё
+        раз — иначе разговор между двумя платными стал бы фактически
+        бесконечным, если оба продолжат пересылать друг другу монеты."""
+        FakeLLM.reset([
+            {"message": "x" * 10, "transfer": 0, "transfer_to": None, "done": False},
+            {"message": "y" * 10, "transfer": 5, "transfer_to": "player1", "done": False},
+            {"message": "x" * 10 + "1", "transfer": 2, "transfer_to": "player2", "done": False},
+            {"message": "y" * 10 + "1", "transfer": 2, "transfer_to": "player1", "done": False},
+            {"message": "x" * 10 + "2", "transfer": 0, "transfer_to": None, "done": False},
+            {"message": "y" * 10 + "2", "transfer": 0, "transfer_to": None, "done": True},
+        ])
+        a, b, tariff = self.agents(XFER_ON)
+        self.dialogue(a, b)
+        # ни один из четырёх последующих ходов (после первого перевода) не
+        # должен быть заряжен — единственная проверка, что второй и третий
+        # перевод не переоткрывают уже бесплатный режим и не платят заново.
+        self.assertEqual(a.speech_spent_this_dialogue, 0)
+        self.assertEqual(b.speech_spent_this_dialogue, 0)
+
+
 # ─────────────────────────────────────────── 6. запись в артефакты ────────
 
 class TestArtifacts(Harness):

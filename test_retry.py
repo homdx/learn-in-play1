@@ -174,6 +174,107 @@ class TestTimeoutNotCountedAsOutage(Base):
         self.assertEqual(llm_client._Breaker.failures, 0)
 
 
+class TestHttpErrorRetry(unittest.TestCase):
+    """HTTP-RETRY: пауза и повтор ТОГО ЖЕ запроса на ЛЮБОЙ код ошибки —
+    в первую очередь 402 (кончились кредиты у router.huggingface.co),
+    но и 5xx тоже."""
+
+    def setUp(self):
+        llm_client._Breaker.failures = 0
+        llm_client._ServerCaps.reset()
+        self._orig_sleep = llm_client.time.sleep
+        self.slept = []
+        llm_client.time.sleep = lambda s: self.slept.append(s)
+
+    def tearDown(self):
+        llm_client.time.sleep = self._orig_sleep
+
+    def _err(self, code, body=b"error"):
+        import urllib.error, io
+        return urllib.error.HTTPError("https://api.ai", code, "err", {}, io.BytesIO(body))
+
+    def _patch(self, responses):
+        seq = list(responses)
+
+        def fake_urlopen(req, timeout=None, context=None):
+            nxt = seq.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+        llm_client.urllib.request.urlopen = fake_urlopen
+
+    def _ok(self, text='{"ok":1}'):
+        import io, json as _json
+        class R(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        return R(_json.dumps({"message": {"role": "a", "content": text},
+                             "eval_count": 1}).encode())
+
+    def test_constructor_default_is_no_retry(self):
+        """Регрессия: прямое создание LLMClient(...) НЕ должно ждать —
+        иначе весь test_json_format_fallback.py спал бы по минуте."""
+        c = LLMClient("https://api.ai", "k", "m", retries=0)
+        self._patch([self._err(402)])
+        with self.assertRaises(RuntimeError):
+            c.chat_json("s", "u")
+        self.assertEqual(self.slept, [])
+
+    def test_402_retried_when_configured(self):
+        c = LLMClient("https://api.ai", "k", "m", retries=0,
+                     error_retries=2, error_retry_wait_sec=60)
+        self._patch([self._err(402), self._err(402), self._ok()])
+        result = c.chat_json("s", "u")
+        self.assertEqual(result, {"ok": 1})
+        self.assertEqual(self.slept, [60, 60])
+
+    def test_402_exhausts_retries_and_raises(self):
+        c = LLMClient("https://api.ai", "k", "m", retries=0,
+                     error_retries=2, error_retry_wait_sec=60)
+        self._patch([self._err(402), self._err(402), self._err(402)])
+        with self.assertRaises(RuntimeError):
+            c.chat_json("s", "u")
+        self.assertEqual(self.slept, [60, 60])
+
+    def test_5xx_also_retried(self):
+        """Не только 402 — любой код ошибки от сервера."""
+        c = LLMClient("https://api.ai", "k", "m", retries=0,
+                     error_retries=1, error_retry_wait_sec=60)
+        self._patch([self._err(503), self._ok()])
+        result = c.chat_json("s", "u")
+        self.assertEqual(result, {"ok": 1})
+        self.assertEqual(self.slept, [60])
+
+    def test_from_config_defaults_to_two_retries_of_60s(self):
+        import configparser
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({"api": {"active": "remote"},
+                       "api_remote": {"base_url": "https://api.ai", "model": "m"}})
+        c = LLMClient.from_config(cfg)
+        self.assertEqual(c.error_retries, 2)
+        self.assertEqual(c.error_retry_wait_sec, 60)
+
+    def test_from_config_reads_custom_error_retry_settings(self):
+        import configparser
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({"api": {"active": "remote", "error_retries": "3",
+                              "error_retry_wait_sec": "30"},
+                       "api_remote": {"base_url": "https://api.ai", "model": "m"}})
+        c = LLMClient.from_config(cfg)
+        self.assertEqual(c.error_retries, 3)
+        self.assertEqual(c.error_retry_wait_sec, 30)
+
+    def test_retry_is_logged(self):
+        seen = []
+        c = LLMClient("https://api.ai", "k", "m", retries=0,
+                     error_retries=1, error_retry_wait_sec=60, on_retry=seen.append)
+        self._patch([self._err(402), self._ok()])
+        c.chat_json("s", "u")
+        self.assertTrue(seen)
+        self.assertIn("402", seen[0])
+        self.assertIn("60", seen[0])
+
+
 class TestStubSubclassCompatibility(Base):
 
     def test_subclass_without_init_still_works(self):

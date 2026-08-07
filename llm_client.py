@@ -206,7 +206,8 @@ class LLMClient:
                  api_format: str = "ollama", verify_ssl: bool = True,
                  num_ctx: int = 0, think: "bool | None" = None,
                  timeout: int = 120, retries: int = 1, on_retry=None,
-                 json_format: bool = True):
+                 json_format: bool = True,
+                 error_retries: int = 0, error_retry_wait_sec: int = 60):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -217,6 +218,22 @@ class LLMClient:
         # RETRY-1: сколько ДОПОЛНИТЕЛЬНЫХ попыток делать при сбое.
         # 0 — прежнее поведение (одна попытка, дальше заглушка).
         self.retries = max(0, int(retries))
+        # HTTP-RETRY: сколько ДОПОЛНИТЕЛЬНЫХ попыток делать на ЛЮБОЙ HTTP-код
+        # ошибки от сервера (402 "кончились кредиты", 5xx, и т.п.), помимо
+        # уже существующего отдельного разбора 429 и 400+json_mode. Каждая
+        # попытка ждёт error_retry_wait_sec секунд перед повтором ТОГО ЖЕ
+        # запроса без изменений — в отличие от RETRY-1 (chat_json), который
+        # меняет temperature/промпт и не ждёт вовсе. Раньше 402/5xx сразу
+        # роняли раунд без единой попытки переждать: HF отдаёт 402 даже на
+        # кратковременный сбой биллинга у них, не только при реально
+        # исчерпанной квоте, так что слепой отказ без повтора терял раунды
+        # там, где повтор через минуту мог бы пройти. По умолчанию 0
+        # (прежнее поведение — падать сразу): прямое LLMClient(...), как в
+        # тестах и заглушках, не должно внезапно засыпать на минуту при
+        # каждой HTTP-ошибке. from_config() ниже включает 2 попытки по
+        # умолчанию — это путь реальных прогонов игры.
+        self.error_retries = max(0, int(error_retries))
+        self.error_retry_wait_sec = max(1, int(error_retry_wait_sec))
         # Необязательный колбэк log(str): клиент не знает про логгер игры,
         # но вызывающий может подставить свой, чтобы повторы были видны.
         self.on_retry = on_retry
@@ -247,6 +264,11 @@ class LLMClient:
         think = None if think_raw is None else cfg.getboolean(api_section, "think")
         timeout = cfg.getint("api", "timeout_seconds", fallback=120)
         retries = cfg.getint("api", "retries", fallback=1)
+        # HTTP-RETRY: см. докстринг __init__. 2 попытки по 60 сек — то же,
+        # что раньше было только у 429, теперь распространено на 402/5xx.
+        error_retries = cfg.getint("api", "error_retries", fallback=2)
+        error_retry_wait_sec = cfg.getint("api", "error_retry_wait_sec",
+                                          fallback=60)
         # Шлюзы перед удалённым сервером могут не знать поля format —
         # можно отключить заранее, не дожидаясь первого 400.
         json_format = cfg.getboolean("api", "json_format", fallback=True)
@@ -254,7 +276,9 @@ class LLMClient:
         return cls(base_url=base_url, api_key=api_key, model=model,
                     api_format=api_format, verify_ssl=verify_ssl,
                     num_ctx=num_ctx, think=think, timeout=timeout,
-                    retries=retries, json_format=json_format)
+                    retries=retries, json_format=json_format,
+                    error_retries=error_retries,
+                    error_retry_wait_sec=error_retry_wait_sec)
 
     def _build_request(self, system: str, user: str, temperature: float,
                         max_tokens: int, json_mode: bool = False):
@@ -378,7 +402,7 @@ class LLMClient:
 
     def chat(self, system: str, user: str, temperature: float = 0.4,
              max_tokens: int = 400, json_mode: bool = False,
-             _retried_429: bool = False) -> str:
+             _retried_429: bool = False, _http_retry_n: int = 0) -> str:
         """Блокинг-вызов чат-комплишена. Возвращает текст ответа
         (с уже вырезанным <think>...</think>, если он был)."""
         url, headers, payload = self._build_request(system, user, temperature,
@@ -440,6 +464,29 @@ class LLMClient:
                      "client")
                 return self.chat(system, user, temperature=temperature,
                                  max_tokens=max_tokens, json_mode=False)
+            # HTTP-RETRY: любой другой код ошибки от сервера — 402 "кончились
+            # кредиты", 5xx, и т.п. Раньше это сразу роняло раунд (см.
+            # max_consecutive_failures = 1 в [api]) без единой попытки
+            # переждать. У router.huggingface.co 402 иногда отдаётся и на
+            # кратковременный сбой биллинга на их стороне, не только когда
+            # квота реально исчерпана — так что фиксированная пауза и повтор
+            # того же запроса стоят своей цены, даже если для настоящего
+            # исчерпания месячной квоты они не помогут и раунд всё равно
+            # прервётся, просто на 1-2 минуты позже.
+            if _http_retry_n < self.error_retries:
+                wait_s = self.error_retry_wait_sec
+                on_retry = getattr(self, "on_retry", None)
+                msg = (f"HTTP {e.code} от {url} ({detail or e.reason}), жду "
+                       f"{wait_s} сек и повторяю тот же запрос (попытка "
+                       f"{_http_retry_n + 1}/{self.error_retries})")
+                if on_retry:
+                    on_retry(msg)
+                _dbg(f"chat(): {msg}")
+                time.sleep(wait_s)
+                return self.chat(system, user, temperature=temperature,
+                                 max_tokens=max_tokens, json_mode=json_mode,
+                                 _retried_429=_retried_429,
+                                 _http_retry_n=_http_retry_n + 1)
             raise RuntimeError(f"HTTP {e.code} от {url}: {detail or e.reason}") from None
         except urllib.error.URLError as e:
             raise RuntimeError(

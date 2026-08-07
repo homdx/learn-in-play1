@@ -1723,7 +1723,17 @@ class PlayerAgent:
 
     def dialogue_turn(self, partner_id: str, partner_balance: int,
                       conversation: list[dict], round_no: int,
-                      is_initiator: bool, closing_turn: bool = False) -> dict:
+                      is_initiator: bool, closing_turn: bool = False,
+                      dialogue_free: bool = False,
+                      max_messages: int = 8) -> dict:
+        # XFER-FREE: `dialogue_free` — уже прошёл перевод в ЭТОМ диалоге
+        # (взводится в run_dialogue ДО этого вызова). Отдельно от
+        # `speech_is_free` (роль, действует во всех диалогах игрока):
+        # здесь бесплатность разговорная и разовая, поэтому reason
+        # передаётся в тексты промпта, чтобы игрок не путал одно с другим.
+        role_free = getattr(self, "speech_is_free", False)
+        free_now  = role_free or dialogue_free
+        free_reason = "role" if role_free else "transfer"
 
         # FIX-9: закрывающий ход после того, как партнёр объявил done.
         # Единственная его цель — дать доиграть уже согласованную сделку
@@ -1773,7 +1783,7 @@ class PlayerAgent:
             + speech_cost.format_transcript_cost(t, self.tariff)
             for t in conversation
         )
-        turns_left = 8 - len(conversation)
+        turns_left = max_messages - len(conversation)
 
         # Remind the player of its OWN earlier stance in this conversation,
         # so it counters the partner's offer instead of drifting into
@@ -1852,7 +1862,7 @@ class PlayerAgent:
             + transfer_ledger.format_recent(self.player_id, self.base_dir,
                                              partner=partner_id)
             + self.tariff.status_text(self.speech_spent_this_dialogue, self.balance,
-                                      getattr(self, "speech_is_free", False))
+                                      free_now, free_reason)
             # TVIS-1: "Max transfer" — это ещё НЕ то, что реально пройдёт.
             # Поверх баланса стоит бюджет переводов на раунд, посчитанный
             # от баланса на НАЧАЛО раунда (SPEND-1). Игрок, начавший с нуля
@@ -1910,7 +1920,7 @@ class PlayerAgent:
             while True:
                 resp = self.client.chat_json(
                     system=self.abstract_prompt
-                           + self.tariff.rule_text(getattr(self, "speech_is_free", False))
+                           + self.tariff.rule_text(free_now, free_reason)
                            + f"\nTASK: Dialogue turn with {partner_id}. Be concrete, no filler, no repetition.",
                     user=user_msg + (echo_retry_hint if attempt else ""),
                     temperature=0.8 + 0.1 * attempt,

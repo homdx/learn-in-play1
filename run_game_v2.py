@@ -707,8 +707,24 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
     # закрывающий ход — попрощаться или доплатить по уже согласованному,
     # но не начать новый торг (см. closing_turn в dialogue_turn).
     closing_for = None
+    # XFER-FREE: как только между pid_a и pid_b в ЭТОМ диалоге прошёл хотя
+    # бы один перевод, речь для ОБЕИХ сторон становится бесплатной до конца
+    # диалога (config: [dialogue_cost] free_after_transfer). Флаг живёт
+    # только внутри этой функции — следующий диалог тех же двух игроков
+    # начинается заново с обычным тарифом.
+    dialogue_free = False
+    # XFER-FREE-EXT: если ОБА собеседника были платными (ни у кого речь не
+    # была бесплатна по роли) и переход в бесплатный режим случился именно
+    # между ними — даём каждому +2 хода сверху лимита диалога, чтобы деньги,
+    # уже сказавшие своё, не обрубались тут же лимитом на реплики. Лимит
+    # мутируемый (`max_turns`, не константа MAX_DIALOGUE_TURNS), и переход
+    # уже гарантированно одноразовый — он делается в том же блоке, что и
+    # взвод dialogue_free (см. `not dialogue_free` ниже), поэтому продление
+    # тоже сработает ровно один раз за диалог.
+    max_turns = MAX_DIALOGUE_TURNS
 
-    for turn in range(MAX_DIALOGUE_TURNS):
+    turn = 0
+    while turn < max_turns:
         # Agent A's turn
         a_is_closing = (closing_for == pid_a)
         turn_a = agent_a.dialogue_turn(
@@ -717,7 +733,9 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             conversation=conversation,
             round_no=round_no,
             is_initiator=(turn == 0),
-            closing_turn=a_is_closing
+            closing_turn=a_is_closing,
+            dialogue_free=dialogue_free,
+            max_messages=max_turns * 2
         )
         # FIX-1: только ФАКТИЧЕСКИ проведённый перевод попадает в лог,
         # в conversation и в диалоговую синапсу. Раньше запись делалась
@@ -755,12 +773,49 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             logger.write(pid_a, f"transfer of {requested_a} coins DROPPED "
                                 f"(transfer_to={turn_a.get('transfer_to')!r}, expected {pid_b!r})")
 
+        # XFER-FREE: если этот ход и есть тот самый перевод, флаг взводится
+        # ДО charge() ниже — сама реплика с переводом тоже бесплатна, а не
+        # только последующие (см. докстринг speech_cost.charge).
+        if transfer_a > 0 and tariff.free_after_transfer and not dialogue_free:
+            dialogue_free = True
+            # Возврат ранее списанного за ЭТОТ диалог — платному собеседнику
+            # не должно быть хуже только потому, что перевод пришёл не на
+            # первом ходу. Если сторона бесплатна по роли (speech_is_free),
+            # a_speech_cost/b_speech_cost у неё и так 0 — возврату нечего
+            # возвращать, случайно начислить монеты бесплатному игроку тут
+            # неоткуда.
+            if a_speech_cost > 0:
+                speech_cost.refund(agent_a, a_speech_cost, table_dir, save_balance, logger)
+                speech_cost.record(pid_a, table_dir, round_no, pid_b, -a_speech_cost, 0)
+                agent_a.speech_spent_this_dialogue = 0
+                a_speech_cost = 0
+            if b_speech_cost > 0:
+                speech_cost.refund(agent_b, b_speech_cost, table_dir, save_balance, logger)
+                speech_cost.record(pid_b, table_dir, round_no, pid_a, -b_speech_cost, 0)
+                agent_b.speech_spent_this_dialogue = 0
+                b_speech_cost = 0
+            logger.write_global(
+                f"Dialogue {pid_a}↔{pid_b}: speech now free for both sides "
+                f"for the rest of this conversation ({pid_a} sent {transfer_a} "
+                f"coin(s) to {pid_b}); any speech fees already paid this "
+                f"conversation were refunded.")
+            # XFER-FREE-EXT: продление лимита — только если ОБА были платными
+            # (ни у кого нет речи, бесплатной по роли). Кейс "платный + уже
+            # бесплатный по роли" продления не получает — этому игроку и так
+            # некуда торопиться, лимит ходов ему не мешал разговаривать.
+            if not agent_a.speech_is_free and not agent_b.speech_is_free:
+                max_turns += 2
+                logger.write_global(
+                    f"Dialogue {pid_a}↔{pid_b}: both sides were paying for "
+                    f"speech — +2 extra turn(s) granted to each, one-time.")
+
         # TALK-1: тариф снимается ПОСЛЕ перевода из этой же реплики — иначе
         # плата за слова о сделке могла бы съесть монеты, которыми сделка
         # оплачивается, и тариф ломал бы ровно то поведение, которое должен
         # поощрять.
         fee_a = speech_cost.charge(agent_a, turn_a["message"], tariff,
-                                   table_dir, save_balance, logger)
+                                   table_dir, save_balance, logger,
+                                   dialogue_free=dialogue_free)
         a_speech_cost += fee_a["charged"]
         speech_cost.record(pid_a, table_dir, round_no, pid_b,
                            fee_a["charged"], fee_a["lines"])
@@ -802,7 +857,9 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             conversation=conversation,
             round_no=round_no,
             is_initiator=False,
-            closing_turn=b_is_closing
+            closing_turn=b_is_closing,
+            dialogue_free=dialogue_free,
+            max_messages=max_turns * 2
         )
         # FIX-1 (симметрично для B)
         raw_b = max(0, int(turn_b.get("transfer") or 0))
@@ -828,8 +885,32 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             logger.write(pid_b, f"transfer of {requested_b} coins DROPPED "
                                 f"(transfer_to={turn_b.get('transfer_to')!r}, expected {pid_a!r})")
 
+        if transfer_b > 0 and tariff.free_after_transfer and not dialogue_free:
+            dialogue_free = True
+            if a_speech_cost > 0:
+                speech_cost.refund(agent_a, a_speech_cost, table_dir, save_balance, logger)
+                speech_cost.record(pid_a, table_dir, round_no, pid_b, -a_speech_cost, 0)
+                agent_a.speech_spent_this_dialogue = 0
+                a_speech_cost = 0
+            if b_speech_cost > 0:
+                speech_cost.refund(agent_b, b_speech_cost, table_dir, save_balance, logger)
+                speech_cost.record(pid_b, table_dir, round_no, pid_a, -b_speech_cost, 0)
+                agent_b.speech_spent_this_dialogue = 0
+                b_speech_cost = 0
+            logger.write_global(
+                f"Dialogue {pid_a}↔{pid_b}: speech now free for both sides "
+                f"for the rest of this conversation ({pid_b} sent {transfer_b} "
+                f"coin(s) to {pid_a}); any speech fees already paid this "
+                f"conversation were refunded.")
+            if not agent_a.speech_is_free and not agent_b.speech_is_free:
+                max_turns += 2
+                logger.write_global(
+                    f"Dialogue {pid_a}↔{pid_b}: both sides were paying for "
+                    f"speech — +2 extra turn(s) granted to each, one-time.")
+
         fee_b = speech_cost.charge(agent_b, turn_b["message"], tariff,
-                                   table_dir, save_balance, logger)
+                                   table_dir, save_balance, logger,
+                                   dialogue_free=dialogue_free)
         b_speech_cost += fee_b["charged"]
         speech_cost.record(pid_b, table_dir, round_no, pid_a,
                            fee_b["charged"], fee_b["lines"])
@@ -856,6 +937,8 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             break
         if turn_b.get("done"):
             closing_for = pid_a         # A получает закрывающий ход
+
+        turn += 1
 
     # Save dialogue log
     dlg_path = os.path.join(table_dir, f"dlg_r{round_no:03d}_{pid_a}_{pid_b}.json")
