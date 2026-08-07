@@ -412,7 +412,15 @@ def _request(host: str, payload: dict, api: str = "ollama",
     print(f"\n🕒 Запрос отправлен: {t_start.isoformat(timespec='milliseconds')}")
 
     try:
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            # UA-1: см. тот же комментарий в llm_client.py._build_request —
+            # requests без явного UA шлёт "python-requests/X.Y.Z", это одна
+            # из сигнатур, которые Cloudflare банит по факту строки
+            # (HTTP 403 "error code: 1010"), до всякого более глубокого
+            # анализа. Groq — реальный случай.
+            "User-Agent": "learn-in-play1-hallucination-test/1.0",
+        }
         if api == "openai":
             headers["Authorization"] = f"Bearer {api_key}"
         r = requests.post(_endpoint(host, api), json=payload,
@@ -685,6 +693,7 @@ def print_curl(api: str = "ollama", host: str = None, api_key: str = "ollama"):
     print("="*60)
     print(f"curl -s {_endpoint(host, api)} \\")
     print("  -H 'Content-Type: application/json' \\")
+    print("  -H 'User-Agent: learn-in-play1-hallucination-test/1.0' \\")
     if api == "openai":
         print(f"  -H 'Authorization: Bearer {api_key}' \\")
     print("  -d '" + json.dumps(payload, ensure_ascii=False).replace("'", "'\\''") + "'")

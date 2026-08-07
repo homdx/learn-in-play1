@@ -285,6 +285,17 @@ class LLMClient:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
+            # UA-1: urllib без явного User-Agent шлёт "Python-urllib/3.x" —
+            # реальный случай: Groq (за Cloudflare) вернул HTTP 403 "error
+            # code: 1010" — это Cloudflare-специфичная блокировка ИМЕННО ПО
+            # СИГНАТУРЕ клиента (известные строки скрипт-библиотек вроде
+            # python-urllib/python-requests/curl/scrapy банятся до всякого
+            # JS-челленджа), не касается настоящих ботов с реальным
+            # поведением. Честная, но не библиотечная строка UA обычно
+            # достаточна, чтобы пройти именно этот фильтр — TLS/JA3-
+            # фингерпринтинг она не подделывает и не решает более
+            # продвинутую защиту, но 1010 чаще всего именно про строку UA.
+            "User-Agent": "learn-in-play1-llm-client/1.0 (+https://github.com/homdx/learn-in-play1)",
         }
         messages = [
             {"role": "system", "content": system},

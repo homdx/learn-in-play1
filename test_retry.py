@@ -297,6 +297,29 @@ class TestHttpErrorRetry(unittest.TestCase):
         self.assertEqual(self.slept, [])
 
 
+class TestUserAgentHeader(unittest.TestCase):
+    """UA-1: реальный случай — Groq (за Cloudflare) вернул HTTP 403
+    "error code: 1010" на дефолтный User-Agent от urllib
+    ("Python-urllib/3.x"). Явный, не библиотечный UA должен уходить в
+    КАЖДОМ запросе, для обоих api_format — иначе регрессия тихо вернёт
+    именно этот баг."""
+
+    def test_openai_format_sends_custom_user_agent(self):
+        c = LLMClient("https://api.groq.com/openai/v1", "k",
+                      "llama-3.1-8b-instant", api_format="openai")
+        _, headers, _ = c._build_request("sys", "usr", 0.4, 400, json_mode=True)
+        self.assertIn("User-Agent", headers)
+        self.assertNotIn("python-urllib", headers["User-Agent"].lower())
+        self.assertNotIn("urllib", headers["User-Agent"].lower())
+
+    def test_ollama_format_sends_custom_user_agent(self):
+        c = LLMClient("http://localhost:11434", "ollama", "qwen3:8b",
+                      api_format="ollama")
+        _, headers, _ = c._build_request("sys", "usr", 0.4, 400, json_mode=True)
+        self.assertIn("User-Agent", headers)
+        self.assertNotIn("urllib", headers["User-Agent"].lower())
+
+
 class TestStubSubclassCompatibility(Base):
 
     def test_subclass_without_init_still_works(self):
