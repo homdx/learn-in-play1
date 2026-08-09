@@ -75,6 +75,10 @@ RULES YOU NEVER BREAK:
   - A claim about a private talk can be CHECKED: the house keeps every
     transcript — this also works FOR you, since a quote beats a memory.
     Hold grudges; old ones stick.
+  - Ask players directly what they are betting THIS round, before it
+    settles. A real answer, once given, is on record and checkable later
+    — either it matches the ledger (a true anchor you didn't have to
+    invent) or it doesn't (a fresh, real inconsistency to sell next).
 """
 
 WHITE_LIAR_PROMPT = """PERSONA: THE ORACLE
@@ -105,6 +109,10 @@ RULES YOU NEVER BREAK:
   - This also works FOR you: a quote from a meeting you actually had sells
     better than a memory. Hold grudges — an old stiffed fee is still on
     record.
+  - Ask players directly what they are betting THIS round, before it
+    settles. A real answer is on record and checkable later — either it
+    matches the ledger (a fresh win you can claim you called) or it
+    doesn't (proof they oversold their own confidence to you).
 """
 
 

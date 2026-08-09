@@ -262,6 +262,26 @@ def fieldnotes_file(pid, base_dir):
     return os.path.join(base_dir, f"fieldnotes_{pid}.md")
 
 
+def addendum_file(pid, base_dir):
+    return os.path.join(base_dir, f"persona_addendum_{pid}.txt")
+
+
+# ROLE-Q: потолок довеска к запертой персоне. Заметно меньше обычного
+# persona_chars — это НЕ вторая персона и не место для переписывания метода,
+# а короткий личный штрих (манера речи, кличка для себя, что-то вроде
+# "подписи"), который лжец может развивать раунд за раундом, не трогая
+# фиксированный текст роли.
+PERSONA_ADDENDUM_CHARS = 400
+
+
+def load_persona_addendum(pid, base_dir) -> str:
+    return load_text(addendum_file(pid, base_dir), "")
+
+
+def save_persona_addendum(pid, base_dir, text: str):
+    save_text(addendum_file(pid, base_dir), text)
+
+
 # ROLE-N: сколько символов полевых заметок держим. Осознанно мало: это
 # рабочий блокнот приёмов, а не вторая персона. При переполнении вытесняется
 # самая старая запись.
@@ -959,11 +979,23 @@ class PlayerAgent:
             self._log(f"persona {len(persona)} chars exceeds hard cap {hard_cap} "
                       f"— truncated for this call")
             persona = _truncate_text(persona, hard_cap)
+        addendum_block = ""
+        if self.persona_locked:
+            addendum = load_persona_addendum(self.player_id, self.base_dir)
+            if addendum:
+                addendum_block = (
+                    "\n=== YOUR OWN ADDENDUM (your voice on top of the fixed "
+                    "method above — editable by you each round, but it never "
+                    "overrides the method or rules) ===\n"
+                    + addendum
+                    + "\n=== END ADDENDUM ===\n"
+                )
         return (
             CORE_SYSTEM_PROMPT
             + "\n=== YOUR PERSONA & STRATEGY (editable by you each round) ===\n"
             + persona
             + "\n=== END PERSONA & STRATEGY ===\n"
+            + addendum_block
             + self._fieldnotes_block()
         )
 
@@ -1503,9 +1535,15 @@ class PlayerAgent:
             existing = load_fieldnotes(self.player_id, self.base_dir)
             seen = ("\n".join(f"  - {n}" for n in existing)
                     if existing else "  (none yet)")
+            cur_addendum = load_persona_addendum(self.player_id, self.base_dir)
             persona_block = (
                 f"Your persona/strategy text (fixed for this game — you cannot "
                 f"edit it, and you are not being asked to):\n{persona}\n\n"
+                f"Your current addendum — a short personal voice/flourish on top "
+                f"of the fixed method above (nickname you use for yourself, a "
+                f"signature phrase, a grudge you're tracking, a stylistic tic — "
+                f"NOT a rewrite of the method or rules, those stay exactly as "
+                f"given): {cur_addendum or '(empty so far)'}\n\n"
                 f"Your field notes so far:\n{seen}\n\n"
                 f"Update your betting synapse"
                 + (f", including whether your strategy should use MULTIPLE bets "
@@ -1522,9 +1560,15 @@ class PlayerAgent:
                 f"to add, return an empty list.\n"
                 f"A field note refines HOW you work your method. It never "
                 f"questions the method itself and never proposes abandoning it.\n"
+                f"You may also update your addendum (optional, max "
+                f"{PERSONA_ADDENDUM_CHARS} characters) — keep it as your own "
+                f"flavor, not a second persona; if you have nothing to add or "
+                f"change, leave it unchanged.\n"
                 f"Return ONLY JSON:\n"
                 f"{{\"notes\": \"updated strategy (max {self.synapse_chars} chars)\",\n"
-                f" \"field_notes\": [\"new observation\", \"...\"]}}"
+                f" \"field_notes\": [\"new observation\", \"...\"],\n"
+                f" \"persona_addendum\": \"unchanged text or your updated addendum, "
+                f"max {PERSONA_ADDENDUM_CHARS} characters\"}}"
             )
         else:
             persona_block = (
@@ -1538,6 +1582,13 @@ class PlayerAgent:
                 f"(NOT the core game rules — those are fixed and always apply regardless of what "
                 f"you write here; betting, paid services, and negotiation with other players remain "
                 f"available to you no matter how you rewrite this section).\n"
+                f"If your persona currently gives you no reason to ever start a conversation, "
+                f"consider whether that is really optimal: talking to another player is "
+                f"free unless dialogue costs are enabled, and it is the only way to learn "
+                f"things that never make it into the public ledger — what someone actually "
+                f"bet on before it settles, what deal they made with someone else, who is "
+                f"broke and might sell information cheap. Silence is a valid strategy, but "
+                f"it should be a choice your persona makes on purpose, not a default.\n"
                 f"Return ONLY JSON:\n"
                 f"{{\"notes\": \"updated strategy (max {self.synapse_chars} chars)\",\n"
                 f" \"update_persona\": true/false,\n"
@@ -1605,6 +1656,27 @@ class PlayerAgent:
                         kept = append_fieldnotes(self.player_id, self.base_dir, fresh)
                         for n in fresh[:FIELDNOTES_PER_ROUND]:
                             self._log(f"FIELD NOTE (+1, {len(kept)} kept): {n}")
+
+                    # ROLE-Q: довесок — отдельно от field_notes, цельный текст,
+                    # а не список. Пишем только если модель реально что-то
+                    # вернула (пустое/отсутствующее поле = "без изменений",
+                    # не стираем то, что уже накопилось).
+                    raw_addendum = resp.get("persona_addendum")
+                    if raw_addendum is not None:
+                        addendum_text = _as_text(raw_addendum, "").strip()
+                        if addendum_text:
+                            truncated = _truncate_text(addendum_text,
+                                                       PERSONA_ADDENDUM_CHARS)
+                            if len(addendum_text) > len(truncated):
+                                self._log(f"persona addendum {len(addendum_text)} "
+                                          f"chars > limit {PERSONA_ADDENDUM_CHARS} "
+                                          f"— truncated")
+                            prev = load_persona_addendum(self.player_id, self.base_dir)
+                            if truncated != prev:
+                                save_persona_addendum(self.player_id, self.base_dir,
+                                                      truncated)
+                                self._log(f"PERSONA ADDENDUM UPDATED "
+                                          f"({len(truncated)} chars): {truncated}")
 
                 if self.persona_locked and resp.get("update_persona"):
                     # ROLE-1: модель всё равно иногда возвращает поле, которого

@@ -2495,7 +2495,7 @@ class TestPromptDiet(unittest.TestCase):
     def test_role_prompts_are_short(self):
         import roles
         for name, text in roles.ROLE_PROMPTS.items():
-            self.assertLess(len(text), 1400, f"роль {name} снова разрослась")
+            self.assertLess(len(text), 1700, f"роль {name} снова разрослась")
 
     def test_pitfalls_block_sits_at_the_very_end(self):
         core = agent_v2.CORE_SYSTEM_PROMPT

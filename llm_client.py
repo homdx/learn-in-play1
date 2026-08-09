@@ -81,6 +81,24 @@ def _ollama_chat_url(base_url: str) -> str:
 
 
 _RETRY_AFTER_MS_RE = re.compile(r"(?:try again|retry)\s+in\s+([\d.]+)\s*ms", re.IGNORECASE)
+# THINK-5: "reasoning" как отдельное имя поля надо отличать от подстроки
+# внутри "reasoning_effort" — иначе отказ на reasoning_effort ложно
+# засчитывался бы и как отказ на bare "reasoning" (или наоборот, в
+# зависимости от порядка проверки). Раньше это решалось поиском по
+# буквальным экранированным кавычкам ("\"reasoning\"") — хрупко: разные
+# серверы по-разному экранируют кавычки в JSON-теле ошибки (одни через
+# \", другие через одинарные кавычки 'reasoning', третьи вообще без
+# кавычек). Негативный просмотр вперёд решает это без оглядки на кавычки.
+_BARE_REASONING_FIELD_RE = re.compile(r"reasoning(?!_effort)")
+# THINK-6: реальный текст ошибки Groq — "`reasoning_effort` must be one of
+# `none` or `default`" — вытаскиваем предложенные значения из backtick-
+# кавычек. Формат "must be one of `a`, `b` or `c`" встречается у многих
+# OpenAI-совместимых валидаторов не только для этого поля, поэтому
+# регулярка не завязана жёстко на слово reasoning_effort — сам детектор
+# в chat() уже гарантирует, что мы внутри разбора именно этой ошибки.
+_MUST_BE_ONE_OF_RE = re.compile(r"must be one of\s*((?:`[^`]+`[,\s]*(?:or\s*)?)+)",
+                                re.IGNORECASE)
+_BACKTICK_VALUE_RE = re.compile(r"`([^`]+)`")
 _RETRY_AFTER_S_RE = re.compile(r"(?:try again|retry)\s+in\s+([\d.]+)\s*s(?:econds?)?\b", re.IGNORECASE)
 
 
@@ -215,6 +233,34 @@ class _ServerCaps:
     понимает), и вывод про один сервер не должен калечить другой.
     """
     no_json_format: dict[str, bool] = {}
+    # THINK-5: раньше все три think-поля (chat_template_kwargs,
+    # reasoning_effort, reasoning) отключались ОДНИМ общим флагом при
+    # отказе на ЛЮБОМ из них (THINK-4). Реальный случай (Groq) отверг
+    # ИМЕННО chat_template_kwargs — это vLLM/SGLang-специфика, никогда не
+    # входила в OpenAI-спеку, отвергать её логично. Но reasoning_effort/
+    # reasoning — штатные OpenAI/OpenRouter поля, которые МОГЛИ БЫ пройти
+    # нормально и реально подавить thinking. Бандлинг всех трёх в одном
+    # флаге выбрасывал рабочий механизм вместе с неработающим. Теперь —
+    # отдельный флаг на каждое конкретное имя поля.
+    rejected_think_fields: dict[str, set] = {}
+    # THINK-6: реальный случай (Groq) — сервер отверг НЕ само поле
+    # reasoning_effort, а конкретно значение "low": '`reasoning_effort`
+    # must be one of `none` or `default`'. Это НЕ "поле не поддерживается"
+    # (как chat_template_kwargs) — поле рабочее, просто со своим набором
+    # допустимых значений, отличным от нативного OpenAI o1/o3/gpt-5
+    # ("low"/"medium"/"high"). Нельзя просто зашить "none" глобально —
+    # это сломало бы reasoning_effort у провайдеров, которые ждут именно
+    # "low". Значение per-base_url: узнали подсказку из текста ошибки —
+    # запомнили именно для этого сервера, для остальных остаётся "low".
+    reasoning_effort_value: dict[str, str] = {}
+
+    @classmethod
+    def reasoning_effort_for(cls, base_url: str) -> str:
+        return cls.reasoning_effort_value.get(base_url, "low")
+
+    @classmethod
+    def set_reasoning_effort_value(cls, base_url: str, value: str):
+        cls.reasoning_effort_value[base_url] = value
 
     @classmethod
     def rejects_json_format(cls, base_url: str) -> bool:
@@ -225,8 +271,18 @@ class _ServerCaps:
         cls.no_json_format[base_url] = True
 
     @classmethod
+    def think_field_rejected(cls, base_url: str, field: str) -> bool:
+        return field in cls.rejected_think_fields.get(base_url, ())
+
+    @classmethod
+    def mark_think_field_rejected(cls, base_url: str, field: str):
+        cls.rejected_think_fields.setdefault(base_url, set()).add(field)
+
+    @classmethod
     def reset(cls):
         cls.no_json_format.clear()
+        cls.rejected_think_fields.clear()
+        cls.reasoning_effort_value.clear()
 
 
 class _Breaker:
@@ -405,7 +461,8 @@ class LLMClient:
             # начинается (см. _extract_content ниже). think=false в
             # конфиге теперь действует и для api_format=openai, не только
             # для ollama.
-            if self.think is not None:
+            if self.think is not None and not _ServerCaps.think_field_rejected(
+                    self.base_url, "chat_template_kwargs"):
                 payload["chat_template_kwargs"] = {"enable_thinking": self.think}
             # THINK-3: chat_template_kwargs — это vLLM/SGLang-специфика.
             # OpenRouter (и любой gateway перед ним, включая gpt-oss —
@@ -419,9 +476,16 @@ class LLMClient:
             # нативного OpenAI o1/o3/gpt-5. Отправляем оба поля сразу: то,
             # что конкретный провайдер не понимает, он молча игнорирует —
             # дешевле, чем гадать, какое поле сработает именно здесь.
+            # THINK-5: НЕ каждый сервер молча игнорирует — Groq валит весь
+            # запрос HTTP 400 на chat_template_kwargs (см. THINK-4). Но это
+            # необязательно значит, что reasoning_effort/reasoning ТОЖЕ
+            # отвергаются тем же сервером — проверяем и отключаем каждое
+            # поле НЕЗАВИСИМО (см. THINK-5 в chat()).
             if self.think is False:
-                payload["reasoning_effort"] = "low"
-                payload["reasoning"] = {"effort": "low", "exclude": True}
+                if not _ServerCaps.think_field_rejected(self.base_url, "reasoning_effort"):
+                    payload["reasoning_effort"] = _ServerCaps.reasoning_effort_for(self.base_url)
+                if not _ServerCaps.think_field_rejected(self.base_url, "reasoning"):
+                    payload["reasoning"] = {"effort": "low", "exclude": True}
         _dbg(f"_build_request: url={url!r}, model={self.model!r}, "
              f"api_format={self.api_format!r}, think={self.think!r}, "
              f"num_ctx={self.num_ctx}, max_tokens={max_tokens}, temp={temperature}, "
@@ -453,6 +517,14 @@ class LLMClient:
             _dbg(f"  prompt_eval_count={prompt_eval_count}, "
                  f"eval_count={eval_count}, num_ctx={self.num_ctx}, "
                  f"has_eval_duration={has_eval_duration}")
+            # DIAG-CTX-3: запоминаем для chat() — там, ПОСЛЕ strip_think(),
+            # известно, действительно ли текст исчез при стрипе (а не был
+            # пуст с самого начала), и только там можно дать верный диагноз.
+            self._last_ollama_diag = {
+                "prompt_eval_count": prompt_eval_count,
+                "eval_count": eval_count,
+                "num_ctx": self.num_ctx,
+            }
 
             if not content.strip() and not thinking:
                 if eval_count == 0 or (eval_count is not None and not has_eval_duration):
@@ -501,6 +573,33 @@ class LLMClient:
         if not content.strip() and reasoning:
             _dbg("  WARNING: content is empty but reasoning is not — "
                  "model returned only thinking, no actual JSON output!")
+        # DIAG-CTX-2: OpenAI-совместимый эквивалент диагностики context-
+        # overflow-vs-sampling-glitch, которая раньше существовала ТОЛЬКО в
+        # ветке api_format=='ollama' (там свои поля prompt_eval_count/
+        # eval_count). Для openai-формата (Grok, OpenRouter, Groq и т.п.)
+        # эти поля просто не существуют в ответе — раньше LLM_DEBUG молчал
+        # об этом полностью, а текст итоговой ошибки в chat_json() всё
+        # равно безусловно отсылал искать prompt_eval_count/eval_count,
+        # которых там физически нет и никогда не будет. Здесь тот же
+        # диагноз строится на usage.prompt_tokens/completion_tokens
+        # (стандартное поле OpenAI-формата) и finish_reason.
+        #
+        # DIAG-CTX-3: реальный случай (Groq, qwen3.6) показал, что этой
+        # проверки здесь мало: content на ЭТОМ этапе НЕ пуст — модель
+        # вернула contentСтр = "<think>...рассуждение без питомого JSON...".
+        # content.strip() пуст становится ТОЛЬКО ПОЗЖЕ, в chat(), после
+        # strip_think(). Проверка "not content.strip()" здесь никогда не
+        # срабатывает для этого случая — usage печатается, а WARNING нет.
+        # Запоминаем usage/finish_reason на self, чтобы chat() мог достать
+        # их уже ПОСЛЕ strip_think и дать диагноз для того самого случая,
+        # который реально произошёл в логе.
+        usage = raw.get("usage") or {}
+        self._last_usage = usage
+        self._last_finish_reason = finish_reason
+        if usage:
+            _dbg(f"  usage: prompt_tokens={usage.get('prompt_tokens')}, "
+                f"completion_tokens={usage.get('completion_tokens')}, "
+                f"total_tokens={usage.get('total_tokens')}")
         return content.strip()
 
     def chat(self, system: str, user: str, temperature: float = 0.4,
@@ -579,6 +678,71 @@ class LLMClient:
                      "client")
                 return self.chat(system, user, temperature=temperature,
                                  max_tokens=max_tokens, json_mode=False)
+            # THINK-5: реальный случай (Groq) — chat_template_kwargs /
+            # reasoning_effort / reasoning не тихо игнорируются, а валят
+            # ВЕСЬ запрос отдельным HTTP 400 ("property 'chat_template_kwargs'
+            # is unsupported"). Это отдельная, вторая проверка от той, что
+            # выше: сервер уже мог отверг response_format ПЕРВЫМ 400 (эта
+            # ветка это чинит), а на СЛЕДУЮЩЕМ ретрае (json_mode уже False)
+            # вылезает уже THIS 400 — если его не поймать отдельно, запрос
+            # уходит в общий HTTP-RETRY со ВСЕ ЕЩЁ тем же chat_template_kwargs
+            # в теле и повторяет одну и ту же ошибку до истощения ретраев.
+            #
+            # Отключаем ТОЛЬКО то поле, которое реально названо в тексте
+            # ошибки — не все три сразу (THINK-4 бандлил их одним флагом:
+            # отказ на chat_template_kwargs выбрасывал заодно и
+            # reasoning_effort/reasoning, даже если сервер их прекрасно
+            # принимает и они реально подавляют thinking).
+            #
+            # THINK-6: для reasoning_effort ошибка может значить не
+            # "поле не поддерживается", а "значение неверное" (реальный
+            # текст Groq: "must be one of `none` or `default`" — поле
+            # рабочее, просто "low" не входит в допустимый набор ДЛЯ
+            # ЭТОГО сервера). В этом случае не выбрасываем поле целиком —
+            # подбираем значение из подсказки сервера (предпочитая "none",
+            # раз наша цель — подавить thinking) и запоминаем его именно
+            # для этого base_url, остальным серверам не мешаем.
+            if e.code == 400 and self.api_format == "openai":
+                newly_rejected = []
+                reasoning_effort_fixed = False
+
+                if "reasoning_effort" in detail:
+                    m = _MUST_BE_ONE_OF_RE.search(detail)
+                    candidates = (_BACKTICK_VALUE_RE.findall(m.group(1))
+                                 if m else [])
+                    chosen = ("none" if "none" in candidates
+                             else (candidates[0] if candidates else None))
+                    if (chosen and
+                            _ServerCaps.reasoning_effort_for(self.base_url) != chosen):
+                        _ServerCaps.set_reasoning_effort_value(self.base_url, chosen)
+                        reasoning_effort_fixed = True
+                        _dbg(f"chat(): HTTP 400 says reasoning_effort must "
+                            f"be one of {candidates} — switching to "
+                            f"{chosen!r} for this server and retrying "
+                            f"(detail={detail[:200]!r})")
+                    elif not _ServerCaps.think_field_rejected(
+                            self.base_url, "reasoning_effort"):
+                        newly_rejected.append("reasoning_effort")
+
+                if ("chat_template_kwargs" in detail
+                        and not _ServerCaps.think_field_rejected(
+                            self.base_url, "chat_template_kwargs")):
+                    newly_rejected.append("chat_template_kwargs")
+                if (_BARE_REASONING_FIELD_RE.search(detail)
+                        and not _ServerCaps.think_field_rejected(
+                            self.base_url, "reasoning")):
+                    newly_rejected.append("reasoning")
+
+                if newly_rejected or reasoning_effort_fixed:
+                    for f in newly_rejected:
+                        _ServerCaps.mark_think_field_rejected(self.base_url, f)
+                    if newly_rejected:
+                        _dbg(f"chat(): HTTP 400 naming think-field(s) "
+                            f"{newly_rejected} — disabling just these for "
+                            f"this client and retrying "
+                            f"(detail={detail[:200]!r})")
+                    return self.chat(system, user, temperature=temperature,
+                                     max_tokens=max_tokens, json_mode=json_mode)
             # HTTP-RETRY: любой другой код ошибки от сервера — 402 "кончились
             # кредиты", 5xx, и т.п. Раньше это сразу роняло раунд (см.
             # max_consecutive_failures = 1 в [api]) без единой попытки
@@ -642,6 +806,60 @@ class LLMClient:
         if not stripped and text:
             _dbg("chat(): WARNING — strip_think() returned empty string! "
                  "The model likely returned ONLY a <think> block with no content after it.")
+            # DIAG-CTX-3: РЕАЛЬНЫЙ момент, когда можно отличить context
+            # overflow от "модель просто зависла в рассуждениях" — раньше
+            # эта проверка стояла в _extract_content(), ГДЕ content ЕЩЁ НЕ
+            # ПУСТ (это буквальный текст "<think>...", strip_think() его
+            # выел только здесь). Там condition "not content.strip()" не
+            # мог сработать НИКОГДА для случая "весь ответ ушёл в один
+            # непарный <think>-блок" — то есть ровно для того случая, что
+            # реально произошёл в логе (Groq, qwen3.6: finish_reason=
+            # 'length', completion_tokens=700=max_tokens, content — один
+            # сплошной <think> без ответа после). Используем usage/
+            # finish_reason (openai) или prompt_eval_count/eval_count
+            # (ollama), сохранённые в _extract_content(), чтобы дать
+            # диагноз именно здесь, где известен факт "текст был, но исчез".
+            if self.api_format == "openai":
+                usage = getattr(self, "_last_usage", None) or {}
+                finish_reason = getattr(self, "_last_finish_reason", "")
+                completion_tokens = usage.get("completion_tokens")
+                if completion_tokens is not None:
+                    if finish_reason == "length":
+                        _dbg(
+                            f"  DIAGNOSIS: finish_reason='length', "
+                            f"completion_tokens={completion_tokens} spent "
+                            f"entirely inside the <think> block above — the "
+                            f"model burned its whole max_tokens budget on "
+                            f"reasoning and never reached an actual answer. "
+                            f"Raise max_tokens or force reasoning "
+                            f"suppression (think=false) for this provider."
+                        )
+                    else:
+                        _dbg(
+                            f"  DIAGNOSIS: finish_reason={finish_reason!r} "
+                            f"with completion_tokens={completion_tokens} — "
+                            f"the model stopped on its own INSIDE its "
+                            f"<think> block without producing an answer "
+                            f"(not a token-budget issue — investigate "
+                            f"prompt/sampling)."
+                        )
+            elif self.api_format == "ollama":
+                diag = getattr(self, "_last_ollama_diag", None) or {}
+                pe = diag.get("prompt_eval_count")
+                ec = diag.get("eval_count")
+                nc = diag.get("num_ctx")
+                near_limit = bool(nc and pe is not None and pe >= nc - 64)
+                _dbg(
+                    f"  DIAGNOSIS: prompt_eval_count={pe}/{nc}, "
+                    f"eval_count={ec}. "
+                    + ("Prompt has filled the context window — this is "
+                       "context overflow, NOT a thinking-only glitch. "
+                       "Shrink dsyn/checklist/history sizes or raise num_ctx."
+                       if near_limit else
+                       "Not near the context limit — the model stopped "
+                       "inside its own thinking without an answer; "
+                       "investigate server-side (stop token / filter?).")
+                )
         return stripped
 
     def _json_format_off(self) -> bool:
@@ -727,9 +945,12 @@ class LLMClient:
                 if not cleaned:
                     raise json.JSONDecodeError(
                         "chat_json got empty string after stripping — "
-                        "model sampled EOS as first token (0-1 completion "
-                        "tokens; see LLM_DEBUG prompt_eval_count/eval_count "
-                        "for context-overflow vs sampling-glitch diagnosis)",
+                        "model sampled EOS as first token or spent its "
+                        "whole budget on hidden reasoning (0-1 completion "
+                        "tokens; see LLM_DEBUG for finish_reason/usage "
+                        "[openai-format providers] or prompt_eval_count/"
+                        "eval_count [ollama] for context-overflow vs "
+                        "sampling-glitch diagnosis)",
                         "", 0)
                 result = json.loads(cleaned)
             except LLMUnavailable:

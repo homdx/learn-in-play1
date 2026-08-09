@@ -14,9 +14,27 @@ OpenRouter (openai/gpt-oss-20b:free). Сервер сжёг весь max_tokens 
 на исправленном.
 """
 
+import contextlib
+import io
 import unittest
 
+import llm_client
 from llm_client import LLMClient
+
+
+@contextlib.contextmanager
+def _capture_dbg():
+    """Включает LLM_DEBUG на время теста и перехватывает его вывод (idёт в
+    stderr через print) в StringIO — чтобы assert-ить реальный текст
+    диагноза, а не только факт отсутствия исключения."""
+    orig = llm_client._LLM_DEBUG
+    llm_client._LLM_DEBUG = True
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(buf):
+            yield buf
+    finally:
+        llm_client._LLM_DEBUG = orig
 
 
 class TestReasoningFieldExtraction(unittest.TestCase):
@@ -116,6 +134,184 @@ class TestThinkFalsePayload(unittest.TestCase):
         self.assertEqual(payload.get("think"), False)
         self.assertNotIn("reasoning_effort", payload)
         self.assertNotIn("reasoning", payload)
+
+
+class TestOpenAIFormatContextOverflowDiagnostic(unittest.TestCase):
+    """DIAG-CTX-3: реальный случай (Groq, qwen/qwen3.6-27b) — модель
+    вложила ВСЁ рассуждение прямо в content как литеральный текст
+    "<think>...", без завершающего JSON и без закрывающего тега.
+    _extract_content() видит НЕПУСТОЙ content на своём этапе (это же самый
+    текст "<think>..."), а strip_think() съедает его уже в chat() — то
+    есть ПОЗЖЕ. Первая версия этого фикса проверяла "content.strip() пуст"
+    внутри _extract_content(), где content ещё не пуст НИКОГДА для этого
+    сценария — DIAGNOSIS не печатался вообще, только usage. Правильное
+    место — chat(), сразу после strip_think(), где известно, что текст
+    БЫЛ, а стал пустым. Эти тесты гоняют через chat_json() полностью, а
+    не только _extract_content(), и ловят настоящий DIAGNOSIS в выводе."""
+
+    def setUp(self):
+        self.c = LLMClient("https://api.example", "k", "m", api_format="openai",
+                          retries=0)
+
+    def _patch(self, raw_body: dict):
+        import io, json as _json
+
+        class FakeResp(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(req, timeout=None, context=None):
+            return FakeResp(_json.dumps(raw_body).encode())
+        llm_client.urllib.request.urlopen = fake_urlopen
+
+    def _raw_with_unclosed_think(self, finish_reason, completion_tokens):
+        return {
+            "choices": [{"index": 0, "finish_reason": finish_reason,
+                        "message": {"role": "assistant",
+                                   "content": "<think>\nreasoning with no "
+                                              "closing tag or answer"}}],
+            "usage": {"prompt_tokens": 1813,
+                     "completion_tokens": completion_tokens,
+                     "total_tokens": 1813 + completion_tokens},
+        }
+
+    def test_length_finish_reason_diagnosis_mentions_burned_budget(self):
+        """Точный сценарий из реального лога: finish_reason='length',
+        completion_tokens == потраченный max_tokens, content — один
+        незакрытый <think> без ответа."""
+        self._patch(self._raw_with_unclosed_think("length", 700))
+        with _capture_dbg() as out:
+            with self.assertRaises(Exception):
+                self.c.chat_json("s", "u")
+        text = out.getvalue()
+        self.assertIn("DIAGNOSIS", text)
+        self.assertIn("finish_reason='length'", text)
+        self.assertIn("completion_tokens=700", text)
+        self.assertIn("burned its whole max_tokens budget", text)
+
+    def test_stop_finish_reason_diagnosis_is_distinguishable_from_length(self):
+        """Если модель сама остановилась (finish_reason='stop') внутри
+        <think>, не исчерпав max_tokens — это ДРУГАЯ причина (не бюджет
+        токенов), диагноз должен отличаться от случая 'length'."""
+        self._patch(self._raw_with_unclosed_think("stop", 120))
+        with _capture_dbg() as out:
+            with self.assertRaises(Exception):
+                self.c.chat_json("s", "u")
+        text = out.getvalue()
+        self.assertIn("DIAGNOSIS", text)
+        self.assertIn("finish_reason='stop'", text)
+        self.assertIn("not a token-budget issue", text)
+        self.assertNotIn("burned its whole max_tokens budget", text)
+
+    def test_usage_tokens_logged_for_openai_format(self):
+        raw = {
+            "choices": [{"index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": ""}}],
+            "usage": {"prompt_tokens": 500, "completion_tokens": 0,
+                      "total_tokens": 500},
+        }
+        content = self.c._extract_content(raw)
+        self.assertEqual(content, "")
+
+    def test_no_usage_field_at_all_does_not_crash(self):
+        """Регресс-щит: не все openai-совместимые серверы шлют usage —
+        отсутствие поля не должно ронять _extract_content ни chat()."""
+        self._patch({"choices": [{"index": 0, "finish_reason": "stop",
+                                  "message": {"role": "assistant",
+                                             "content": "<think>no usage field"}}]})
+        with self.assertRaises(Exception):
+            self.c.chat_json("s", "u")  # не должно бросить что-то ДРУГОЕ,
+                                        # кроме ожидаемого JSONDecodeError
+
+
+class TestOllamaContextOverflowDiagnosisMovedCorrectly(unittest.TestCase):
+    """Тот же DIAG-CTX-3 фикс должен работать и для ollama: раньше
+    диагноз (context overflow vs sampling glitch) стоял в
+    _extract_content(), где содержимое ollama-варианта <think>-в-content
+    тоже ещё не пусто на этом этапе — то же самое слепое пятно, что и у
+    openai-ветки, просто для другого провайдера."""
+
+    def setUp(self):
+        self.c = LLMClient("http://localhost:11434", "ollama", "qwen3:8b",
+                          api_format="ollama", retries=0, num_ctx=8192)
+
+    def _patch(self, raw_body: dict):
+        import io, json as _json
+
+        class FakeResp(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(req, timeout=None, context=None):
+            return FakeResp(_json.dumps(raw_body).encode())
+        llm_client.urllib.request.urlopen = fake_urlopen
+
+    def test_near_context_limit_is_flagged_as_overflow(self):
+        self._patch({
+            "message": {"role": "assistant",
+                       "content": "<think>\nunclosed reasoning, no answer"},
+            "prompt_eval_count": 8150, "eval_count": 200,
+            "eval_duration": 12345,
+        })
+        with _capture_dbg() as out:
+            with self.assertRaises(Exception):
+                self.c.chat_json("s", "u")
+        text = out.getvalue()
+        self.assertIn("DIAGNOSIS", text)
+        self.assertIn("context overflow", text)
+
+    def test_far_from_context_limit_is_not_flagged_as_overflow(self):
+        self._patch({
+            "message": {"role": "assistant",
+                       "content": "<think>\nunclosed reasoning, no answer"},
+            "prompt_eval_count": 300, "eval_count": 200,
+            "eval_duration": 12345,
+        })
+        with _capture_dbg() as out:
+            with self.assertRaises(Exception):
+                self.c.chat_json("s", "u")
+        text = out.getvalue()
+        self.assertIn("DIAGNOSIS", text)
+        self.assertNotIn("context overflow", text)
+
+
+class TestChatJsonEmptyStringErrorMessage(unittest.TestCase):
+    """Текст ошибки chat_json() при пустой строке после strip не должен
+    безусловно указывать на ollama-only поля (prompt_eval_count/eval_count)
+    — для openai-формата провайдеров это бесполезная подсказка, там нужно
+    смотреть finish_reason/usage."""
+
+    def test_error_message_mentions_both_provider_diagnostics(self):
+        c = LLMClient("https://api.example", "k", "m", api_format="openai",
+                     retries=0)
+        import io
+
+        class FakeResp(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(req, timeout=None, context=None):
+            import json as _json
+            body = _json.dumps({
+                "choices": [{"index": 0, "finish_reason": "stop",
+                            "message": {"role": "assistant",
+                                       "content": "<think>only thinking</think>"}}]
+            }).encode()
+            return FakeResp(body)
+        import llm_client as _lc
+        orig = _lc.urllib.request.urlopen
+        _lc.urllib.request.urlopen = fake_urlopen
+        try:
+            with self.assertRaises(Exception) as ctx:
+                c.chat_json("s", "u")
+            msg = str(ctx.exception)
+            self.assertIn("finish_reason", msg)
+            self.assertIn("usage", msg)
+            self.assertIn("prompt_eval_count", msg)
+            self.assertIn("openai-format", msg)
+            self.assertIn("ollama", msg)
+        finally:
+            _lc.urllib.request.urlopen = orig
 
 
 if __name__ == "__main__":
