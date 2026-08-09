@@ -667,10 +667,9 @@ def _place_bet_for_player(agent, pid, base_dir, round_no, logger) -> bool:
 
     bet = agent.decide_bet(round_no)
     common.write_json(common.bet_file(pid, base_dir), bet)
-    agent.balance -= bet["amount"]
+    agent.balance -= common.total_bet_amount(bet)
     save_balance(pid, base_dir, agent.balance)
-    bd = bet.get("numbers", bet.get("selection"))
-    logger.write(pid, f"bet: {bet['type']}({bd}) amount={bet['amount']} "
+    logger.write(pid, f"bet: {common.describe_bets(bet)} "
                       f"balance_after={agent.balance}")
     return True
 

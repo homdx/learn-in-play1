@@ -56,6 +56,13 @@ DEF_FAILS_SHOWN        = 4   # сорванных сделок на игрока
 # что диалоги и платные услуги вообще существуют.
 DEF_PERSONA_CHARS      = 2500  # порог сжатия персоны
 DEF_CHECKLIST_CHARS    = 2000  # потолок чек-листа (FIX-19)
+# MULTI-BET-2: с несколькими ставками за раунд чек-листу нужно держать не
+# только долги/обещания, но и таблицу "какие числа/типы закрыты у меня и у
+# остальных игроков за этот раунд" — при max_bets_per_round=1 хватало пары
+# строк, при нескольких ставках на игрока список растёт кратно. Отдельный
+# (больший) потолок применяется автоматически, когда multi-bet включён, и
+# тоже настраивается через ini ([memory] checklist_chars_multi_bet).
+DEF_CHECKLIST_CHARS_MULTI_BET = 3500
 PERSONA_HARD_FACTOR    = 2     # жёсткий потолок = persona_chars * этого
 
 # ── бюджеты токенов на каждый тип вызова LLM ──────────────────────────────
@@ -419,10 +426,9 @@ def _format_history(rounds, window):
     for r in tail:
         bet = r["bet"]
         outcome = "WON" if r["win"] else "lost"
-        bd = bet.get("numbers", bet.get("selection"))
         lines.append(
-            f"  num={r['winning_number']} bet={bet['type']}({bd}) "
-            f"amount={bet['amount']} → {outcome} payout={r['payout']} "
+            f"  num={r['winning_number']} bet={common.describe_bets(bet)} "
+            f"→ {outcome} payout={r['payout']} "
             f"balance_after={r['balance_after']}"
         )
     return "\n".join(lines)
@@ -443,11 +449,10 @@ def _format_public_ledger(entries: list[dict], window: int = 20, exclude_pid: st
     lines = []
     for e in visible[-window:]:
         bet = e.get("bet", {}) or {}
-        bd = bet.get("numbers", bet.get("selection"))
         status = "WON" if e.get("win") else "lost"
         lines.append(
-            f"  r{e.get('round_no', '?')}: {e.get('player_id')} bet {bet.get('type')}({bd}) "
-            f"amount={bet.get('amount')} on number={e.get('winning_number')} → {status} "
+            f"  r{e.get('round_no', '?')}: {e.get('player_id')} bet "
+            f"{common.describe_bets(bet)} on number={e.get('winning_number')} → {status} "
             f"payout={e.get('payout', 0)}"
         )
     return "\n".join(lines) if lines else "(no public results yet)"
@@ -552,13 +557,18 @@ def _format_scoreboard(entries: list[dict], exclude_pid: str = None) -> str:
         a = agg.setdefault(pid, {"staked": 0, "won": 0, "bets": 0, "hits": 0,
                                  "last": None, "types": {}})
         bet = e.get("bet", {}) or {}
-        a["staked"] += bet.get("amount", 0) or 0
+        try:
+            sub_bets = common.normalize_bet_container(bet)
+        except ValueError:
+            sub_bets = []
+        a["staked"] += common.total_bet_amount(bet) if sub_bets else 0
         a["won"]    += e.get("payout", 0) or 0
         a["bets"]   += 1
         a["hits"]   += 1 if e.get("win") else 0
         a["last"]    = e.get("round_no", a["last"])
-        t = bet.get("type", "?")
-        a["types"][t] = a["types"].get(t, 0) + 1
+        for b in sub_bets:
+            t = b.get("type", "?")
+            a["types"][t] = a["types"].get(t, 0) + 1
 
     if not agg:
         return "(no bets have been resolved yet)"
@@ -810,6 +820,21 @@ class PlayerAgent:
 
         self.max_bet_fraction = cfg.getfloat("game", "max_bet_fraction", fallback=0.4)
         self.start_balance    = cfg.getint("game",   "start_balance",    fallback=100)
+        # MULTI-BET-1: сколько РАЗНЫХ ставок игрок может разместить за один
+        # раунд. 1 (по умолчанию) == прежнее поведение, ровно одна ставка,
+        # промпт и формат JSON не меняются вовсе. >1 разрешает игроку
+        # раскладывать бюджет раунда сразу по нескольким числам/ставкам.
+        self.max_bets_per_round = max(1, cfg.getint("game", "max_bets_per_round", fallback=1))
+
+        # MULTI-BET-2: если чек-лист включён и НЕ задан явный checklist_chars
+        # в конфиге, а игра работает в режиме нескольких ставок за раунд —
+        # поднимаем потолок автоматически (иначе таблица "мои числа / чужие
+        # числа" обрезается на первом же раунде с несколькими игроками).
+        # Явный checklist_chars в конфиге всегда имеет приоритет.
+        if self.max_bets_per_round > 1 and not cfg.has_option("memory", "checklist_chars"):
+            self.checklist_chars = cfg.getint(
+                "memory", "checklist_chars_multi_bet",
+                fallback=DEF_CHECKLIST_CHARS_MULTI_BET)
 
         self.balance = load_balance(player_id, base_dir, self.start_balance)
 
@@ -1096,6 +1121,23 @@ class PlayerAgent:
         "bet. Keep whatever actually helps you act, drop whatever you never look at."
     )
 
+    # MULTI-BET-2: отдельная подсказка, добавляется в промпт update_checklist
+    # ТОЛЬКО когда max_bets_per_round > 1. Не переопределяет правило выше
+    # ("ставка — не обязательство"): здесь речь не про долги, а про то, что
+    # в раунде с несколькими ставками игроку самому нужно помнить, какие
+    # числа/типы он уже закрыл, чтобы не дублировать их бессмысленно и не
+    # забыть про диверсификацию — а также какие числа публично закрывают
+    # соперники (из списка "Bets already placed"), если это важно для его
+    # стратегии.
+    _MULTI_BET_CHECKLIST_HINT = (
+        "You may place several bets per round now — also track (as a short "
+        "list, not full sentences) which numbers/selections YOU currently "
+        "have covered this round, so you don't blindly duplicate them next "
+        "time, and note anything worth remembering about which "
+        "numbers/selections OTHER players have publicly covered (from the "
+        "'Bets already placed' list) if it matters for your own strategy. "
+        )
+
     def _checklist_or_default(self):
         text = load_checklist(self.player_id, self.base_dir)
         return _truncate_text(text, self.checklist_chars)
@@ -1242,7 +1284,9 @@ class PlayerAgent:
             f"owed to the wheel, not to each other; only record actual transfers "
             f"or agreed payout splits. Tick off anything "
             f"that was actually settled just now. Note anything they claimed that "
-            f"you have not yet checked against the ledger. Max "
+            f"you have not yet checked against the ledger. "
+            + (self._MULTI_BET_CHECKLIST_HINT if self.max_bets_per_round > 1 else "") +
+            f"Max "
             f"{self.checklist_chars} characters.\n"
             f"{promise_ledger.PROMPT_INSTRUCTIONS}\n"
             f"Return ONLY JSON: {{\"checklist\": \"the full new text\", "
@@ -1349,7 +1393,7 @@ class PlayerAgent:
                 f"Result of {round_tag} (note: this is the ROUND number, separate "
                 f"from the roulette wheel's winning number below): "
                 f"winning_number={last_entry['winning_number']}, "
-                f"bet={last_entry['bet']['type']} amount={last_entry['bet']['amount']} → "
+                f"bet={common.describe_bets(last_entry['bet'])} → "
                 f"{outcome}, payout={last_entry['payout']}, "
                 f"balance={last_entry['balance_after']}.\n\n"
             )
@@ -1411,7 +1455,7 @@ class PlayerAgent:
         if round_no is not None:
             speech_block = speech_cost.format_reflect_summary(
                 self.player_id, self.base_dir, round_no, self.tariff,
-                bet_amount=(last_entry["bet"]["amount"] if last_entry else None))
+                bet_amount=(common.total_bet_amount(last_entry["bet"]) if last_entry else None))
 
         user_msg = (
             result_line
@@ -2179,6 +2223,33 @@ class PlayerAgent:
         public_txt = _format_public_ledger(ledger, window=self.ledger_win_bet,
                                            exclude_pid=self.player_id)
         max_amt  = max(1, int(self.balance * self.max_bet_fraction))
+        multi    = self.max_bets_per_round > 1
+
+        if multi:
+            bet_format = (
+                f"Place your bet(s). You may place UP TO {self.max_bets_per_round} "
+                f"separate bets this round, covering different numbers/selections. "
+                f"Return ONLY JSON:\n"
+                f"{{\"bets\": [ {{\"type\": \"...\", \"numbers\": [...] OR \"selection\": \"...\", "
+                f"\"amount\": N}}, ... up to {self.max_bets_per_round} entries ], "
+                f"\"reasoning\": \"short reason\"}}\n"
+                f"Types: straight(1#,35:1) split(2#,17:1) street(3#,11:1) corner(4#,8:1) "
+                f"sixline(6#,5:1) dozen(sel=1st12/2nd12/3rd12,2:1) "
+                f"column(sel=col1/col2/col3,2:1) "
+                f"even_money(sel=red/black/even/odd/low/high,1:1). "
+                f"The SUM of all 'amount' fields must be ≤ {self.balance}."
+            )
+        else:
+            bet_format = (
+                f"Place your bet. Return ONLY JSON:\n"
+                f"{{\"type\": \"...\", \"numbers\": [...] OR \"selection\": \"...\", "
+                f"\"amount\": N, \"reasoning\": \"short reason\"}}\n"
+                f"Types: straight(1#,35:1) split(2#,17:1) street(3#,11:1) corner(4#,8:1) "
+                f"sixline(6#,5:1) dozen(sel=1st12/2nd12/3rd12,2:1) "
+                f"column(sel=col1/col2/col3,2:1) "
+                f"even_money(sel=red/black/even/odd/low/high,1:1). "
+                f"amount ≤ {self.balance}."
+            )
 
         user_msg = (
             f"Player: {self.player_id}  Balance: {self.balance}  "
@@ -2197,27 +2268,41 @@ class PlayerAgent:
             f"money:\n{score_txt}\n\n"
             f"Public results — the raw ledger lines behind that scoreboard:\n{public_txt}\n\n"
             + open_bets.format_for_prompt(self.base_dir, self.player_id) +
-            f"Place your bet. Return ONLY JSON:\n"
-            f"{{\"type\": \"...\", \"numbers\": [...] OR \"selection\": \"...\", "
-            f"\"amount\": N, \"reasoning\": \"short reason\"}}\n"
-            f"Types: straight(1#,35:1) split(2#,17:1) street(3#,11:1) corner(4#,8:1) "
-            f"sixline(6#,5:1) dozen(sel=1st12/2nd12/3rd12,2:1) "
-            f"column(sel=col1/col2/col3,2:1) "
-            f"even_money(sel=red/black/even/odd/low/high,1:1). "
-            f"amount ≤ {self.balance}."
+            bet_format
         )
         bet = None
         for _ in range(2):
             try:
-                bet = self.client.chat_json(
+                resp = self.client.chat_json(
                     system=self.abstract_prompt + "\nTASK: Place casino bet. JSON only.",
                     user=user_msg, temperature=self.temperature, max_tokens=self.tok_bet
                 )
-                bet.pop("reasoning", None)
-                bet["player_id"] = self.player_id
-                common.validate_bet(bet)
-                if bet["amount"] > self.balance:
-                    bet["amount"] = self.balance
+                resp.pop("reasoning", None)
+
+                if multi and isinstance(resp.get("bets"), list):
+                    sub_bets = resp["bets"]
+                    common.validate_bets({"bets": sub_bets}, max_bets=self.max_bets_per_round)
+                    total = common.total_bet_amount({"bets": sub_bets})
+                    if total > self.balance:
+                        # FIX: не отбрасываем ставку целиком — пропорционально
+                        # уменьшаем каждую под-ставку, чтобы уложиться в баланс.
+                        scale = self.balance / total if total > 0 else 0
+                        remaining = self.balance
+                        for i, b in enumerate(sub_bets):
+                            if i == len(sub_bets) - 1:
+                                b["amount"] = max(1, remaining)
+                            else:
+                                b["amount"] = max(1, int(b["amount"] * scale))
+                                remaining -= b["amount"]
+                        common.validate_bets({"bets": sub_bets}, max_bets=self.max_bets_per_round,
+                                             balance=self.balance)
+                    bet = {"bets": sub_bets, "player_id": self.player_id}
+                else:
+                    resp["player_id"] = self.player_id
+                    common.validate_bet(resp)
+                    if resp["amount"] > self.balance:
+                        resp["amount"] = self.balance
+                    bet = resp
                 break
             except LLMUnavailable:
                 raise        # FIX-17: выключатель наверх, не в заглушку
@@ -2226,6 +2311,9 @@ class PlayerAgent:
                 bet = None
 
         if bet is None:
+            # FIX-обязательная заглушка: 1 монета на красное. НЕ зависит от
+            # max_bets_per_round — при сбое LLM игрок всегда получает ровно
+            # одну простую ставку, а не пытается собрать список ставок.
             bet = {"type": "even_money", "selection": "red",
                    "amount": min(self.balance, 1), "player_id": self.player_id}
             self._log(f"fallback bet used: {bet}")

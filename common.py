@@ -103,14 +103,36 @@ def bet_numbers(bet):
 
 
 def validate_bet(bet):
-    """Простая проверка структуры ставки. Бросает ValueError при ошибке."""
+    """
+    Простая проверка структуры ставки. Бросает ValueError при ошибке.
+
+    BUGFIX-AMOUNT-1: LLM время от времени возвращает amount дробным
+    (5.7) или строкой ("5"). Раньше такое значение проходило валидацию
+    как есть (проверялось только "> 0") и дальше ПУТЕШЕСТВОВАЛО дробным
+    через баланс игрока, payout, balance_*.json на диске и публичный
+    леджер — раунд за раундом, тихо портя целочисленную бухгалтерию игры
+    (тот же класс бага, что чинили для переводов между игроками, см.
+    `int(float(resp.get("transfer", ...)))` в agent_v2.py). Здесь тот же
+    приём: приводим amount к int РОВНО ОДИН РАЗ, в момент валидации, и
+    мутируем сам bet-словарь — дальше по всей цепочке (evaluate_bet,
+    total_bet_amount, запись на диск) читается уже гарантированно целое
+    число, откуда бы ни пришла ставка (single bet, под-ставка в 'bets',
+    результат крупье на диске после рестарта).
+    """
     if "type" not in bet or "amount" not in bet:
         raise ValueError("В ставке должны быть поля 'type' и 'amount'")
     btype = bet["type"]
     if btype not in PAYOUTS:
         raise ValueError(f"Неизвестный тип ставки: {btype}")
-    if bet["amount"] <= 0:
+
+    raw_amount = bet["amount"]
+    try:
+        amount = int(float(raw_amount))
+    except (TypeError, ValueError):
+        raise ValueError(f"Сумма ставки должна быть числом, получено {raw_amount!r}")
+    if amount <= 0:
         raise ValueError("Сумма ставки должна быть положительной")
+    bet["amount"] = amount
 
     if btype in ("straight", "split", "street", "corner", "sixline"):
         nums = bet.get("numbers")
@@ -148,6 +170,87 @@ def evaluate_bet(bet, winning_number):
         amount = bet["amount"]
         return True, amount + amount * odds
     return False, 0
+
+
+# ---------------------------------------------------------------------------
+# MULTI-BET-1: игрок может поставить НЕСКОЛЬКО ставок за раунд одновременно.
+# Формат на диске остаётся обратно совместимым:
+#   - старый (единственная ставка):  {"type": "straight", "numbers": [...], "amount": 5}
+#   - новый (несколько ставок):      {"bets": [ {...}, {...}, ... ]}
+# normalize_bet_container() приводит оба варианта к списку под-ставок, так
+# что весь остальной код (валидация, оценка, отображение) работает с единым
+# списком и не должен знать, один был файл ставки или несколько.
+# ---------------------------------------------------------------------------
+
+def normalize_bet_container(bet):
+    """Возвращает список отдельных под-ставок (всегда list[dict])."""
+    if not isinstance(bet, dict):
+        raise ValueError("Ставка должна быть словарём")
+    if "bets" in bet:
+        sub = bet.get("bets")
+        if not isinstance(sub, list) or not sub:
+            raise ValueError("'bets' должен быть непустым списком ставок")
+        return sub
+    return [bet]
+
+
+def total_bet_amount(bet):
+    """Суммарная сумма всех под-ставок в контейнере (одна или несколько)."""
+    return sum(int(b.get("amount", 0) or 0) for b in normalize_bet_container(bet))
+
+
+def describe_bets(bet):
+    """Человекочитаемое описание одной или нескольких ставок для логов/промптов."""
+    parts = []
+    for b in normalize_bet_container(bet):
+        bd = b.get("numbers", b.get("selection"))
+        parts.append(f"{b.get('type', '?')}({bd}) amount={b.get('amount', '?')}")
+    return "; ".join(parts)
+
+
+def validate_bets(bet, max_bets=None, balance=None):
+    """
+    Валидирует контейнер ставок (одна ставка ИЛИ список 'bets'). Бросает
+    ValueError при любой проблеме:
+      - каждая под-ставка проходит обычную validate_bet();
+      - если задан max_bets — количество под-ставок не должно его превышать;
+      - если задан balance — суммарная сумма всех ставок не должна его
+        превышать (защита от игрока, который пытается поставить больше,
+        чем у него есть, раскладывая сумму по нескольким ставкам).
+    Возвращает список под-ставок при успехе.
+    """
+    subs = normalize_bet_container(bet)
+    if max_bets is not None and len(subs) > max_bets:
+        raise ValueError(
+            f"Слишком много ставок за раунд: {len(subs)} > максимум {max_bets}"
+        )
+    for b in subs:
+        validate_bet(b)
+    if balance is not None:
+        total = sum(b["amount"] for b in subs)
+        if total > balance:
+            raise ValueError(
+                f"Суммарная ставка {total} превышает баланс {balance}"
+            )
+    return subs
+
+
+def evaluate_bets(bet, winning_number):
+    """
+    Оценивает одну или несколько ставок сразу.
+    Возвращает (any_win: bool, total_payout: int, per_bet: list[dict]), где
+    per_bet — [{"bet": <под-ставка>, "win": bool, "payout": int}, ...] —
+    построчная разбивка для детального лога/истории.
+    """
+    per_bet = []
+    total_payout = 0
+    any_win = False
+    for b in normalize_bet_container(bet):
+        win, payout = evaluate_bet(b, winning_number)
+        per_bet.append({"bet": b, "win": win, "payout": payout})
+        total_payout += payout
+        any_win = any_win or win
+    return any_win, total_payout, per_bet
 
 
 # ---------------------------------------------------------------------------

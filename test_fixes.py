@@ -276,7 +276,7 @@ class TestBetAtomicity(GameHarness):
         src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "run_game_v2.py"), encoding="utf-8").read()
         i_bet_file = src.index("common.write_json(common.bet_file(pid, base_dir), bet)")
-        i_deduct = src.index('agent.balance -= bet["amount"]')
+        i_deduct = src.index('agent.balance -= common.total_bet_amount(bet)')
         self.assertLess(i_bet_file, i_deduct,
                         "ставка записывается ПОСЛЕ списания баланса (FIX-3)")
 

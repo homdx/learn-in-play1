@@ -36,16 +36,12 @@ import common
 
 
 def _describe(bet: dict) -> str:
-    """Человекочитаемое поле ставки: 'even_money(red)', 'straight(17)'."""
-    sel = bet.get("selection")
-    nums = bet.get("numbers")
-    if sel:
-        target = str(sel)
-    elif nums:
-        target = ",".join(str(n) for n in nums)
-    else:
-        target = "?"
-    return f"{bet.get('type', '?')}({target})"
+    """
+    Человекочитаемое поле ставки: 'even_money(red)', 'straight(17)'.
+    MULTI-BET-1: bet может содержать несколько под-ставок ("bets": [...]);
+    common.describe_bets() уже умеет и старый плоский, и новый формат.
+    """
+    return common.describe_bets(bet)
 
 
 def read(base_dir: str) -> list:
@@ -65,7 +61,7 @@ def read(base_dir: str) -> list:
             bet = common.read_json(path)
         except Exception:
             continue
-        if isinstance(bet, dict) and bet.get("amount") is not None:
+        if isinstance(bet, dict) and (bet.get("amount") is not None or bet.get("bets")):
             out.append((m.group(1), bet))
     return out
 
@@ -92,7 +88,7 @@ def format_for_prompt(base_dir: str, self_pid: str = None) -> str:
     lines = []
     for pid, bet in placed:
         mark = "  YOU: " if pid == self_pid else f"  {pid}: "
-        lines.append(f"{mark}{_describe(bet)} for {bet.get('amount')} coins")
+        lines.append(f"{mark}{_describe(bet)} for {common.total_bet_amount(bet)} coins total")
     tail = (
         "\nIf a player told you in conversation that they would bet one thing "
         "and the list above shows another, they lied to you — and you still "

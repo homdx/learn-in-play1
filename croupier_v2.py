@@ -33,8 +33,7 @@ def run_round(base_dir, winning_number=None, logger=None):
     # игрока — так итоговый лог раунда содержит сводку ставок сразу
     # перед спином, а не только в момент их размещения диалоговой фазой.
     for pid, bet, _bet_path in bets:
-        bd = bet.get("numbers", bet.get("selection"))
-        recap_msg = f"bet recap before spin: {bet.get('type')}({bd}) amount={bet.get('amount')}"
+        recap_msg = f"bet recap before spin: {common.describe_bets(bet)}"
         if logger:
             logger.write(pid, recap_msg)
         else:
@@ -57,9 +56,10 @@ def run_round(base_dir, winning_number=None, logger=None):
 
     results = []
     for pid, bet, bet_path in bets:
+        per_bet = []
         try:
-            common.validate_bet(bet)
-            win, payout = common.evaluate_bet(bet, winning_number)
+            common.validate_bets(bet)
+            win, payout, per_bet = common.evaluate_bets(bet, winning_number)
         except ValueError as e:
             win, payout = False, 0
             msg = f"Invalid bet ({e}), no payout."
@@ -72,6 +72,7 @@ def run_round(base_dir, winning_number=None, logger=None):
             "player_id": pid,
             "winning_number": winning_number,
             "bet": bet,
+            "bets": per_bet,
             "win": win,
             "payout": payout,
         }
@@ -79,7 +80,7 @@ def run_round(base_dir, winning_number=None, logger=None):
         os.remove(bet_path)
 
         status = f"WON payout={payout}" if win else "lost"
-        msg2 = f"bet={bet['type']} amount={bet['amount']} → {status}"
+        msg2 = f"{common.describe_bets(bet)} → {status}"
         if logger:
             logger.write(pid, msg2)
         else:
