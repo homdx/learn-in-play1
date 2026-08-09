@@ -1138,6 +1138,31 @@ class PlayerAgent:
         "'Bets already placed' list) if it matters for your own strategy. "
         )
 
+    # MULTI-BET-3: та же возможность, но версия для стадий ДО самой ставки
+    # (reflect_betting — сразу после раунда, где переписывается стратегия
+    # в синапсе; plan_round — перед фазой диалогов, где строится повестка).
+    # Раньше про несколько ставок вообще не упоминалось ни там, ни там —
+    # единственное место, где модель узнавала о лимите, было ВНУТРИ самого
+    # decide_bet, то есть В МОМЕНТ ставки, без права подготовиться заранее:
+    # обдумать хедж, договориться о чём-то в диалоге с оглядкой на будущую
+    # раскладку ставок, спланировать это в синапсе. Без этого напоминания
+    # раньше на всех стадиях планирования агент рассуждал как игрок с
+    # ОДНОЙ ставкой, и мысль "поставить на несколько чисел" физически не
+    # успевала родиться до самого момента decide_bet.
+    _MULTI_BET_STRATEGY_HINT = (
+        "Reminder: this game lets you place UP TO {n} SEPARATE bets in a "
+        "single round (e.g. a long-shot straight number plus a safer "
+        "even_money hedge) — factor this into your strategy now, not just "
+        "when you actually place the bet. If splitting your stake across a "
+        "few bets would improve your odds of winning something this game, "
+        "plan for it here.\n\n"
+    )
+
+    def _multi_bet_strategy_hint(self) -> str:
+        if self.max_bets_per_round <= 1:
+            return ""
+        return self._MULTI_BET_STRATEGY_HINT.format(n=self.max_bets_per_round)
+
     def _checklist_or_default(self):
         text = load_checklist(self.player_id, self.base_dir)
         return _truncate_text(text, self.checklist_chars)
@@ -1166,6 +1191,7 @@ class PlayerAgent:
             f"of round {round_no}.\n"
             f"Your balance: {self.balance}. "
             f"Players you can talk to: {available_partners}\n\n"
+            + self._multi_bet_strategy_hint()
             + common.bailout_notice(self.base_dir, round_no)
             + _current_round_notice(round_no)
             + self._first_round_role_block(round_no) +
@@ -1185,7 +1211,13 @@ class PlayerAgent:
             f"what is settled or dead, and add what you intend to do THIS round: who "
             f"you mean to approach and for what, what you owe and to whom, what you "
             f"are owed, and what you must verify against the ledger before paying "
-            f"anyone. Be concrete — name players and amounts. Max "
+            f"anyone. Be concrete — name players and amounts. "
+            + (f"State explicitly HOW MANY separate bets you intend to place this "
+               f"round (1 up to {self.max_bets_per_round}) and on what, before you "
+               f"actually place them — don't default to one without considering "
+               f"whether splitting your stake serves you better. "
+               if self.max_bets_per_round > 1 else "") +
+            f"Max "
             f"{self.checklist_chars} characters.\n"
             # FIX-20d: правка реестра доступна и здесь. Раньше статус можно
             # было сменить только в update_checklist, то есть лишь поговорив
@@ -1415,7 +1447,11 @@ class PlayerAgent:
                 f"Your persona/strategy text (fixed for this game — you cannot "
                 f"edit it, and you are not being asked to):\n{persona}\n\n"
                 f"Your field notes so far:\n{seen}\n\n"
-                f"Update your betting synapse, and add up to "
+                f"Update your betting synapse"
+                + (f", including whether your strategy should use MULTIPLE bets "
+                   f"per round (up to {self.max_bets_per_round}) going forward "
+                   if self.max_bets_per_round > 1 else "") +
+                f", and add up to "
                 f"{FIELDNOTES_PER_ROUND} field notes about how your METHOD is "
                 f"landing at this table: an approach that was rejected and the "
                 f"exact reason given, a price nobody paid, a player who only "
@@ -1434,7 +1470,11 @@ class PlayerAgent:
             persona_block = (
                 f"Current persona/strategy text (the ONLY part of your prompt you can edit):\n"
                 f"{persona}\n\n"
-                f"Update your betting synapse. You may also rewrite your persona/strategy text "
+                f"Update your betting synapse"
+                + (f", including whether your strategy should use MULTIPLE bets "
+                   f"per round (up to {self.max_bets_per_round}) going forward "
+                   if self.max_bets_per_round > 1 else "") +
+                f". You may also rewrite your persona/strategy text "
                 f"(NOT the core game rules — those are fixed and always apply regardless of what "
                 f"you write here; betting, paid services, and negotiation with other players remain "
                 f"available to you no matter how you rewrite this section).\n"
@@ -1459,6 +1499,7 @@ class PlayerAgent:
 
         user_msg = (
             result_line
+            + self._multi_bet_strategy_hint()
             + speech_block +
             f"Current betting synapse:\n{notes or '(empty)'}\n\n"
             f"Round history:\n{hist_text}\n\n"
@@ -2226,18 +2267,38 @@ class PlayerAgent:
         multi    = self.max_bets_per_round > 1
 
         if multi:
+            example_bets = [
+                {"type": "straight", "numbers": [17], "amount": max(1, self.balance // 10)},
+                {"type": "even_money", "selection": "red", "amount": max(1, self.balance // 5)},
+            ][:min(2, self.max_bets_per_round)]
+            example_json = json.dumps(
+                {"bets": example_bets, "reasoning": "spreading risk across two bets"},
+                ensure_ascii=False)
             bet_format = (
-                f"Place your bet(s). You may place UP TO {self.max_bets_per_round} "
-                f"separate bets this round, covering different numbers/selections. "
-                f"Return ONLY JSON:\n"
-                f"{{\"bets\": [ {{\"type\": \"...\", \"numbers\": [...] OR \"selection\": \"...\", "
-                f"\"amount\": N}}, ... up to {self.max_bets_per_round} entries ], "
-                f"\"reasoning\": \"short reason\"}}\n"
+                f"Place your bet(s) for round {round_no}. You may place UP TO "
+                f"{self.max_bets_per_round} SEPARATE bets this round, each covering "
+                f"a different number/selection — this is not a rare edge case, it is "
+                f"a normal, encouraged way to play: splitting your stake across "
+                f"several bets (e.g. one straight number for a big long-shot payout "
+                f"plus one even_money bet to hedge) is often a stronger use of your "
+                f"stake than putting it all on one bet. Decide the number of bets "
+                f"(from 1 up to {self.max_bets_per_round}) yourself, based on your "
+                f"strategy — but actively consider whether more than one serves you "
+                f"better before defaulting to one.\n"
+                f"Return ONLY JSON, ALWAYS as a 'bets' list (even for a single bet, "
+                f"wrap it in the list with one entry — never return a bare "
+                f"{{\"type\": ...}} object at the top level):\n"
+                f"{{\"bets\": [ {{\"type\": \"...\", \"numbers\": [...] OR \"selection\": "
+                f"\"...\", \"amount\": N}}, ... up to {self.max_bets_per_round} entries "
+                f"], \"reasoning\": \"short reason\"}}\n"
+                f"Example with two bets (adapt types/numbers/amounts to your own "
+                f"balance and strategy, do not copy these numbers): {example_json}\n"
                 f"Types: straight(1#,35:1) split(2#,17:1) street(3#,11:1) corner(4#,8:1) "
                 f"sixline(6#,5:1) dozen(sel=1st12/2nd12/3rd12,2:1) "
                 f"column(sel=col1/col2/col3,2:1) "
                 f"even_money(sel=red/black/even/odd/low/high,1:1). "
-                f"The SUM of all 'amount' fields must be ≤ {self.balance}."
+                f"The SUM of all 'amount' fields across every bet in the list must "
+                f"be ≤ {self.balance}."
             )
         else:
             bet_format = (
