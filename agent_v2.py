@@ -569,7 +569,7 @@ def _format_scoreboard(entries: list[dict], exclude_pid: str = None) -> str:
         pnl = a["won"] - a["staked"]
         fav = max(a["types"].items(), key=lambda kv: kv[1])[0] if a["types"] else "?"
         lines.append(
-            f"  {pid}: casino P&L={pnl:+d}c over {a['bets']} bet(s) "
+            f"  {pid}: casino P&L={pnl:+.2f}c over {a['bets']} bet(s) "
             f"(staked {a['staked']}, returned {a['won']}, won {a['hits']}/{a['bets']}), "
             f"mostly {fav}, last bet in r{a['last']}"
         )
@@ -596,7 +596,7 @@ def _format_dsyn_for_prompt(data: dict, recent: int = DEF_DSYN_RECENT,
         for pid, r in rep.items():
             lines.append(
                 f"  {pid}: trust={r.get('trust_score',5)}/10 "
-                f"net={r.get('net',0):+d}c "
+                f"net={r.get('net',0):+.2f}c "
                 f"last_seen=r{r.get('last_seen_round','?')} "
                 f"note='{r.get('reputation_note','')}' "
                 f"intent='{r.get('future_intent','')}'"
@@ -616,7 +616,7 @@ def _format_dsyn_for_prompt(data: dict, recent: int = DEF_DSYN_RECENT,
         for itx in raw[-recent:]:
             lines.append(
                 f"  r{itx.get('round','?')} {itx.get('partner','?')}: "
-                f"net={itx.get('net_transfer',0):+d}c — {itx.get('summary','')}"
+                f"net={itx.get('net_transfer',0):+.2f}c — {itx.get('summary','')}"
             )
         parts.append("\n".join(lines))
 
@@ -987,7 +987,7 @@ class PlayerAgent:
         self._log(f"dialogue synapse too large ({text_size} chars), compressing {len(old_raw)} old entries…")
         old_text = "\n".join(
             f"r{e.get('round','?')} partner={e.get('partner','?')} "
-            f"net={e.get('net_transfer',0):+d} summary={e.get('summary','')}"
+            f"net={e.get('net_transfer',0):+.2f} summary={e.get('summary','')}"
             for e in old_raw
         )
         existing_compressed = dsyn.get("compressed_history", "")
@@ -1224,7 +1224,7 @@ class PlayerAgent:
         user_msg = (
             f"You are {self.player_id}. Round {round_no}. Your conversation with "
             f"{partner_id} just ended.\n"
-            f"Net coins moved between you this conversation: {net_transfer:+d} "
+            f"Net coins moved between you this conversation: {net_transfer:+.2f} "
             f"(positive = you received).\nYour balance is now {self.balance}.\n"
             f"{free_speech_note}\n"
             f"Transcript:\n{conv_txt}\n\n"
@@ -2087,7 +2087,7 @@ class PlayerAgent:
             # свёрнутому числу вторая читалась как выкачивание монет.
             f"Money moved this conversation: you sent {partner_id} "
             f"{_gross_sent} coin(s); {partner_id} sent you {_gross_recv} "
-            f"coin(s); net for you {net_transfer:+d} "
+            f"coin(s); net for you {net_transfer:+.2f} "
             f"(positive=you received).\n"
             f"Judge by BOTH figures: coins returned or paid back are not the "
             f"same as coins never moved.\n"
@@ -2163,7 +2163,7 @@ class PlayerAgent:
         save_dsyn(self.player_id, self.base_dir, dsyn)
         self._log(
             f"dsyn updated for {partner_id}: trust={old['trust_score']}/10 "
-            f"net_total={old['net']:+d}c intent='{old['future_intent'][:60]}'"
+            f"net_total={old['net']:+.2f}c intent='{old['future_intent'][:60]}'"
         )
 
     # ── decide bet ───────────────────────────────────────────────────────
