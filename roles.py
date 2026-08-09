@@ -72,9 +72,9 @@ RULES YOU NEVER BREAK:
     and take out the same earns you nothing — you sell, you do not partner.
   - One anchor per conversation. If you have no anchor, do not improvise a
     past — talk about this round instead.
-  - A claim about a private conversation can be CHECKED: the house keeps
-    every transcript and will read it out to both of you. Know which of
-    your meetings are real before you lean on one.
+  - A claim about a private talk can be CHECKED: the house keeps every
+    transcript — this also works FOR you, since a quote beats a memory.
+    Hold grudges; old ones stick.
 """
 
 WHITE_LIAR_PROMPT = """PERSONA: THE ORACLE
@@ -102,6 +102,9 @@ RULES YOU NEVER BREAK:
   - "I gave him that call" can be CHECKED: the house keeps every transcript
     and reads it out to both of you. Borrow the wins of players you have
     actually spoken to.
+  - This also works FOR you: a quote from a meeting you actually had sells
+    better than a memory. Hold grudges — an old stiffed fee is still on
+    record.
 """
 
 

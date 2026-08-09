@@ -724,6 +724,14 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
 
     turn = 0
     while turn < max_turns:
+        # QUOTE-1: рефлексия-2 срабатывает РОВНО ОДИН раз за диалог для
+        # каждой стороны — у инициатора перед его самой первой репликой
+        # (turn==0), у отвечающего перед его самым первым ответом (тоже
+        # turn==0, но уже ПОСЛЕ того как turn_a получен ниже). На всех
+        # последующих turn это пустая строка: разговор уже содержит то,
+        # что нужно, повторный вызов был бы просто лишним расходом.
+        quote_note_a = (agent_a.reflect_on_partner_dialogues(pid_b, round_no)
+                        if turn == 0 else "")
         # Agent A's turn
         a_is_closing = (closing_for == pid_a)
         turn_a = agent_a.dialogue_turn(
@@ -734,7 +742,8 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             is_initiator=(turn == 0),
             closing_turn=a_is_closing,
             dialogue_free=dialogue_free,
-            max_messages=max_turns * 2
+            max_messages=max_turns * 2,
+            quote_note=quote_note_a
         )
         # FIX-1: только ФАКТИЧЕСКИ проведённый перевод попадает в лог,
         # в conversation и в диалоговую синапсу. Раньше запись делалась
@@ -849,6 +858,14 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             closing_for = pid_b         # B получает один закрывающий ход
 
         # Agent B's turn
+        # QUOTE-1: отвечающая сторона делает СВОЮ рефлексию-2 ровно один
+        # раз — на самом первом ответе (turn==0), сразу после того как
+        # увидела входящую реплику turn_a. incoming_message даёт модели
+        # контекст входящего сообщения при выборе цитаты — например,
+        # чтобы выбрать контр-цитату на конкретное утверждение партнёра.
+        quote_note_b = (agent_b.reflect_on_partner_dialogues(
+                            pid_a, round_no, incoming_message=turn_a["message"])
+                        if turn == 0 else "")
         b_is_closing = (closing_for == pid_b)
         turn_b = agent_b.dialogue_turn(
             partner_id=pid_a,
@@ -858,7 +875,8 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             is_initiator=False,
             closing_turn=b_is_closing,
             dialogue_free=dialogue_free,
-            max_messages=max_turns * 2
+            max_messages=max_turns * 2,
+            quote_note=quote_note_b
         )
         # FIX-1 (симметрично для B)
         raw_b = max(0, int(turn_b.get("transfer") or 0))

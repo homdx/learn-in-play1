@@ -80,8 +80,8 @@ def _ollama_chat_url(base_url: str) -> str:
     return f"{base}/api/chat"
 
 
-_RETRY_AFTER_MS_RE = re.compile(r"try again in\s+([\d.]+)\s*ms", re.IGNORECASE)
-_RETRY_AFTER_S_RE = re.compile(r"try again in\s+([\d.]+)\s*s(?:econds?)?\b", re.IGNORECASE)
+_RETRY_AFTER_MS_RE = re.compile(r"(?:try again|retry)\s+in\s+([\d.]+)\s*ms", re.IGNORECASE)
+_RETRY_AFTER_S_RE = re.compile(r"(?:try again|retry)\s+in\s+([\d.]+)\s*s(?:econds?)?\b", re.IGNORECASE)
 
 
 def _parse_retry_after(e: urllib.error.HTTPError, detail: str):
@@ -96,6 +96,13 @@ def _parse_retry_after(e: urllib.error.HTTPError, detail: str):
     Groq не всегда шлёт заголовок `Retry-After` (виден не в каждом 429), но
     почти всегда пишет точное время текстом в теле ошибки — берём его как
     запасной источник, если заголовка нет.
+
+    RATE-4: Google Gemini (`generativelanguage.googleapis.com`) на 429
+    пишет ДРУГОЙ глагол — не "try again in", а "Please retry in
+    57.062042596s." — старые регулярки требовали ровно фразу "try again
+    in" и не совпадали вообще, поэтому пауза не парсилась и код всегда
+    ждал фиксированные 60 сек вместо честных ~57 из ответа сервера.
+    Регулярки расширены на оба варианта: "try again in" И "retry in".
 
     Возвращает секунды (float) или None, если число не нашлось нигде —
     тогда вызывающий сам решает, чем заменить (обычно фиксированным

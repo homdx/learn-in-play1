@@ -473,6 +473,147 @@ class TestRateLimitPreciseWait(unittest.TestCase):
         self.assertEqual(c.max_retry_after_sec, 180)
 
 
+class TestGeminiRetryAfterParsing(unittest.TestCase):
+    """RATE-4: Google Gemini (generativelanguage.googleapis.com) на 429
+    формулирует паузу по-другому, чем Groq/OpenAI: не "Please try again in
+    820ms", а "Please retry in 57.062042596s." — старые регулярки искали
+    буквально фразу "try again in" и не совпадали вообще ни с чем, из-за
+    чего код всегда ждал фиксированные error_retry_wait_sec (60 сек) вместо
+    честных ~57 из ответа сервера. Реальный случай из лога:
+
+        "Quota exceeded for metric: .../generate_content_free_tier_requests,
+        limit: 20, model: gemini-3.6-flash
+        Please retry in 57.062042596s."
+    """
+
+    def setUp(self):
+        llm_client._Breaker.failures = 0
+        llm_client._ServerCaps.reset()
+        self._orig_sleep = llm_client.time.sleep
+        self.slept = []
+        llm_client.time.sleep = lambda s: self.slept.append(s)
+
+    def tearDown(self):
+        llm_client.time.sleep = self._orig_sleep
+
+    def _err_429(self, body: str, headers: dict = None):
+        import urllib.error, io, email.message
+        h = email.message.Message()
+        for k, v in (headers or {}).items():
+            h[k] = v
+        return urllib.error.HTTPError(
+            "https://generativelanguage.googleapis.com/x", 429,
+            "Too Many Requests", h, io.BytesIO(body.encode()))
+
+    def _patch(self, responses):
+        seq = list(responses)
+
+        def fake_urlopen(req, timeout=None, context=None):
+            nxt = seq.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+        llm_client.urllib.request.urlopen = fake_urlopen
+
+    def _ok(self, text='{"ok":1}'):
+        import io, json as _json
+        class R(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        return R(_json.dumps({"choices": [{"message": {"content": text},
+                                          "finish_reason": "stop"}]}).encode())
+
+    GEMINI_BODY = (
+        '{\n'
+        '  "error": {\n'
+        '    "code": 429,\n'
+        '    "message": "You exceeded your current quota, please check your '
+        'plan and billing details. For more information on this error, head '
+        'to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor '
+        'your current usage, head to: https://ai.dev/rate-limit. \\n'
+        '* Quota exceeded for metric: '
+        'generativelanguage.googleapis.com/generate_content_free_tier_requests, '
+        'limit: 20, model: gemini-3.6-flash\\n'
+        'Please retry in 57.062042596s.",\n'
+        '    "status": "RESOURCE_EXHAUSTED"\n'
+        '  }\n'
+        '}'
+    )
+
+    def test_first_429_parses_gemini_retry_in_seconds_from_body(self):
+        """RATE-1 (первая попытка на вызов): без заголовка Retry-After,
+        текст тела — единственный источник, и он должен быть распознан."""
+        c = LLMClient("https://generativelanguage.googleapis.com/v1beta/openai",
+                     "k", "gemini-3.6-flash", api_format="openai", retries=0)
+        self._patch([self._err_429(self.GEMINI_BODY), self._ok()])
+        c.chat_json("s", "u")
+        self.assertEqual(self.slept, [57.062042596])
+
+    def test_second_consecutive_429_also_parses_gemini_format(self):
+        """Тот же регресс, что RATE-2 чинил для Groq: ВТОРОЙ подряд 429
+        (после того как RATE-1 уже использовал свою единственную попытку)
+        идёт через общий HTTP-RETRY — и должен ждать распарсенные ~57с из
+        тела Gemini, а не фиксированные error_retry_wait_sec=60, как было
+        в реальном логе ("жду 60.0 сек" вместо честных ~57)."""
+        c = LLMClient("https://generativelanguage.googleapis.com/v1beta/openai",
+                     "k", "gemini-3.6-flash", api_format="openai", retries=0,
+                     error_retries=2, error_retry_wait_sec=60)
+        self._patch([
+            self._err_429(self.GEMINI_BODY),  # RATE-1 использует попытку
+            self._err_429(self.GEMINI_BODY),  # второй 429 — тоже Gemini-формат
+            self._ok(),
+        ])
+        c.chat_json("s", "u")
+        self.assertEqual(self.slept, [57.062042596, 57.062042596])
+
+    def test_gemini_retry_after_header_still_takes_priority_if_present(self):
+        """Если Gemini когда-нибудь начнёт слать Retry-After header — он
+        должен побеждать текст тела, как и для всех остальных провайдеров
+        (заголовок всегда приоритетнее текста, см. _parse_retry_after)."""
+        c = LLMClient("https://generativelanguage.googleapis.com/v1beta/openai",
+                     "k", "gemini-3.6-flash", api_format="openai", retries=0)
+        self._patch([
+            self._err_429(self.GEMINI_BODY, headers={"Retry-After": "12"}),
+            self._ok(),
+        ])
+        c.chat_json("s", "u")
+        self.assertEqual(self.slept, [12.0])
+
+    def test_gemini_format_does_not_break_existing_groq_ms_format(self):
+        """Регресс-щит: расширение регулярки под 'retry in' не должно
+        задеть старый путь 'try again in ...ms' (Groq)."""
+        c = LLMClient("https://api.groq.com/openai/v1", "k", "m",
+                     api_format="openai", retries=0)
+        body = ('{"error":{"message":"Rate limit reached. '
+               'Please try again in 820ms.","type":"tokens"}}')
+        self._patch([self._err_429(body), self._ok()])
+        c.chat_json("s", "u")
+        self.assertEqual(self.slept, [0.82])
+
+    def test_gemini_style_retry_in_seconds_without_decimal(self):
+        """Целое число секунд (без дробной части) тоже должно парситься —
+        не только Gemini-style дробные секунды из реального лога."""
+        c = LLMClient("https://generativelanguage.googleapis.com/v1beta/openai",
+                     "k", "gemini-3.6-flash", api_format="openai", retries=0)
+        body = '{"error":{"message":"Quota exceeded. Please retry in 15s.","code":429}}'
+        self._patch([self._err_429(body), self._ok()])
+        c.chat_json("s", "u")
+        self.assertEqual(self.slept, [15.0])
+
+    def test_gemini_cap_still_applies_via_max_retry_after_sec(self):
+        """RATE-3: потолок ожидания должен работать и для Gemini-формата —
+        аномально долгая квота (например суточный лимит) не должна
+        подвешивать прогон на часы, как и для Groq."""
+        c = LLMClient("https://generativelanguage.googleapis.com/v1beta/openai",
+                     "k", "gemini-3.6-flash", api_format="openai", retries=0,
+                     max_retry_after_sec=180)
+        body = '{"error":{"message":"Quota exceeded. Please retry in 3600s.","code":429}}'
+        self._patch([self._err_429(body)])
+        with self.assertRaises((RuntimeError, Exception)):
+            c.chat_json("s", "u")
+        self.assertEqual(self.slept, [], "не должен был спать вообще — сразу упасть")
+
+
 class TestStubSubclassCompatibility(Base):
 
     def test_subclass_without_init_still_works(self):

@@ -17,6 +17,7 @@ import re
 from datetime import datetime
 
 import common
+import dialogue_archive
 import open_bets
 import promise_ledger
 import roles
@@ -78,7 +79,27 @@ DEF_TOKENS = {
     "update_dsyn": 350,
     "compress":    500,
     "checklist":   700,
+    "quote_reflect": 2000,
 }
+
+# COLOR-1: список красных/чёрных номеров, построенный из common.RED_NUMBERS
+# / common.BLACK_NUMBERS — той же таблицы, что реально использует крупье.
+# Раньше цвет конкретного номера нигде игроку не показывался: он должен
+# был знать раскладку рулетки из общих знаний модели. В реальном прогоне
+# игрок продал партнёру (за 33 монеты) "хедж" вида "70 на red + 5 на 36
+# как противоположный цвет" — но 36 КРАСНОЕ число, то есть хедж на деле
+# удваивал ставку в одну сторону, а не страховал её. Крупье посчитал бы
+# спин правильно в любом случае (RED_NUMBERS — источник истины для кода),
+# но стратегия обеих сторон была построена на факте, которого не было.
+# Даём таблицу текстом везде, где игроки решают/обсуждают ставки на цвет.
+_RED_NUMS_TXT = ",".join(str(n) for n in sorted(common.RED_NUMBERS))
+_BLACK_NUMS_TXT = ",".join(str(n) for n in sorted(common.BLACK_NUMBERS))
+COLOR_TABLE_HINT = (
+    f"Wheel colors (get this from the table below, not memory or a "
+    f"partner's claim — a wrong guess turns a hedge into a duplicate bet "
+    f"on the same outcome): red = {_RED_NUMS_TXT}; black = {_BLACK_NUMS_TXT}; "
+    f"0 is neither.\n"
+)
 
 # ─────────────────────────────────────────────────────── file helpers ──────
 
@@ -87,6 +108,26 @@ def notes_file(pid, base_dir):
 
 def history_file(pid, base_dir):
     return os.path.join(base_dir, f"history_{pid}.json")
+
+def quote_notes_file(pid, base_dir):
+    """
+    QUOTE-1: заметка-цитата per (я, партнёр) — результат "рефлексии-2".
+    Отдельный файл на игрока, ключ внутри — id партнёра, значение — одна
+    запись {round_no, quote_text, quote_round, quote_from, note}.
+    quote_text — ТОЧНЫЙ текст, который код взял из архива диалогов; модель
+    его никогда не перепечатывает сама (см. reflect_on_partner_dialogues).
+    """
+    return os.path.join(base_dir, f"quote_notes_{pid}.json")
+
+def load_quote_notes(pid, base_dir) -> dict:
+    if os.path.exists(quote_notes_file(pid, base_dir)):
+        return common.read_json(quote_notes_file(pid, base_dir))
+    return {}
+
+def save_quote_note(pid, base_dir, partner_id, entry: dict):
+    notes = load_quote_notes(pid, base_dir)
+    notes[str(partner_id)] = entry
+    common.write_json(quote_notes_file(pid, base_dir), notes)
 
 def dsyn_file(pid, base_dir):
     return os.path.join(base_dir, f"dsyn_{pid}.json")
@@ -799,6 +840,7 @@ class PlayerAgent:
         self.tok_update_dsyn = _tok("update_dsyn")
         self.tok_compress    = _tok("compress")
         self.tok_checklist   = _tok("checklist")
+        self.tok_quote_reflect = _tok("quote_reflect")
 
         # FIX-11: объём памяти агента — секция [memory]
         def _mem(name, default):
@@ -826,6 +868,17 @@ class PlayerAgent:
         # раскладывать бюджет раунда сразу по нескольким числам/ставкам.
         self.max_bets_per_round = max(1, cfg.getint("game", "max_bets_per_round", fallback=1))
 
+        # QUOTE-1: рефлексия-2 (архив разговоров с конкретным партнёром +
+        # выбор точной цитаты). Полностью опциональна — по умолчанию ВЫКЛ,
+        # т.к. добавляет отдельный LLM-вызов на КАЖДУЮ сторону КАЖДОГО
+        # диалога (инициатор — перед своей первой репликой, отвечающий —
+        # перед своим первым ответом). При enabled=False ни вызова, ни
+        # лишнего текста в промптах не появляется вообще.
+        self.quote_reflection_enabled = cfg.getboolean(
+            "game", "quote_reflection_enabled", fallback=False)
+        self.quote_reflection_max_lines = cfg.getint(
+            "memory", "quote_reflection_max_lines", fallback=30)
+
         # MULTI-BET-2: если чек-лист включён и НЕ задан явный checklist_chars
         # в конфиге, а игра работает в режиме нескольких ставок за раунд —
         # поднимаем потолок автоматически (иначе таблица "мои числа / чужие
@@ -850,6 +903,13 @@ class PlayerAgent:
             if player_id not in players:
                 players = players + [player_id]
             self.roles = roles.parse_roles(cfg, players)
+        # QUOTE-2: полный список игроков за столом нужен отдельно от self.roles —
+        # чтобы при определении "чей архив проверить" не гадать имя из прозы
+        # регуляркой, а сверять ответ модели со списком РЕАЛЬНО существующих
+        # игроков (см. _pick_relevant_archive_partner).
+        self.all_players = [p.strip() for p in
+                           cfg.get("game", "players", fallback="").split(",")
+                           if p.strip()] or [player_id]
         self.role           = self.roles.role_of(player_id)
         self.persona_locked = self.roles.is_locked(player_id)
 
@@ -1837,11 +1897,203 @@ class PlayerAgent:
                 return True
         return False
 
+    # ── QUOTE-1/2: рефлексия-2 — архив разговоров с ОДНИМ партнёром ────────
+
+    def _pick_relevant_archive_partner(self, current_partner_id: str,
+                                       incoming_message: str) -> str:
+        """
+        QUOTE-2: входящее сообщение может быть заявлением не про самого
+        говорящего, а про ТРЕТЬЕГО игрока — «ты обещал player5 ставить
+        чёрное» касается архива {я↔player5}, а не {я↔{current_partner_id}}.
+        Один маленький LLM-вызов определяет, чей архив реально релевантен;
+        по умолчанию (при любой неопределённости, ошибке или отсутствии
+        других игроков) — безопасный откат на текущего собеседника, то
+        есть прежнее поведение QUOTE-1 в точности воспроизводится.
+
+        Имя целевого игрока проверяется по self.all_players — модель не
+        может "изобрести" несуществующего игрока и заставить нас читать
+        файл, которого нет (dialogue_archive и так вернёт пустоту на
+        несуществующий id, но валидация здесь дешевле и понятнее в логах).
+        """
+        others = [p for p in self.all_players
+                 if p != self.player_id and p != current_partner_id]
+        if not others:
+            return current_partner_id
+        try:
+            resp = self.client.chat_json(
+                system=self.abstract_prompt +
+                      "\nTASK: Identify which player's archive is relevant "
+                      "to a claim. JSON only.",
+                user=(
+                    f"You are {self.player_id}, talking to {current_partner_id}. "
+                    f"They just said:\n  \"{incoming_message}\"\n\n"
+                    f"Other players at this table (not {current_partner_id}, "
+                    f"not you): {others}\n\n"
+                    f"Does this message make a claim about a past conversation "
+                    f"between YOU and ONE of these OTHER players — for example "
+                    f"\"you promised player5 to bet black\" is a claim about "
+                    f"your own past dialogue with player5, not with "
+                    f"{current_partner_id}? If so, name that player.\n"
+                    f"Return ONLY JSON: {{\"archive_with\": \"<exact id from "
+                    f"the list above>\", or null if the claim is about "
+                    f"{current_partner_id} themself or nothing needs checking}}\n"
+                    f"Do not explain your reasoning in prose — output the JSON "
+                    f"object only, with no text before or after it."
+                ),
+                temperature=self.temperature, max_tokens=self.tok_quote_reflect
+            )
+            target = resp.get("archive_with")
+        except LLMUnavailable:
+            raise
+        except Exception as e:
+            self._log(f"_pick_relevant_archive_partner failed: {e}")
+            return current_partner_id
+        if isinstance(target, str) and target in others:
+            return target
+        return current_partner_id
+
+    def reflect_on_partner_dialogues(self, partner_id: str, round_no: int,
+                                     incoming_message: str = None) -> str:
+        """
+        Отдельная от betting/dsyn/checklist рефлексия, посвящённая ТОЛЬКО
+        прошлым разговорам с ОДНИМ конкретным партнёром. Вызывается дважды
+        за диалог, из run_dialogue():
+          - у ИНИЦИАТОРА — перед его первой репликой (incoming_message=None);
+          - у ОТВЕЧАЮЩЕГО — после первой входящей реплики партнёра, перед
+            своим первым ответом (incoming_message=та реплика).
+
+        QUOTE-2: у ОТВЕЧАЮЩЕГО (incoming_message задан) сначала решается,
+        чей архив реально нужен — свой с ТЕКУЩИМ собеседником (как раньше)
+        или свой с ДРУГИМ игроком, если входящее сообщение — заявление про
+        третье лицо (см. _pick_relevant_archive_partner). У ИНИЦИАТОРА эта
+        развилка не нужна и не делается — incoming_message=None однозначно
+        означает архив с текущим партнёром, как и было в QUOTE-1.
+
+        "Нельзя исказить": модель НИКОГДА не перепечатывает цитату сама —
+        она только называет НОМЕР строки в пронумерованном списке, который
+        мы сами построили из файлов диалогов на диске (dialogue_archive).
+        Точный текст в файл заметки кладёт этот же код, тем же куском, что
+        строил список, — генерация текста моделью не участвует нигде между
+        "что реально было сказано" и "что легло в заметку".
+
+        Полностью отключается конфигом (game.quote_reflection_enabled,
+        по умолчанию False) — тогда не делает ни одного вызова LLM и не
+        возвращает ни байта текста для промпта. Определение "чей архив
+        нужен" (QUOTE-2) — не отдельный флаг, а часть того же тумблера:
+        при incoming_message оно добавляет ровно ОДИН лишний вызов сверх
+        уже существовавшего в QUOTE-1.
+
+        Возвращает готовый блок текста для вставки в dialogue_turn (может
+        быть пустой строкой).
+        """
+        if not self.quote_reflection_enabled:
+            return ""
+
+        target_id = partner_id
+        cross_check = False
+        if incoming_message:
+            target_id = self._pick_relevant_archive_partner(
+                partner_id, incoming_message)
+            cross_check = (target_id != partner_id)
+
+        history = dialogue_archive.full_history(self.base_dir, self.player_id,
+                                                 target_id)
+        if not history:
+            # Файл-уровневый факт: разговоров не было. Дёшево и детерминированно
+            # — вызывать LLM ради констатации пустоты незачем.
+            self._log(f"QUOTE REFLECT vs {target_id}"
+                     + (f" (redirected from {partner_id})" if cross_check else "")
+                     + ": no prior dialogue exists")
+            return (f"(You have never had a dialogue with {target_id} before "
+                    f"this one — nothing to bring up from the past.)\n\n")
+
+        window = history[-self.quote_reflection_max_lines:]
+        listing = "\n".join(
+            f"  [{i}] r{h['round_no']} {h['from']}: {h['message']}"
+            for i, h in enumerate(window)
+        )
+        who_line = (
+            f"{partner_id} just made a claim about your past dialogue with "
+            f"{target_id} — below is YOUR history with {target_id}, not with "
+            f"{partner_id}.\n"
+            if cross_check else ""
+        )
+        incoming_block = (
+            f"\n{partner_id} just opened this round's conversation with:\n"
+            f"  \"{incoming_message}\"\n"
+            if incoming_message else ""
+        )
+        user_msg = (
+            f"You are {self.player_id}. You are about to talk to {partner_id} "
+            f"in round {round_no}.\n"
+            f"{who_line}\n"
+            f"Your COMPLETE past conversation history with {target_id}, across "
+            f"all previous rounds, word for word, each line numbered:\n"
+            f"{listing}\n"
+            f"{incoming_block}\n"
+            f"Pick AT MOST ONE numbered line above that would actually help you "
+            f"now — to call out a broken promise, back up a claim, catch a "
+            f"contradiction, or reinforce a threat/deal. Most rounds nothing "
+            f"needs bringing up — only pick one if it genuinely helps.\n"
+            f"Return ONLY JSON: {{\"quote_index\": N or null, \"note\": "
+            f"\"why this helps now, <=200 chars, empty if quote_index is null\"}}\n"
+            f"Do not explain your reasoning in prose — output the JSON object "
+            f"only, with no text before or after it."
+        )
+        try:
+            resp = self.client.chat_json(
+                system=self.abstract_prompt +
+                      "\nTASK: Review your own past dialogue history with one "
+                      "partner. JSON only.",
+                user=user_msg, temperature=self.temperature,
+                max_tokens=self.tok_quote_reflect
+            )
+            idx = resp.get("quote_index")
+            note = str(resp.get("note", "") or "")[:200]
+        except LLMUnavailable:
+            raise
+        except Exception as e:
+            self._log(f"reflect_on_partner_dialogues failed for {target_id}: {e}")
+            return ""
+
+        quote_text = quote_round = quote_from = None
+        if isinstance(idx, int) and 0 <= idx < len(window):
+            h = window[idx]
+            quote_text, quote_round, quote_from = h["message"], h["round_no"], h["from"]
+
+        save_quote_note(self.player_id, self.base_dir, target_id, {
+            "round_no": round_no, "quote_text": quote_text,
+            "quote_round": quote_round, "quote_from": quote_from, "note": note,
+            "raised_by": partner_id if cross_check else None,
+        })
+
+        redirect_tag = f" (redirected from {partner_id})" if cross_check else ""
+        if quote_text is None:
+            self._log(f"QUOTE REFLECT vs {target_id}{redirect_tag}: "
+                     f"no quote picked ({len(window)} lines available)")
+            return f"{note}\n\n" if note else ""
+        self._log(f"QUOTE REFLECT vs {target_id}{redirect_tag}: picked "
+                 f"[{quote_from}, r{quote_round}] "
+                 f"\"{quote_text[:80]}{'…' if len(quote_text) > 80 else ''}\"")
+        label = (f"past dialogues with {target_id} (relevant to {partner_id}'s "
+                f"claim)" if cross_check else f"past dialogues with {target_id}")
+        return (
+            f"QUOTE NOTE (from your own reflection on {label}): {note}\n"
+            f"Saved quote — {quote_from}, round {quote_round}, exact words pulled "
+            f"by the casino from the table's own record, not retyped by you: "
+            f"\"{quote_text}\"\n"
+            f"If you reference the round this was said in, use round {quote_round} "
+            f"exactly — do not guess or shift it to a different round.\n"
+            f"You may quote it verbatim, paraphrase it, or ignore it now — "
+            f"your call.\n\n"
+        )
+
     def dialogue_turn(self, partner_id: str, partner_balance: int,
                       conversation: list[dict], round_no: int,
                       is_initiator: bool, closing_turn: bool = False,
                       dialogue_free: bool = False,
-                      max_messages: int = 8) -> dict:
+                      max_messages: int = 8,
+                      quote_note: str = "") -> dict:
         # XFER-FREE: `dialogue_free` — уже прошёл перевод в ЭТОМ диалоге
         # (взводится в run_dialogue ДО этого вызова). Отдельно от
         # `speech_is_free` (роль, действует во всех диалогах игрока):
@@ -1921,7 +2173,11 @@ class PlayerAgent:
                 f"further. If you agreed to pay {partner_id} anything in this "
                 f"conversation, set 'transfer' to that amount NOW — otherwise the "
                 f"deal simply does not happen and {partner_id} will record you as "
-                f"someone who agreed and did not pay. Otherwise just close politely."
+                f"someone who agreed and did not pay. Otherwise just close politely.\n"
+                f"This line is the last thing on record for this conversation — "
+                f"you may use it to state a closing summary of what was and wasn't "
+                f"agreed, in your own words. It is exact, permanent, and quotable "
+                f"back to you later exactly as written, so make it count."
             )
         elif len(conversation) == 0:
             role_hint = (
@@ -1956,6 +2212,7 @@ class PlayerAgent:
             f"Dialogue with {partner_id} (their balance ≈{partner_balance}). "
             f"Round {round_no}. {role_hint}\n"
             f"{stance_hint}\n"
+            + COLOR_TABLE_HINT
             + self._checklist_block(
                 "YOUR CHECKLIST (your own agenda — this is what you came to do):") +
             f"Dialogue synapse for {partner_id}:\n{dsyn_txt}\n\n"
@@ -1968,6 +2225,7 @@ class PlayerAgent:
             f"Your own recent rounds (fact-check any claim you or {partner_id} "
             f"make about YOUR results against this — do not rely on memory or "
             f"guesswork about what you won or lost):\n{hist_txt}\n\n"
+            + quote_note +
             f"Conversation so far:\n{conv_txt or '(just started)'}\n\n"
             + _dialogue_running_totals(conversation, self.player_id, partner_id)
             # FIX-20b: раньше due_reminder стоял ТОЛЬКО в plan_round, хотя
@@ -1997,7 +2255,12 @@ class PlayerAgent:
             f"\"deal, I agree, I'll send it\" together with done=true means the money is "
             f"never sent, the deal does not happen, and {partner_id} records you as "
             f"someone who agreed and defaulted. Agree and pay in one move, or leave "
-            f"done=false and pay on your next turn.\n\n"
+            f"done=false and pay on your next turn.\n"
+            f"If you set done=true here, this message becomes the last word YOU get "
+            f"in this conversation — a good closing line (a summary of what was "
+            f"agreed, a warning, a claim you want on record) is exact and permanent, "
+            f"and can be quoted back to you word for word in a future conversation, "
+            f"by you or by {partner_id}.\n\n"
             f"Your message must be different from anything already said above.\n\n"
             f"Return ONLY JSON:\n"
             f"{{\"message\": \"your text\",\n"
@@ -2298,7 +2561,8 @@ class PlayerAgent:
                 f"column(sel=col1/col2/col3,2:1) "
                 f"even_money(sel=red/black/even/odd/low/high,1:1). "
                 f"The SUM of all 'amount' fields across every bet in the list must "
-                f"be ≤ {self.balance}."
+                f"be ≤ {self.balance}.\n"
+                + COLOR_TABLE_HINT
             )
         else:
             bet_format = (
@@ -2309,7 +2573,8 @@ class PlayerAgent:
                 f"sixline(6#,5:1) dozen(sel=1st12/2nd12/3rd12,2:1) "
                 f"column(sel=col1/col2/col3,2:1) "
                 f"even_money(sel=red/black/even/odd/low/high,1:1). "
-                f"amount ≤ {self.balance}."
+                f"amount ≤ {self.balance}.\n"
+                + COLOR_TABLE_HINT
             )
 
         user_msg = (

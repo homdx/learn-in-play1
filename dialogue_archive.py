@@ -182,6 +182,41 @@ def lookup(table_dir: str, listener: str, speaker: str,
 
 # ── блоки для промпта ────────────────────────────────────────────────────
 
+def full_history(table_dir: str, pid_x: str, pid_y: str,
+                 max_chars: int = MAX_EVIDENCE_CHARS) -> list[dict]:
+    """
+    QUOTE-1: ВСЯ переписка pid_x↔pid_y — реплики ОБЕИХ сторон, по ВСЕМ
+    раундам, в хронологическом порядке. В отличие от lookup() (который
+    берёт слова только ОДНОЙ стороны, для проверки чужого утверждения о
+    третьем лице), это нужно для собственной рефлексии игрока над своими
+    же прошлыми разговорами с конкретным партнёром — там важен весь обмен
+    репликами, а не только то, что сказал говорящий.
+
+    Возвращает [{"round_no": int, "from": str, "message": str}, ...].
+    Пустой список — если эти двое никогда не разговаривали (файл-уровневый
+    факт, тот же принцип, что и STATUS_NO_RECORD в lookup()).
+    """
+    want = {_norm(pid_x), _norm(pid_y)}
+    out = []
+    for r, a, b, path in iter_dialogue_files(table_dir):
+        if {_norm(a), _norm(b)} != want:
+            continue
+        data = load_conversation(path)
+        if data is None:
+            continue
+        for turn in data.get("conversation", []):
+            if not isinstance(turn, dict):
+                continue
+            msg = str(turn.get("message", "")).strip()
+            if not msg or msg == "(…)":
+                continue
+            if len(msg) > max_chars:
+                msg = msg[:max_chars].rstrip() + " …"
+            out.append({"round_no": r, "from": turn.get("from"), "message": msg})
+    out.sort(key=lambda e: e["round_no"])
+    return out
+
+
 def format_evidence(table_dir: str, listener: str, speaker: str,
                     round_no: int | None, claim: str = "") -> str:
     """
