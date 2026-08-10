@@ -262,6 +262,29 @@ class _ServerCaps:
     def set_reasoning_effort_value(cls, base_url: str, value: str):
         cls.reasoning_effort_value[base_url] = value
 
+    # MODEL-FALLBACK-2: реальный случай — с тремя моделями в списке
+    # каждый НОВЫЙ вызов chat_json() (новое решение агента: план раунда,
+    # следующий ход, реплика в диалоге — это ОТДЕЛЬНЫЕ вызовы) начинал
+    # перебор моделей заново с ПЕРВОЙ, даже если она уже была признана
+    # исчерпанной минуту назад. Gemini free tier даёт daily-квоту
+    # ("generate_content_free_tier_requests, limit: 20") — она не
+    # восстанавливается за минуты, так что каждый следующий вызов заново
+    # тратил ~6-7 минут (полный цикл retries/error_retries на мёртвой
+    # модели), прежде чем снова дойти до рабочей. Со стороны это выглядело
+    # как "ходит по кругу" — и это было им буквально, отсюда и жалоба.
+    # Запоминаем позицию ПОСЛЕДНЕЙ РАБОЧЕЙ модели в списке для этого
+    # base_url — следующий вызов chat_json() (от ЛЮБОГО игрока/клиента,
+    # делящего один base_url) начинает перебор СРАЗУ с неё, а не с нуля.
+    current_model_index: dict[str, int] = {}
+
+    @classmethod
+    def get_model_index(cls, base_url: str) -> int:
+        return cls.current_model_index.get(base_url, 0)
+
+    @classmethod
+    def set_model_index(cls, base_url: str, idx: int):
+        cls.current_model_index[base_url] = idx
+
     @classmethod
     def rejects_json_format(cls, base_url: str) -> bool:
         return cls.no_json_format.get(base_url, False)
@@ -283,6 +306,7 @@ class _ServerCaps:
         cls.no_json_format.clear()
         cls.rejected_think_fields.clear()
         cls.reasoning_effort_value.clear()
+        cls.current_model_index.clear()
 
 
 class _Breaker:
@@ -317,7 +341,36 @@ class LLMClient:
                  max_retry_after_sec: int = 180):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self.model = model
+        # MODEL-FALLBACK-1: `model` может быть списком через запятую
+        # ("model-a, model-b, model-c") — тогда при исчерпании ретраев на
+        # текущей модели chat_json() переключается на следующую в списке,
+        # начиная attempts заново уже на ней. self.model остаётся ОДНИМ
+        # текущим активным именем (то, что реально читает _build_request)
+        # — именно оно и меняется при переключении; весь остальной код,
+        # который просто читает self.model, ничего не знает про список и
+        # продолжает работать как раньше. Одно имя без запятой даёт список
+        # из одного элемента — поведение не отличается от версии без этой
+        # фичи.
+        self.models = [m.strip() for m in str(model).split(",") if m.strip()]
+        if not self.models:
+            self.models = [model]
+        # MODEL-FALLBACK-3: реальный случай — конфиг содержал одну и ту же
+        # модель ДВАЖДЫ подряд ("gemini-3.6-flash, gemini-3.6-flash,
+        # gemini-3.5-flash"), скорее всего опечатка при копировании строки.
+        # Без дедупликации переключение "на следующую модель" честно
+        # переключалось — просто на строку с тем же именем, и вызов
+        # повторял тот же самый провал ещё раз (лишний полный цикл
+        # retries/error_retries на заведомо мёртвой модели — Gemini free
+        # tier это ~7 минут впустую). Порядок первого появления сохраняем,
+        # повторы молча выбрасываем.
+        seen = set()
+        deduped = []
+        for m in self.models:
+            if m not in seen:
+                seen.add(m)
+                deduped.append(m)
+        self.models = deduped
+        self.model = self.models[0]
         self.api_format = api_format
         self.num_ctx = num_ctx
         self.think = think
@@ -878,13 +931,84 @@ class LLMClient:
     def chat_json(self, system: str, user: str, temperature: float = 0.4,
                   max_tokens: int = 400) -> dict:
         """
+        MODEL-FALLBACK-1/2: если self.models содержит больше одной модели —
+        когда текущая исчерпывает СВОИ собственные ретраи (RETRY-1 внутри
+        _chat_json_one_model), переключаемся на следующую модель в списке
+        и пробуем её с нуля (полный набор attempts заново), вместо того
+        чтобы сразу поднимать исключение наверх. Только если ВСЕ модели
+        списка исчерпаны за этот проход — пробрасываем последнюю ошибку
+        вызывающему, точно как раньше делала одна модель.
+
+        LLMUnavailable (предохранитель) тоже даёт шанс следующей модели:
+        шесть подряд сбоев ОДНОЙ модели могут значить, что перегружена
+        именно она (например, у Groq/Gemini лимиты TPM/TPD/суточная квота
+        считаются ПО МОДЕЛИ, не по серверу в целом) — соседняя модель того
+        же провайдера вполне может отвечать нормально. Наверх LLMUnavailable
+        уходит, только если она же оказалась последней ошибкой ПОСЛЕДНЕЙ
+        модели прохода — внешний контракт (агент не гасит это исключение, а
+        прокидывает дальше) не меняется, независимо от того, сколько моделей
+        внутри перепробовано.
+
+        MODEL-FALLBACK-2: реальный случай — с тремя моделями каждый НОВЫЙ
+        вызов chat_json() (а это отдельный вызов на каждое решение агента:
+        план раунда, следующий ход, реплика в диалоге — не один вызов на
+        весь раунд) раньше ВСЕГДА начинал перебор с models[0], даже если
+        она была признана мёртвой минуту назад с суточной квотой (Gemini
+        free tier: "generate_content_free_tier_requests, limit: 20" — не
+        восстанавливается за минуты). Со стороны это выглядело как "ходит
+        по кругу", и было им буквально: 6-7 минут впустую на каждый вызов,
+        прежде чем снова дойти до рабочей модели. Теперь стартовая позиция
+        перебора берётся из _ServerCaps (общая для всех клиентов на этот
+        base_url) — начинаем сразу с последней РАБОЧЕЙ модели, а не с нуля.
+        Если весь проход всё равно провалился — сбрасываем позицию на 0,
+        чтобы СЛЕДУЮЩИЙ внешний вызов не залип на последней модели прохода
+        (к тому моменту, скорее всего, уже прошло достаточно реального
+        времени, чтобы имело смысл заново попробовать первую по счёту).
+        """
+        models = getattr(self, "models", None) or [getattr(self, "model", None)]
+        n = len(models)
+        base_url = getattr(self, "base_url", "")
+        start = _ServerCaps.get_model_index(base_url) % n
+        last_exc = None
+        on_retry = getattr(self, "on_retry", None)
+        for step in range(n):
+            idx = (start + step) % n
+            model = models[idx]
+            self.model = model
+            try:
+                result = self._chat_json_one_model(
+                    system, user, temperature=temperature, max_tokens=max_tokens)
+                _ServerCaps.set_model_index(base_url, idx)
+                return result
+            except Exception as e:
+                last_exc = e
+                if step < n - 1:
+                    next_model = models[(idx + 1) % n]
+                    msg = (f"model {model!r} failed ({type(e).__name__}: {e}), "
+                          f"switching to next model in list: {next_model!r}")
+                    if on_retry:
+                        on_retry(msg)
+                    _dbg(f"chat_json(): {msg}")
+                    continue
+                _ServerCaps.set_model_index(base_url, 0)
+                raise
+        raise last_exc   # недостижимо (models никогда не пуст), но пусть будет явно
+
+    def _chat_json_one_model(self, system: str, user: str,
+                             temperature: float = 0.4,
+                             max_tokens: int = 400) -> dict:
+        """
         Как chat(), но парсит ответ как JSON (снимая ``` обёртку при
-        необходимости).
+        необходимости). Работает на self.model, ТЕКУЩЕМ в момент вызова —
+        переключением между несколькими моделями занимается chat_json()
+        выше, эта функция про одну конкретную модель ничего не знает.
 
         RETRY-1: при сбое делает ещё self.retries попыток. Повторяем всё,
         что может пройти со второго раза — таймаут, битый JSON, временную
         ошибку сервера. НЕ повторяем LLMUnavailable: предохранитель уже
-        решил, что сервера нет, и долбиться в него бессмысленно.
+        решил, что сервера нет, и долбиться в него бессмысленно (но
+        chat_json() выше всё равно даст шанс СЛЕДУЮЩЕЙ модели, если она
+        есть в списке).
 
         Цена повтора на CPU-ноутбуке — ещё один таймаут стены, до 15 минут.
         Это осознанный размен: пропущенный вызов молча превращается в
