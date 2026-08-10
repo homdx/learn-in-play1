@@ -219,8 +219,15 @@ VALID_PLAYER_MENTIONS = ["player1"]  # только этот игрок суще
 #      Eve") — старый regex требовал кавычки с обеих сторон, эти три имени
 #      прошли вообще без единой проверки.
 # Ниже — три отдельных исправления под каждый из этих трёх случаев.
+# INVENTED-NAME-3 / FIX-2: реальный случай (allam-2-7b, серия Groq-прогонов) —
+# "player A only accepts...", "player B refuses...", "player C focuses...",
+# "player D has a history..." — ОДНОБУКВЕННЫЕ вымышленные имена после
+# триггера "player". Старая нижняя граница {2,20} требовала минимум 3 буквы
+# в имени (заглавная + ещё 2), поэтому одна литера "A"/"B"/"C"/"D" вообще
+# не матчилась ни одним regex'ом, и все 4 выдуманных игрока прошли как OK.
+# Понижаем нижнюю границу до {0,20} — теперь ловится и однобуквенное имя.
 _QUOTED_NAME_RE = re.compile(
-    r"['\u2018\u2019\"]([A-Z][a-zA-Z]{2,20}(?:\s[A-Z][a-zA-Z]{2,20}){0,2})['\u2018\u2019\"]"
+    r"['\u2018\u2019\"]([A-Z][a-zA-Z]{0,20}(?:\s[A-Z][a-zA-Z]{0,20}){0,2})['\u2018\u2019\"]"
 )
 # re.IGNORECASE только на триггерное слово (через инлайн-флаг (?i:...)),
 # а не на всю регулярку — иначе становится нечувствительным к регистру и
@@ -231,18 +238,44 @@ _QUOTED_NAME_RE = re.compile(
 # учёта регистра триггера не ловила вовсе.
 _UNQUOTED_NAME_RE = re.compile(
     r"(?i:player|absent player|absent|targeting|against)\s+"
-    r"([A-Z][a-zA-Z]{2,20}(?:\s[A-Z][a-zA-Z]{2,20}){0,2})\b"
+    r"([A-Z][a-zA-Z]{0,20}(?:\s[A-Z][a-zA-Z]{0,20}){0,2})\b"
 )
 # player2/player3/player4/player5 — С ПРОБЕЛОМ ИЛИ БЕЗ ("player2",
 # "player 2", "player-2"). \s* покрывает случай 2 из INVENTED-NAME-2.
 _PLAYER_N_RE = re.compile(r"player\s*[2-5]\b", re.IGNORECASE)
 
+# INVENTED-NAME-4 / FIX-1: реальный случай (openai/gpt-oss-120b, серия
+# Groq-прогонов) — "Alice refused my offer...", "Bob paid 3 coins...",
+# "Dave rejected a joint-stake proposal..." — вымышленные игроки названы
+# ПРЯМО В НАЧАЛЕ заметки/предложения, БЕЗ триггерного слова
+# player/absent/targeting/against перед именем. _UNQUOTED_NAME_RE их не
+# ловит по конструкции (ей нужен триггер). Из 5 придуманных в этом ответе
+# персонажей (Alice/Bob/Carol/Dave/Eve) только Carol и Eve стояли рядом с
+# "absent player" и ловились — Alice/Bob/Dave проходили как OK.
+#
+# Ловим заглавное слово в начале строки ИЛИ сразу после ".", "!", "?" и
+# пробела, за которым следует один из глаголов, которыми модель обычно
+# описывает ДЕЙСТВИЕ игрока (что он сказал/сделал/отказал/заплатил) — то
+# есть точно субъект-персонаж, а не служебное слово вроде "Consider"/
+# "Update"/"Focus", которые в этом промпте предшествуют инфинитиву или
+# существительному, а не одному из этих глаголов.
+_SENTENCE_INITIAL_NAME_RE = re.compile(
+    r"(?:^|(?<=[.!?]\s))([A-Z][a-zA-Z]{1,20})\s+"
+    r"(?:refused|rejected|paid|dismissed|offered|accepted|agreed|declined|"
+    r"responded|promised|denied|missed|wanted|said|told|showed|gave|took|"
+    r"borrowed|warned|sold|bought|cited|ignored|only\s+responds|never\s+"
+    r"accepts|has\s+a\s+history)\b"
+)
+
 # Слова, которые ЛЕГИТИМНО встречаются в кавычках с большой буквы и не
 # являются именами игроков — ставки, роли, персоны из самого промпта.
+# "I" добавлен после FIX-2 (понижение нижней границы длины имени до 1
+# символа) — иначе местоимение "I" после триггерного слова ловилось бы как
+# однобуквенное имя игрока.
 _QUOTED_NON_PLAYER_WORDS = {
     "Red", "Black", "Even", "Odd", "High", "Low",
     "Straight", "Split", "Corner", "Sixline", "Dozen", "Column",
-    "Prosecutor", "Oracle",
+    "Prosecutor", "Oracle", "I",
 }
 
 
@@ -251,7 +284,7 @@ def _find_invented_player_names(text: str) -> set:
     похожих на игроков, которых не было в раунде (не player1, не служебные
     слова из ставок/ролей)."""
     found = set()
-    for rx in (_QUOTED_NAME_RE, _UNQUOTED_NAME_RE):
+    for rx in (_QUOTED_NAME_RE, _UNQUOTED_NAME_RE, _SENTENCE_INITIAL_NAME_RE):
         for m in rx.finditer(text):
             name = m.group(1)
             if name in _QUOTED_NON_PLAYER_WORDS:
@@ -312,10 +345,19 @@ def check_response(response_text: str, raw: dict) -> dict:
         if kw in all_text:
             issues.append(f"⚠️  HALLUCINATION: найдено '{kw}' — этого разговора не было")
 
+    # FIX-4: реальный случай (llama-3.1-8b-instant, Groq) — одна заметка
+    # упоминала СРАЗУ Player 2 И Player 3 ("Player 2 dismissed my offer to
+    # sell a warning about Player 3's reputation..."). Старый код делал
+    # `if _PLAYER_N_RE.search(note)` — один if на заметку, поэтому даже при
+    # двух разных выдуманных игроках в одной строке засчитывался только
+    # один issue, и реальное число фабрикаций в сводке занижалось. Теперь
+    # находим и репортим КАЖДОЕ уникальное упоминание "playerN" в заметке.
     if field_notes:
         for note in field_notes:
-            if _PLAYER_N_RE.search(note):
-                issues.append(f"⚠️  HALLUCINATION: упомянут игрок которого player2 не встречал: '{note}'")
+            mentioned = {m.group(0) for m in _PLAYER_N_RE.finditer(note)}
+            for mention in sorted(mentioned):
+                issues.append(f"⚠️  HALLUCINATION: упомянут игрок '{mention}', которого "
+                              f"player2 не встречал: '{note}'")
 
     # INVENTED-NAME-1: см. комментарий у _find_invented_player_names — ловит
     # выдуманные имена собеседников, которых HALLUCINATION_KEYWORDS не знает.
