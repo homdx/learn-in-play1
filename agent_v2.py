@@ -347,6 +347,31 @@ def load_text(path, default=""):
             return f.read().strip()
     return default
 
+
+# MONEY-1: раньше денежные суммы везде показывались как {:+.2f} — всегда
+# два знака после запятой ("+20.00c"), даже когда сумма целая (обычный
+# случай — монеты в этой игре целые). Это сделали в своё время как фикс
+# на другую проблему: до этого суммы иногда реально приходили дробными
+# (нескорректированный float от модели — см. BUGFIX-AMOUNT-1 в
+# common.validate_bet, где сумма ставки принудительно приводится к int
+# именно из-за этого), и .2f не давал дробям тихо потеряться в округлении
+# при отображении. Но постоянные ".00" на каждой целой сумме — визуальный
+# шум без всякой пользы, при том что сам источник дробей (validate_bet)
+# давно защищён отдельно.
+# Компромисс: показываем ЦЕЛОЕ число без десятичных, когда сумма и есть
+# целая (обычный случай) — и ТОЛЬКО если где-то в другом месте (не через
+# validate_bet, например net_transfer/net в dsyn, которые не проходят
+# через ту защиту) всё-таки просочится дробь, показываем её честно с
+# двумя знаками, а не round()'им тихо до целого, теряя данные.
+def fmt_money(value) -> str:
+    try:
+        is_whole = float(value) == int(value)
+    except (TypeError, ValueError, OverflowError):
+        return f"{value}"
+    if is_whole:
+        return f"{int(value):+d}"
+    return f"{float(value):+.2f}"
+
 def save_text(path, text):
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
@@ -640,7 +665,7 @@ def _format_scoreboard(entries: list[dict], exclude_pid: str = None) -> str:
         pnl = a["won"] - a["staked"]
         fav = max(a["types"].items(), key=lambda kv: kv[1])[0] if a["types"] else "?"
         lines.append(
-            f"  {pid}: casino P&L={pnl:+.2f}c over {a['bets']} bet(s) "
+            f"  {pid}: casino P&L={fmt_money(pnl)}c over {a['bets']} bet(s) "
             f"(staked {a['staked']}, returned {a['won']}, won {a['hits']}/{a['bets']}), "
             f"mostly {fav}, last bet in r{a['last']}"
         )
@@ -667,7 +692,7 @@ def _format_dsyn_for_prompt(data: dict, recent: int = DEF_DSYN_RECENT,
         for pid, r in rep.items():
             lines.append(
                 f"  {pid}: trust={r.get('trust_score',5)}/10 "
-                f"net={r.get('net',0):+.2f}c "
+                f"net={fmt_money(r.get('net',0))}c "
                 f"last_seen=r{r.get('last_seen_round','?')} "
                 f"note='{r.get('reputation_note','')}' "
                 f"intent='{r.get('future_intent','')}'"
@@ -687,7 +712,7 @@ def _format_dsyn_for_prompt(data: dict, recent: int = DEF_DSYN_RECENT,
         for itx in raw[-recent:]:
             lines.append(
                 f"  r{itx.get('round','?')} {itx.get('partner','?')}: "
-                f"net={itx.get('net_transfer',0):+.2f}c — {itx.get('summary','')}"
+                f"net={fmt_money(itx.get('net_transfer',0))}c — {itx.get('summary','')}"
             )
         parts.append("\n".join(lines))
 
@@ -1104,7 +1129,7 @@ class PlayerAgent:
         self._log(f"dialogue synapse too large ({text_size} chars), compressing {len(old_raw)} old entries…")
         old_text = "\n".join(
             f"r{e.get('round','?')} partner={e.get('partner','?')} "
-            f"net={e.get('net_transfer',0):+.2f} summary={e.get('summary','')}"
+            f"net={fmt_money(e.get('net_transfer',0))} summary={e.get('summary','')}"
             for e in old_raw
         )
         existing_compressed = dsyn.get("compressed_history", "")
@@ -1390,7 +1415,7 @@ class PlayerAgent:
         user_msg = (
             f"You are {self.player_id}. Round {round_no}. Your conversation with "
             f"{partner_id} just ended.\n"
-            f"Net coins moved between you this conversation: {net_transfer:+.2f} "
+            f"Net coins moved between you this conversation: {fmt_money(net_transfer)} "
             f"(positive = you received).\nYour balance is now {self.balance}.\n"
             f"{free_speech_note}\n"
             f"Transcript:\n{conv_txt}\n\n"
@@ -2507,7 +2532,7 @@ class PlayerAgent:
             # свёрнутому числу вторая читалась как выкачивание монет.
             f"Money moved this conversation: you sent {partner_id} "
             f"{_gross_sent} coin(s); {partner_id} sent you {_gross_recv} "
-            f"coin(s); net for you {net_transfer:+.2f} "
+            f"coin(s); net for you {fmt_money(net_transfer)} "
             f"(positive=you received).\n"
             f"Judge by BOTH figures: coins returned or paid back are not the "
             f"same as coins never moved.\n"
@@ -2583,7 +2608,7 @@ class PlayerAgent:
         save_dsyn(self.player_id, self.base_dir, dsyn)
         self._log(
             f"dsyn updated for {partner_id}: trust={old['trust_score']}/10 "
-            f"net_total={old['net']:+.2f}c intent='{old['future_intent'][:60]}'"
+            f"net_total={fmt_money(old['net'])}c intent='{old['future_intent'][:60]}'"
         )
 
     # ── decide bet ───────────────────────────────────────────────────────

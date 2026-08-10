@@ -202,12 +202,40 @@ VALID_PLAYER_MENTIONS = ["player1"]  # только этот игрок суще
 # "Nova" — с суммами и цитатами того, что они якобы сказали. Ни одно из этих
 # имён не входит в HALLUCINATION_KEYWORDS, и оба прогона прошли как "OK".
 #
-# Вместо конкретных слов ищем ЛЮБОЕ имя в кавычках вида 'Name'/"Name" —
-# так модели описывают собеседников в field_notes (см. и оригинальную
-# галлюцинацию, и эту: "Player 'Quantum'", "absent player 'Rigel'") — и
-# сверяем с VALID_PLAYER_MENTIONS. Не идеальный NER, но ловит именно этот
-# класс фабрикации, которую HALLUCINATION_KEYWORDS пропускает по конструкции.
-_QUOTED_NAME_RE = re.compile(r"['\u2018\u2019\"]([A-Z][a-zA-Z]{2,20})['\u2018\u2019\"]")
+# Вместо конкретных слов ищем ЛЮБОЕ имя похожее на игрока — в кавычках
+# 'Name'/"Name" ИЛИ многословное 'First Last', а также БЕЗ кавычек после
+# триггерных слов player/absent/against/with — и сверяем с
+# VALID_PLAYER_MENTIONS. Не идеальный NER, но ловит именно этот класс
+# фабрикации, которую HALLUCINATION_KEYWORDS пропускает по конструкции.
+#
+# INVENTED-NAME-2: реальный случай (эта же серия прогонов, allam-2-7b vs
+# llama-3.1-8b-instant vs gpt-oss-120b) — три РАЗНЫХ способа обойти
+# детектор, ни один не покрывался версией INVENTED-NAME-1:
+#   1. Двухсловные вымышленные имена В КАВЫЧКАХ ('Risky Rachel', 'Lucky
+#      Louis') — старый regex ловил только ОДНО слово между кавычками.
+#   2. "player 2" / "player 3" С ПРОБЕЛОМ — старая проверка искала
+#      substring "player2" (без пробела) и не находила "player 2's".
+#   3. Имена БЕЗ КАВЫЧЕК вообще ("player Alice", "player Carlos", "player
+#      Eve") — старый regex требовал кавычки с обеих сторон, эти три имени
+#      прошли вообще без единой проверки.
+# Ниже — три отдельных исправления под каждый из этих трёх случаев.
+_QUOTED_NAME_RE = re.compile(
+    r"['\u2018\u2019\"]([A-Z][a-zA-Z]{2,20}(?:\s[A-Z][a-zA-Z]{2,20}){0,2})['\u2018\u2019\"]"
+)
+# re.IGNORECASE только на триггерное слово (через инлайн-флаг (?i:...)),
+# а не на всю регулярку — иначе становится нечувствительным к регистру и
+# сам класс символов [A-Z] для имени, начиная ловить любое слово с большой
+# буквы ПОСЛЕ "player" (в т.ч. "Bet", "Even" и т.п. — ложные срабатывания).
+# Сценарий: "Player Eve" (с большой буквы в начале предложения) — реальный
+# случай из этой же серии прогонов (gpt-oss-120b), которого версия без
+# учёта регистра триггера не ловила вовсе.
+_UNQUOTED_NAME_RE = re.compile(
+    r"(?i:player|absent player|absent|targeting|against)\s+"
+    r"([A-Z][a-zA-Z]{2,20}(?:\s[A-Z][a-zA-Z]{2,20}){0,2})\b"
+)
+# player2/player3/player4/player5 — С ПРОБЕЛОМ ИЛИ БЕЗ ("player2",
+# "player 2", "player-2"). \s* покрывает случай 2 из INVENTED-NAME-2.
+_PLAYER_N_RE = re.compile(r"player\s*[2-5]\b", re.IGNORECASE)
 
 # Слова, которые ЛЕГИТИМНО встречаются в кавычках с большой буквы и не
 # являются именами игроков — ставки, роли, персоны из самого промпта.
@@ -219,16 +247,18 @@ _QUOTED_NON_PLAYER_WORDS = {
 
 
 def _find_invented_player_names(text: str) -> set:
-    """Возвращает множество имён в кавычках, похожих на игроков, которых не
-    было в раунде (не player1, не служебные слова из ставок/ролей)."""
+    """Возвращает множество имён (в кавычках ИЛИ без — см. INVENTED-NAME-2),
+    похожих на игроков, которых не было в раунде (не player1, не служебные
+    слова из ставок/ролей)."""
     found = set()
-    for m in _QUOTED_NAME_RE.finditer(text):
-        name = m.group(1)
-        if name in _QUOTED_NON_PLAYER_WORDS:
-            continue
-        if name.lower() in VALID_PLAYER_MENTIONS:
-            continue
-        found.add(name)
+    for rx in (_QUOTED_NAME_RE, _UNQUOTED_NAME_RE):
+        for m in rx.finditer(text):
+            name = m.group(1)
+            if name in _QUOTED_NON_PLAYER_WORDS:
+                continue
+            if name.lower() in VALID_PLAYER_MENTIONS:
+                continue
+            found.add(name)
     return found
 
 
@@ -284,8 +314,7 @@ def check_response(response_text: str, raw: dict) -> dict:
 
     if field_notes:
         for note in field_notes:
-            note_lower = note.lower()
-            if any(p in note_lower for p in ["player2", "player3", "player4", "player5"]):
+            if _PLAYER_N_RE.search(note):
                 issues.append(f"⚠️  HALLUCINATION: упомянут игрок которого player2 не встречал: '{note}'")
 
     # INVENTED-NAME-1: см. комментарий у _find_invented_player_names — ловит
@@ -317,6 +346,39 @@ DEFAULT_HOSTS = {
     "openai": "http://localhost:11434/v1",
 }
 
+# THINK-FALLBACK: как в llm_client.py._ServerCaps — какие think-поля сервер
+# уже отверг 400-й, запоминаем per-host, чтобы второй и последующие вызовы
+# (батч-режим / несколько раундов) не наступали на те же грабли заново.
+# Реальный случай: Groq на allam-2-7b отвечает 400
+# {"error":{"message":"property 'reasoning' is unsupported", ...}} —
+# поле 'reasoning' валит ВЕСЬ запрос, а не тихо игнорируется.
+_REJECTED_THINK_FIELDS: dict[str, set] = {}
+_THINK_FIELD_NAMES = ("reasoning_effort", "reasoning", "chat_template_kwargs")
+# "reasoning" как отдельное имя поля надо отличать от подстроки внутри
+# "reasoning_effort" — та же логика, что и в llm_client.py._BARE_REASONING_FIELD_RE.
+_BARE_REASONING_FIELD_RE = re.compile(r"reasoning(?!_effort)")
+
+
+def _think_field_rejected(host: str, field: str) -> bool:
+    return field in _REJECTED_THINK_FIELDS.get(host, ())
+
+
+def _mark_think_field_rejected(host: str, field: str):
+    _REJECTED_THINK_FIELDS.setdefault(host, set()).add(field)
+
+
+def _detect_rejected_think_field(host: str, error_body: str) -> str | None:
+    """По тексту 400-й ошибки понять, какое из think-полей сервер не
+    понимает. Возвращает имя поля (для _mark_think_field_rejected) или None,
+    если ошибка не про think-поля вовсе (тогда падаем как раньше)."""
+    for field in ("chat_template_kwargs", "reasoning_effort"):
+        if field in error_body and not _think_field_rejected(host, field):
+            return field
+    if (_BARE_REASONING_FIELD_RE.search(error_body)
+            and not _think_field_rejected(host, "reasoning")):
+        return "reasoning"
+    return None
+
 
 def _endpoint(host: str, api: str) -> str:
     host = host.rstrip("/")
@@ -329,7 +391,8 @@ def _endpoint(host: str, api: str) -> str:
 
 
 def _make_payload(model: str, use_json_format: bool, num_predict: int,
-                  disable_thinking: bool, api: str = "ollama") -> dict:
+                  disable_thinking: bool, api: str = "ollama",
+                  host: str = "") -> dict:
     messages = [
         {"role": "system", "content": SYSTEM_MSG + TASK_SUFFIX},
         {"role": "user",   "content": REFLECT_USER_MSG},
@@ -354,9 +417,14 @@ def _make_payload(model: str, use_json_format: bool, num_predict: int,
             # весь бюджет на скрытые рассуждения и вернул content="" при
             # finish_reason='length', хотя reasoning_effort уже был здесь.
             # Отправляем оба сразу — то, что провайдер не знает, он молча
-            # игнорирует; если ругается 400, уберите --no-think.
-            payload["reasoning_effort"] = "low"
-            payload["reasoning"] = {"effort": "low", "exclude": True}
+            # игнорирует; если ругается 400 — THINK-FALLBACK ниже ловит это
+            # и повторяет запрос БЕЗ конкретно того поля, что вызвало отказ
+            # (см. _detect_rejected_think_field / _REJECTED_THINK_FIELDS),
+            # так же как это уже устроено в llm_client.py._ServerCaps.
+            if not _think_field_rejected(host, "reasoning_effort"):
+                payload["reasoning_effort"] = "low"
+            if not _think_field_rejected(host, "reasoning"):
+                payload["reasoning"] = {"effort": "low", "exclude": True}
         return payload
 
     payload = {
@@ -465,9 +533,13 @@ def _single_call(model: str, host: str, use_json_format: bool,
                   num_predict: int = 700, disable_thinking: bool = False,
                   api: str = "ollama", api_key: str = "ollama",
                   exit_on_error: bool = True) -> tuple:
-    """Делает один запрос к чат-эндпоинту и возвращает (data, content)."""
-    payload = _make_payload(model, use_json_format, num_predict, disable_thinking, api)
+    """Делает один запрос к чат-эндпоинту и возвращает (data, content).
 
+    THINK-FALLBACK: если сервер отвечает 400 из-за конкретного think-поля
+    (reasoning / reasoning_effort / chat_template_kwargs — см.
+    _detect_rejected_think_field), запоминаем это для host и повторяем БЕЗ
+    того поля — до 3 раз (полей всего 3), вместо того чтобы падать сразу.
+    """
     print(f"\n{'='*60}")
     print(f"Модель: {model}")
     print(f"API: {api}")
@@ -480,7 +552,29 @@ def _single_call(model: str, host: str, use_json_format: bool,
     print("\n[USER (первые 300 символов)]:", REFLECT_USER_MSG[:300], "...")
     print("\nОтправляю запрос...")
 
-    data = _request(host, payload, api, api_key, exit_on_error=exit_on_error)
+    for _attempt in range(len(_THINK_FIELD_NAMES) + 1):
+        payload = _make_payload(model, use_json_format, num_predict,
+                                disable_thinking, api, host=host)
+        try:
+            data = _request(host, payload, api=api, api_key=api_key,
+                            exit_on_error=False)
+        except ModelCallError as e:
+            if e.kind == "http" and disable_thinking and api == "openai":
+                field = _detect_rejected_think_field(host, str(e))
+                if field:
+                    print(f"\n♻️  Сервер отверг think-поле '{field}' — "
+                          f"запоминаю для {host} и повторяю без него...")
+                    _mark_think_field_rejected(host, field)
+                    continue
+            if exit_on_error:
+                sys.exit(1)
+            raise
+        break
+    else:
+        # Все think-поля перебраны и всё равно 400 — сдаёмся как раньше.
+        if exit_on_error:
+            sys.exit(1)
+        raise ModelCallError("http", "все think-поля отвергнуты сервером")
 
     # Полная выдача сервера БЕЗ купюр — включая message целиком.
     # Некоторые модели (reasoning-модели) кладут вывод в message["thinking"],
@@ -611,7 +705,9 @@ def _load_config_connection(path: str, section: str = None) -> dict:
     if not cfg.read(path):
         print(f"❌ Не удалось прочитать конфиг: {path}")
         sys.exit(1)
-    sec = section or f"api_{cfg.get('api', 'active', fallback='local')}"
+    active = cfg.get("api", "active", fallback="local")
+    sec = section or f"api_{active}"
+    print(f"[config] {path}: [api].active={active} → секция [{sec}]")
     if not cfg.has_section(sec):
         print(f"❌ В конфиге {path} нет секции [{sec}] "
               f"(доступные: {', '.join(cfg.sections())})")
@@ -714,12 +810,24 @@ if __name__ == "__main__":
                              "в конце печатается сводная таблица PASS/FAIL. "
                              "Пример: --config config_v2_mistral.ini "
                              "--models ministral-8b-latest,open-mistral-nemo,mistral-small-latest")
-    parser.add_argument("--config", default=None,
+    parser.add_argument("--config", default="config_v2.ini",
                         help="CONFIG-1: путь к игровому .ini (config_v2*.ini) — "
                              "берёт из него base_url/api_key/api_format секции "
                              "[api_<active>] (или --section), чтобы не переносить "
                              "их вручную. --host/--api/--api-key, если заданы, "
-                             "имеют приоритет над значениями из конфига.")
+                             "имеют приоритет над значениями из конфига. По "
+                             "умолчанию 'config_v2.ini' — ТОЧНО как run_game_v2.py, "
+                             "так что этот скрипт видит remote/local (active=) "
+                             "ровно так же, как настоящая игра. Если файла по "
+                             "умолчанию нет — скрипт не падает, а тихо откатывается "
+                             "на старое поведение (localhost Ollama); передайте "
+                             "--config явно, чтобы получить ошибку при опечатке "
+                             "в пути. Используйте --no-config, чтобы гарантированно "
+                             "проигнорировать любой config_v2.ini рядом со скриптом.")
+    parser.add_argument("--no-config", action="store_true",
+                        help="Игнорировать --config полностью (в т.ч. дефолтный "
+                             "config_v2.ini) и использовать только --host/--api/"
+                             "--api-key/DEFAULT_HOSTS, как раньше.")
     parser.add_argument("--section", default=None,
                         help="Имя секции в --config вместо [api_<active>] "
                              "(например api_remote2, если сейчас активна другая)")
@@ -751,7 +859,17 @@ if __name__ == "__main__":
                              "не меняется.")
     args = parser.parse_args()
 
-    cfg_conn = _load_config_connection(args.config, args.section) if args.config else None
+    cfg_conn = None
+    if args.no_config:
+        pass
+    elif args.config == "config_v2.ini" and not os.path.exists(args.config):
+        # Дефолтный путь (не передан явно пользователем) — если его нет
+        # рядом со скриптом, молча работаем как раньше (localhost Ollama),
+        # а не падаем: в отличие от run_game_v2.py, этот тест-скрипт часто
+        # запускают не из корня репозитория.
+        pass
+    else:
+        cfg_conn = _load_config_connection(args.config, args.section)
 
     api = args.api or (cfg_conn["api"] if cfg_conn else "ollama")
     host = args.host or (cfg_conn["host"] if cfg_conn else None) or DEFAULT_HOSTS[api]

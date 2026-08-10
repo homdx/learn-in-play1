@@ -1080,6 +1080,30 @@ class TestScoreboard(unittest.TestCase):
         self.assertIn("3 bet(s)", txt)
         self.assertIn("won 1/3", txt)
 
+    def test_whole_pnl_has_no_decimals(self):
+        """MONEY-1: суммы в этой игре целые (монеты) — постоянные '.00' на
+        каждой целой сумме были визуальным шумом без всякой пользы. Целое
+        значение показывается как целое число, без десятичных."""
+        txt = agent_v2._format_scoreboard(self.led([
+            (1, "p1", "even_money", 20, True, 40),
+        ]))
+        self.assertIn("casino P&L=+20c", txt)
+        self.assertNotIn("+20.00c", txt)
+        self.assertNotIn("+20.0c", txt)
+
+    def test_fractional_pnl_still_shown_with_decimals(self):
+        """MONEY-1: если сумма всё же дробная (например, старый баг с не
+        скорректированным float от модели до BUGFIX-AMOUNT-1, или любой
+        другой путь, которым дробь могла бы просочиться) — она должна
+        остаться ВИДИМОЙ, а не молча округлиться до целого и потерять
+        данные. fmt_money() — единая точка форматирования для этого."""
+        self.assertEqual(agent_v2.fmt_money(5.5), "+5.50")
+        self.assertEqual(agent_v2.fmt_money(-3.25), "-3.25")
+        self.assertEqual(agent_v2.fmt_money(20), "+20")
+        self.assertEqual(agent_v2.fmt_money(20.0), "+20")
+        self.assertEqual(agent_v2.fmt_money(-1000), "-1000")
+        self.assertEqual(agent_v2.fmt_money(0), "+0")
+
     def test_own_entries_excluded(self):
         txt = agent_v2._format_scoreboard(
             self.led([(1, "p1", "even_money", 20, True, 40),
