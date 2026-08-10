@@ -777,6 +777,11 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             a_total_sent += requested_a
             agent_a.sent_this_round = getattr(agent_a, "sent_this_round", 0) + requested_a
             a_transfers += 1
+            # RECON-1: reconcile each side's private promise ledger against
+            # this real, already-applied transfer — deterministic, no LLM
+            # call. See promise_ledger.auto_settle_from_transfer docstring.
+            promise_ledger.auto_settle_from_transfer(
+                table_dir, pid_a, pid_b, transfer_a, round_no)
         elif requested_a > 0:
             logger.write(pid_a, f"transfer of {requested_a} coins DROPPED "
                                 f"(transfer_to={turn_a.get('transfer_to')!r}, expected {pid_b!r})")
@@ -898,6 +903,9 @@ def run_dialogue(agent_a: PlayerAgent, agent_b: PlayerAgent,
             b_total_sent += requested_b
             agent_b.sent_this_round = getattr(agent_b, "sent_this_round", 0) + requested_b
             b_transfers += 1
+            # RECON-1: same reconciliation, symmetric direction (B → A).
+            promise_ledger.auto_settle_from_transfer(
+                table_dir, pid_b, pid_a, transfer_b, round_no)
         elif requested_b > 0:
             logger.write(pid_b, f"transfer of {requested_b} coins DROPPED "
                                 f"(transfer_to={turn_b.get('transfer_to')!r}, expected {pid_a!r})")
