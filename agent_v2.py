@@ -1816,26 +1816,37 @@ class PlayerAgent:
             f" \"partner\": \"pid\" (required if action=talk, must be from available list),\n"
             f" \"reason\": \"short reason for this choice\"}}"
         )
-        try:
-            resp = self.client.chat_json(
-                system=self.abstract_prompt + "\nTASK: Decide next move: talk to a player or go bet.",
-                user=user_msg, temperature=0.7, max_tokens=self.tok_next_move
-            )
-            action  = resp.get("action", "bet")
-            partner = resp.get("partner")
-            # RETRY-2: LLM иногда возвращает "reason" не строкой (dict/list/None),
-            # а вызывающий код в run_game_v2.py делает reason[:80] — на не-строке
-            # это падает с "unhashable type: 'slice'" (для dict) или TypeError
-            # (для None/list). Приводим к строке здесь же, у источника.
-            reason = resp.get("reason", "")
-            if not isinstance(reason, str):
-                reason = str(reason)
-            if action == "talk" and partner in available_players:
-                return {"action": "talk", "partner": partner, "reason": reason}
-            return {"action": "bet", "partner": None, "reason": reason}
-        except LLMUnavailable:
-            raise            # FIX-17: выключатель наверх, не в заглушку
-        except Exception as e:
+        # RETRY-18: раньше один сбойный chat_json (обрыв JSON, пустой ответ
+        # и т.п.) сразу форсировал "иду ставить, диалоги в этом раунде
+        # пропущены" — хотя decide_bet рядом уже 20 строк ниже переживает
+        # ровно такие же сбои через свои 2 попытки. Даём decide_next_move
+        # тот же второй шанс перед тем, как форсировать заглушку.
+        last_err = None
+        for _ in range(2):
+            try:
+                resp = self.client.chat_json(
+                    system=self.abstract_prompt + "\nTASK: Decide next move: talk to a player or go bet.",
+                    user=user_msg, temperature=0.7, max_tokens=self.tok_next_move
+                )
+                action  = resp.get("action", "bet")
+                partner = resp.get("partner")
+                # RETRY-2: LLM иногда возвращает "reason" не строкой (dict/list/None),
+                # а вызывающий код в run_game_v2.py делает reason[:80] — на не-строке
+                # это падает с "unhashable type: 'slice'" (для dict) или TypeError
+                # (для None/list). Приводим к строке здесь же, у источника.
+                reason = resp.get("reason", "")
+                if not isinstance(reason, str):
+                    reason = str(reason)
+                if action == "talk" and partner in available_players:
+                    return {"action": "talk", "partner": partner, "reason": reason}
+                return {"action": "bet", "partner": None, "reason": reason}
+            except LLMUnavailable:
+                raise            # FIX-17: выключатель наверх, не в заглушку
+            except Exception as e:
+                last_err = e
+                self._log(f"decide_next_move attempt failed ({e}), retrying")
+        if True:
+            e = last_err
             # RETRY-1: заглушка "иду ставить" в логе неотличима от осознанного
             # решения замолчать. Помечаем явно, иначе при разборе прогона
             # технический сбой читается как стратегия игрока.
@@ -2391,73 +2402,82 @@ class PlayerAgent:
             "Do NOT restate their message, and do NOT restate your own."
         )
 
-        try:
-            attempt = 0
-            while True:
-                resp = self.client.chat_json(
-                    system=self.abstract_prompt
-                           + self.tariff.rule_text(free_now, free_reason)
-                           + f"\nTASK: Dialogue turn with {partner_id}. Be concrete, no filler, no repetition.",
-                    user=user_msg + (echo_retry_hint if attempt else ""),
-                    temperature=0.8 + 0.1 * attempt,
-                    max_tokens=self.tok_dialogue
-                )
-                draft = str(resp.get("message", "…"))
-                if closing_turn or not self._is_echo(draft, conversation, partner_id):
-                    break
-                attempt += 1
-                if attempt > 1:
-                    break
-                self._log(f"draft echoed the conversation — asking for a new "
-                          f"line (attempt {attempt + 1})")
+        # RETRY-19: раньше один сбойный chat_json здесь (обрыв JSON, пустой
+        # ответ и т.п. — то же самое, что чинится повтором в decide_bet)
+        # сразу подставлял "(…)" и молча закрывал диалог, хотя партнёру
+        # уже выставили счёт за эту реплику. Даём дублю turn'а тот же
+        # второй шанс перед тем, как подставлять заглушку.
+        last_err = None
+        for _outer in range(2):
             try:
-                raw_transfer = int(float(resp.get("transfer", 0) or 0))
-            except (TypeError, ValueError):
-                raw_transfer = 0
-            transfer = max(0, min(raw_transfer, self.balance))
-            # FIX-1: единственный возможный получатель в этом диалоге —
-            # сам партнёр. Модель регулярно возвращает transfer>0 с
-            # transfer_to=null (или с опечаткой в id), и раньше такой
-            # перевод молча пропадал, оставляя в логе фантомную сделку.
-            # Считаем непустую сумму намерением заплатить партнёру;
-            # явное указание ТРЕТЬЕГО игрока — по-прежнему отмена.
-            raw_to = resp.get("transfer_to")
-            if transfer > 0 and raw_to not in (None, "", partner_id):
-                self._log(f"transfer_to={raw_to!r} is not the dialogue partner "
-                          f"({partner_id}) — transfer cancelled")
-                transfer = 0
-            transfer_to = partner_id if transfer > 0 else None
-            message = str(resp.get("message", "…"))
+                attempt = 0
+                while True:
+                    resp = self.client.chat_json(
+                        system=self.abstract_prompt
+                               + self.tariff.rule_text(free_now, free_reason)
+                               + f"\nTASK: Dialogue turn with {partner_id}. Be concrete, no filler, no repetition.",
+                        user=user_msg + (echo_retry_hint if attempt else ""),
+                        temperature=0.8 + 0.1 * attempt,
+                        max_tokens=self.tok_dialogue
+                    )
+                    draft = str(resp.get("message", "…"))
+                    if closing_turn or not self._is_echo(draft, conversation, partner_id):
+                        break
+                    attempt += 1
+                    if attempt > 1:
+                        break
+                    self._log(f"draft echoed the conversation — asking for a new "
+                              f"line (attempt {attempt + 1})")
+                try:
+                    raw_transfer = int(float(resp.get("transfer", 0) or 0))
+                except (TypeError, ValueError):
+                    raw_transfer = 0
+                transfer = max(0, min(raw_transfer, self.balance))
+                # FIX-1: единственный возможный получатель в этом диалоге —
+                # сам партнёр. Модель регулярно возвращает transfer>0 с
+                # transfer_to=null (или с опечаткой в id), и раньше такой
+                # перевод молча пропадал, оставляя в логе фантомную сделку.
+                # Считаем непустую сумму намерением заплатить партнёру;
+                # явное указание ТРЕТЬЕГО игрока — по-прежнему отмена.
+                raw_to = resp.get("transfer_to")
+                if transfer > 0 and raw_to not in (None, "", partner_id):
+                    self._log(f"transfer_to={raw_to!r} is not the dialogue partner "
+                              f"({partner_id}) — transfer cancelled")
+                    transfer = 0
+                transfer_to = partner_id if transfer > 0 else None
+                message = str(resp.get("message", "…"))
 
-            # ECHO-1/ECHO-3: сюда доходит либо нормальная реплика, либо
-            # повтор, выживший после переспроса. Второй раз — значит,
-            # сказать действительно нечего, закрываем диалог через
-            # loop_break (без закрывающего хода партнёру).
-            #
-            # Перевод из повторной реплики отменяем в любом случае: он
-            # согласован не был, это часть скопированного чужого текста.
-            # Именно так утекли 38 монет в реальном прогоне — копия чужой
-            # фразы "let's split the risk" пришла вместе с переводом.
-            if not closing_turn and self._is_echo(message, conversation, partner_id):
-                self._log(f"echoed the conversation twice in a row "
-                          f"(with {partner_id}) — ending dialogue")
+                # ECHO-1/ECHO-3: сюда доходит либо нормальная реплика, либо
+                # повтор, выживший после переспроса. Второй раз — значит,
+                # сказать действительно нечего, закрываем диалог через
+                # loop_break (без закрывающего хода партнёру).
+                #
+                # Перевод из повторной реплики отменяем в любом случае: он
+                # согласован не был, это часть скопированного чужого текста.
+                # Именно так утекли 38 монет в реальном прогоне — копия чужой
+                # фразы "let's split the risk" пришла вместе с переводом.
+                if not closing_turn and self._is_echo(message, conversation, partner_id):
+                    self._log(f"echoed the conversation twice in a row "
+                              f"(with {partner_id}) — ending dialogue")
+                    return {
+                        "message": "Let's wrap this up here — we're going in circles.",
+                        "transfer": 0, "transfer_to": None, "done": True,
+                        "loop_break": True
+                    }
+
                 return {
-                    "message": "Let's wrap this up here — we're going in circles.",
-                    "transfer": 0, "transfer_to": None, "done": True,
-                    "loop_break": True
+                    "message": message,
+                    "transfer": transfer,
+                    "transfer_to": transfer_to,
+                    "done": bool(resp.get("done", False))
                 }
-
-            return {
-                "message": message,
-                "transfer": transfer,
-                "transfer_to": transfer_to,
-                "done": bool(resp.get("done", False))
-            }
-        except LLMUnavailable:
-            raise            # FIX-17: выключатель наверх, не в заглушку
-        except Exception as e:
-            self._log(f"dialogue_turn failed ({e})")
-            return {"message": "(…)", "transfer": 0, "transfer_to": None, "done": True}
+            except LLMUnavailable:
+                raise            # FIX-17: выключатель наверх, не в заглушку
+            except Exception as e:
+                last_err = e
+                self._log(f"dialogue_turn attempt failed ({e}), retrying")
+        self._log(f"dialogue_turn failed ({last_err})")
+        return {"message": "(…)", "transfer": 0, "transfer_to": None, "done": True}
 
     # ── update dialogue synapse after conversation ────────────────────────
 
