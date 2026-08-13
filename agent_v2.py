@@ -999,13 +999,13 @@ class PlayerAgent:
         # обрезка без вызова LLM гарантирует, что персона физически не может
         # вытеснить CORE_SYSTEM_PROMPT из контекста ни при каком раскладе.
         persona = self.persona_prompt
-        hard_cap = self.persona_chars * PERSONA_HARD_FACTOR
+        hard_cap = getattr(self, "persona_chars", DEF_PERSONA_CHARS) * PERSONA_HARD_FACTOR
         if len(persona) > hard_cap:
             self._log(f"persona {len(persona)} chars exceeds hard cap {hard_cap} "
                       f"— truncated for this call")
             persona = _truncate_text(persona, hard_cap)
         addendum_block = ""
-        if self.persona_locked:
+        if getattr(self, "persona_locked", False):
             addendum = load_persona_addendum(self.player_id, self.base_dir)
             if addendum:
                 addendum_block = (
@@ -1682,27 +1682,6 @@ class PlayerAgent:
                         for n in fresh[:FIELDNOTES_PER_ROUND]:
                             self._log(f"FIELD NOTE (+1, {len(kept)} kept): {n}")
 
-                    # ROLE-Q: довесок — отдельно от field_notes, цельный текст,
-                    # а не список. Пишем только если модель реально что-то
-                    # вернула (пустое/отсутствующее поле = "без изменений",
-                    # не стираем то, что уже накопилось).
-                    raw_addendum = resp.get("persona_addendum")
-                    if raw_addendum is not None:
-                        addendum_text = _as_text(raw_addendum, "").strip()
-                        if addendum_text:
-                            truncated = _truncate_text(addendum_text,
-                                                       PERSONA_ADDENDUM_CHARS)
-                            if len(addendum_text) > len(truncated):
-                                self._log(f"persona addendum {len(addendum_text)} "
-                                          f"chars > limit {PERSONA_ADDENDUM_CHARS} "
-                                          f"— truncated")
-                            prev = load_persona_addendum(self.player_id, self.base_dir)
-                            if truncated != prev:
-                                save_persona_addendum(self.player_id, self.base_dir,
-                                                      truncated)
-                                self._log(f"PERSONA ADDENDUM UPDATED "
-                                          f"({len(truncated)} chars): {truncated}")
-
                 if self.persona_locked and resp.get("update_persona"):
                     # ROLE-1: модель всё равно иногда возвращает поле, которого
                     # у неё не просили. Пишем это в лог, а не игнорируем молча:
@@ -1720,6 +1699,30 @@ class PlayerAgent:
                                   f"{self.persona_chars} — truncated")
                     save_text(prompt_file(self.player_id, self.base_dir), new_persona)
                     self._log(f"PERSONA REWRITTEN ({len(new_persona)} chars):\n{new_persona}")
+
+                if self.persona_locked:
+                    # ROLE-Q: довесок — отдельно от field_notes, цельный текст,
+                    # а не список. Пишем только если модель реально что-то
+                    # вернула (пустое/отсутствующее поле = "без изменений",
+                    # не стираем то, что уже накопилось). Независимо от
+                    # update_persona: это отдельный канал, не попытка
+                    # переписать роль.
+                    raw_addendum = resp.get("persona_addendum")
+                    if raw_addendum is not None:
+                        addendum_text = _as_text(raw_addendum, "").strip()
+                        if addendum_text:
+                            truncated = _truncate_text(addendum_text,
+                                                       PERSONA_ADDENDUM_CHARS)
+                            if len(addendum_text) > len(truncated):
+                                self._log(f"persona addendum {len(addendum_text)} "
+                                          f"chars > limit {PERSONA_ADDENDUM_CHARS} "
+                                          f"— truncated")
+                            prev = load_persona_addendum(self.player_id, self.base_dir)
+                            if truncated != prev:
+                                save_persona_addendum(self.player_id, self.base_dir,
+                                                      truncated)
+                                self._log(f"PERSONA ADDENDUM UPDATED "
+                                          f"({len(truncated)} chars): {truncated}")
                 last_err = None
                 break
             except LLMUnavailable:
@@ -2569,9 +2572,16 @@ class PlayerAgent:
             f" \"future_intent\": \"what you plan with them next round\",\n"
             f" \"summary\": \"1-sentence summary of this specific conversation\"}}"
         )
+        # Собираем system-промпт ДО try: abstract_prompt читает файлы и
+        # атрибуты персоны, и если это упадёт (например, AttributeError
+        # в неполностью инициализированном объекте), ошибка не должна
+        # маскироваться под "LLM failed" — это не сбой сети/модели, а
+        # баг конфигурации, который иначе тихо съедался и подменял
+        # реальный ответа модели заглушкой (SCHEMA-2 регрессия).
+        system_prompt = self.abstract_prompt + f"\nTASK: Update reputation for {partner_id}."
         try:
             resp = self.client.chat_json(
-                system=self.abstract_prompt + f"\nTASK: Update reputation for {partner_id}.",
+                system=system_prompt,
                 user=user_msg, temperature=0.4, max_tokens=self.tok_update_dsyn
             )
         except LLMUnavailable:

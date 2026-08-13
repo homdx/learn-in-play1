@@ -37,11 +37,23 @@ import common
 
 def _describe(bet: dict) -> str:
     """
-    Человекочитаемое поле ставки: 'even_money(red)', 'straight(17)'.
-    MULTI-BET-1: bet может содержать несколько под-ставок ("bets": [...]);
-    common.describe_bets() уже умеет и старый плоский, и новый формат.
+    Человекочитаемое поле ставки: 'even_money(red)', 'straight(17)',
+    'corner(1,2,4,5)'. MULTI-BET-1: bet может содержать несколько
+    под-ставок ("bets": [...]).
+
+    Отдельно от common.describe_bets(): та функция используется в логах,
+    где нужна сумма КАЖДОЙ под-ставки ('amount=5'), а здесь total уже
+    показывается один раз в конце строки ('for N coins total'), так что
+    дублировать amount() внутри описания и печатать номера как список
+    Python ('[1, 2, 4, 5]') было бы лишним шумом в промпте.
     """
-    return common.describe_bets(bet)
+    parts = []
+    for b in common.normalize_bet_container(bet):
+        bd = b.get("numbers", b.get("selection"))
+        if isinstance(bd, (list, tuple)):
+            bd = ",".join(str(n) for n in bd)
+        parts.append(f"{b.get('type', '?')}({bd})")
+    return "; ".join(parts)
 
 
 def read(base_dir: str) -> list:

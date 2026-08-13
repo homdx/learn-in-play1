@@ -94,6 +94,7 @@ class GameHarness(unittest.TestCase):
         self.table = os.path.join(self.tmp, "table")
         self.logs = os.path.join(self.tmp, "logs")
         self._orig_client = agent_v2.LLMClient
+        self._orig_llm_client_class = llm_client.LLMClient
         agent_v2.LLMClient = FakeLLM
         llm_client.LLMClient = FakeLLM
         FakeLLM.behaviour = {}
@@ -101,6 +102,7 @@ class GameHarness(unittest.TestCase):
 
     def tearDown(self):
         agent_v2.LLMClient = self._orig_client
+        llm_client.LLMClient = self._orig_llm_client_class
         run_game_v2.load_config = self._orig_load_config
         shutil.rmtree(self.tmp, ignore_errors=True)
 
