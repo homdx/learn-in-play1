@@ -168,6 +168,68 @@ def merge_and_save(pid, base_dir, model_promises, round_no: int) -> list[dict]:
     return existing
 
 
+def auto_settle_from_transfer(base_dir, sender_pid: str, receiver_pid: str,
+                              amount: int, round_no: int) -> None:
+    """
+    RECON-1: a real coin transfer just happened at the table — this is
+    ground truth, the exact thing merge_and_save's own docstring says does
+    NOT need a model ("comparing two integers... does not [need a model]").
+    But until now nothing ever compared them: a player's private promise
+    ledger only changed when THAT SAME player's update_checklist call
+    happened to mention the promise again. A payment that already arrived
+    could sit "status": "open" forever if the model never revisited it —
+    seen for real in a saved game: player4's own promises_player4.json kept
+    an "owed_to_me" entry open for a 3-coin call payment from player1 that
+    had already been transferred two turns earlier in the same dialogue,
+    which let player4 later say "the ledger shows no record of me owing
+    you" without technically lying — the record just hadn't caught up.
+
+    This closes that gap deterministically, no LLM call, right where the
+    transfer itself is applied to balances:
+      - on the RECEIVER's ledger: the oldest open "owed_to_me" promise(s)
+        from this sender get settled, oldest due_round first, up to the
+        amount actually received.
+      - on the SENDER's ledger: the oldest open "i_owe" promise(s) to this
+        receiver get settled the same way — the deliverable itself (was
+        the "call" actually sent?) is still free-text and stays a model
+        judgement; only the MONEY side of a promise is auto-reconciled
+        here, because that is the part the engine already knows for a
+        fact.
+    Partial payments are handled by walking promises oldest-first and only
+    settling ones the transferred amount fully covers, so a small transfer
+    against a large debt correctly settles nothing rather than closing an
+    unpaid promise early.
+    """
+    if amount <= 0:
+        return
+
+    def _settle_side(pid: str, direction: str, counterparty: str) -> None:
+        promises = load_promises(pid, base_dir)
+        remaining = amount
+        changed = False
+        candidates = sorted(
+            [p for p in promises
+             if p.get("status") == "open"
+             and p.get("direction") == direction
+             and (p.get("counterparty") or "").strip().lower()
+                 == counterparty.strip().lower()],
+            key=lambda p: (p.get("due_round", round_no), p.get("id", 0))
+        )
+        for p in candidates:
+            if remaining <= 0:
+                break
+            owed = p.get("amount", 0)
+            if owed <= remaining:
+                p["status"] = "settled"
+                remaining -= owed
+                changed = True
+        if changed:
+            save_promises(pid, base_dir, promises)
+
+    _settle_side(receiver_pid, "owed_to_me", sender_pid)
+    _settle_side(sender_pid, "i_owe", receiver_pid)
+
+
 def open_debt_to(pid, base_dir, partner: str, before_round: int) -> int:
     """
     OPEN-1: сколько `pid` СЕЙЧАС должен `partner` по обещаниям, взятым в
