@@ -5,6 +5,7 @@ import shutil
 import tempfile
 
 import dialogue_archive as da
+import run_game_v2 as rg
 
 
 def _dlg(table, r, a, b, turns):
@@ -112,6 +113,48 @@ def run():
 
     for d in (t, t2, t3):
         shutil.rmtree(d, ignore_errors=True)
+
+    # AUTO-T3: restore_round_snapshot error handling
+    t4 = tempfile.mkdtemp()
+    try:
+        rg.restore_round_snapshot(t4, 99)
+        check("restore missing snapshot raises SystemExit", False)
+    except SystemExit as e:
+        check("restore missing snapshot raises SystemExit", "No snapshot found" in str(e))
+
+    snap = os.path.join(t4, "snapshots", "round_2")
+    os.makedirs(snap)
+    with open(os.path.join(snap, "note.txt"), "w", encoding="utf-8") as fh:
+        fh.write("hello")
+    rg.restore_round_snapshot(t4, 2)
+    check("restore snapshot copies files",
+          open(os.path.join(t4, "note.txt"), encoding="utf-8").read() == "hello")
+
+    corrupt_snap = os.path.join(t4, "snapshots", "round_3")
+    os.makedirs(corrupt_snap)
+    with open(os.path.join(corrupt_snap, "game_state.json"), "w", encoding="utf-8") as fh:
+        fh.write("{not valid json")
+    try:
+        rg.restore_round_snapshot(t4, 3)
+        check("restore corrupt snapshot raises SystemExit", False)
+    except SystemExit as e:
+        check("restore corrupt snapshot raises SystemExit", "Corrupt" in str(e))
+    shutil.rmtree(t4, ignore_errors=True)
+
+    # AUTO-T4: load_config / load_last_round error handling
+    t5 = tempfile.mkdtemp()
+    try:
+        rg.load_config(os.path.join(t5, "nope.ini"))
+        check("load_config missing file raises SystemExit", False)
+    except SystemExit:
+        check("load_config missing file raises SystemExit", True)
+
+    state_path = rg.state_file(t5)
+    with open(state_path, "w", encoding="utf-8") as fh:
+        fh.write("{not valid json")
+    check("load_last_round corrupt state falls back to 0",
+          rg.load_last_round(t5) == 0)
+    shutil.rmtree(t5, ignore_errors=True)
 
     print(f"\n{'ALL PASS' if not fails else 'FAILED: ' + ', '.join(fails)}")
     return 1 if fails else 0
