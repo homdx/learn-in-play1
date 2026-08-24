@@ -338,7 +338,11 @@ class LLMClient:
                  timeout: int = 120, retries: int = 1, on_retry=None,
                  json_format: bool = True,
                  error_retries: int = 0, error_retry_wait_sec: int = 60,
-                 max_retry_after_sec: int = 180):
+                 max_retry_after_sec: int = 180,
+                 retry_temperatures="0.0,0.1",
+                 retry_tokens_step_mult: float = 2.0,
+                 retry_tokens_ctx_fraction: float = 0.5,
+                 retry_tokens_default_ceiling: int = 32768):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         # MODEL-FALLBACK-1: `model` может быть списком через запятую
@@ -409,6 +413,35 @@ class LLMClient:
         # Необязательный колбэк log(str): клиент не знает про логгер игры,
         # но вызывающий может подставить свой, чтобы повторы были видны.
         self.on_retry = on_retry
+        # AUTO-RETRY-TEMP-BUDGET-1: см. докстринг _chat_json_one_model.
+        # Fixed, ABSOLUTE temperature schedule for retry-recovery mode —
+        # deliberately NOT relative to the caller's `temperature` (see
+        # jan-auto-agent Gate1Filter._UNPARSEABLE_TEMPERATURES for the
+        # same pattern: at temperature=0.0 the model is deterministic,
+        # so a relative "+0.15 per attempt" ramp from an already-fixed
+        # base doesn't reliably move away from a repeated argmax the way
+        # a genuinely different absolute value does). Accepts either a
+        # comma-separated string (as it arrives from configparser) or an
+        # iterable of floats (direct construction, tests).
+        if isinstance(retry_temperatures, str):
+            _rt = tuple(
+                float(t.strip()) for t in retry_temperatures.split(",") if t.strip()
+            )
+        else:
+            _rt = tuple(float(t) for t in retry_temperatures)
+        self.retry_temperatures = _rt or (0.0,)
+        # How much the max_tokens budget multiplies by each time every
+        # temperature in retry_temperatures has been tried once at the
+        # current tier (i.e. every len(retry_temperatures) attempts).
+        # Default 2.0 — doubles, matching jan-auto-agent's
+        # _UNPARSEABLE_TOKENS_STEP_MULT.
+        self.retry_tokens_step_mult = max(1.0, float(retry_tokens_step_mult))
+        # Ceiling on the escalated token budget, expressed as a fraction
+        # of num_ctx when num_ctx is known (a model's real context window
+        # is the honest limit on how far escalation can usefully go) or a
+        # fixed fallback ceiling otherwise.
+        self.retry_tokens_ctx_fraction = float(retry_tokens_ctx_fraction)
+        self.retry_tokens_default_ceiling = int(retry_tokens_default_ceiling)
         self._ssl_context = None if verify_ssl else _make_unverified_context()
         # EOS-2/COMPAT: json_format=false в [api] — это утверждение про
         # СЕРВЕР, поэтому оно и пишется в общий кэш, а не в экземпляр.
@@ -452,12 +485,30 @@ class LLMClient:
         # можно отключить заранее, не дожидаясь первого 400.
         json_format = cfg.getboolean("api", "json_format", fallback=True)
 
+        # AUTO-RETRY-TEMP-BUDGET-1: см. докстринг _chat_json_one_model /
+        # __init__. Все четыре — необязательные, с теми же дефолтами, что
+        # и при прямом создании LLMClient(...) без конфига, так что
+        # существующие agents.ini без этих ключей продолжают работать
+        # ровно как раньше, просто с более умным повтором.
+        retry_temperatures = cfg.get("api", "retry_temperatures",
+                                      fallback="0.0,0.1")
+        retry_tokens_step_mult = cfg.getfloat(
+            "api", "retry_tokens_step_mult", fallback=2.0)
+        retry_tokens_ctx_fraction = cfg.getfloat(
+            "api", "retry_tokens_ctx_fraction", fallback=0.5)
+        retry_tokens_default_ceiling = cfg.getint(
+            "api", "retry_tokens_default_ceiling", fallback=32768)
+
         return cls(base_url=base_url, api_key=api_key, model=model,
                     api_format=api_format, verify_ssl=verify_ssl,
                     num_ctx=num_ctx, think=think, timeout=timeout,
                     retries=retries, json_format=json_format,
                     error_retries=error_retries,
                     error_retry_wait_sec=error_retry_wait_sec,
+                    retry_temperatures=retry_temperatures,
+                    retry_tokens_step_mult=retry_tokens_step_mult,
+                    retry_tokens_ctx_fraction=retry_tokens_ctx_fraction,
+                    retry_tokens_default_ceiling=retry_tokens_default_ceiling,
                     max_retry_after_sec=max_retry_after_sec)
 
     def _build_request(self, system: str, user: str, temperature: float,
@@ -1033,19 +1084,72 @@ class LLMClient:
                 # eval_count=1, вторая и третья за 0.8 с (промпт уже в
                 # KV-кэше, тот же префикс → тот же argmax).
                 #
-                # Теперь наоборот: температуру повышаем и заодно портим
-                # хвост промпта. Изменение последнего токена промпта
-                # сбивает и распределение, и переиспользование кэша —
-                # попытка перестаёт быть точной копией предыдущей.
+                # AUTO-RETRY-TEMP-BUDGET-1 (заменяет плоский "+0.15 за
+                # попытку" из EOS-2). EOS-2 чинил ТОЛЬКО детерминированный
+                # тупик (сдвигал температуру от повторяющегося argmax), но
+                # никогда не трогал max_tokens — а живой прогон показал
+                # ровно этот класс сбоя: "Unterminated string...",
+                # "Expecting value..." — модель не сломалась, ей просто не
+                # хватило бюджета токенов дописать JSON до конца, и повтор
+                # на ТОМ ЖЕ max_tokens воспроизводил тот же обрыв на том же
+                # символе. temp+0.15 в этом случае не помогает вообще —
+                # причина не в сэмплировании.
+                #
+                # Схема (та же 2-D сетка, что и в jan-auto-agent
+                # Gate1Filter._UNPARSEABLE_TEMPERATURES / AUTO-RETRY-TEMP-1):
+                # фиксированные АБСОЛЮТНЫЕ температуры из retry_temperatures
+                # (по умолчанию 0.0, 0.1) перебираются по кругу на каждом
+                # "ярусе" бюджета токенов, прежде чем бюджет удваивается
+                # (retry_tokens_step_mult). Абсолютные, а не "текущая
+                # температура + шаг": на temperature=0.0 модель
+                # детерминирована, и прибавка к уже нулевой базе от
+                # попытки к попытке ничего не меняет — нужно именно другое
+                # фиксированное значение, а не сдвиг относительно старого.
+                # Пример при дефолтах (0.0, 0.1) и max_tokens=512:
+                #   attempt 2: max_tokens=1024, temp=0.0
+                #   attempt 3: max_tokens=1024, temp=0.1
+                #   attempt 4: max_tokens=2048, temp=0.0
+                #   attempt 5: max_tokens=2048, temp=0.1
+                #   attempt 6: max_tokens=4096, temp=0.0
+                # Потолок — доля от num_ctx (реальное окно модели), а не
+                # производная от max_tokens: маленький настроенный
+                # max_tokens (например bet=250) — это ровно то, что вызвало
+                # обрыв, так что умножать именно его и упираться в тот же
+                # порядок величины смысла нет; num_ctx честно отражает,
+                # сколько места у модели есть на самом деле.
                 attempt_temp = temperature
+                attempt_tokens = max_tokens
                 attempt_user = user
                 if attempt > 1:
-                    attempt_temp = min(temperature + 0.15 * (attempt - 1), 1.0)
+                    retry_temps = getattr(self, "retry_temperatures", (0.0, 0.1))
+                    n_temps = max(1, len(retry_temps))
+                    retry_index = attempt - 2          # 0-based: first retry = 0
+                    tier_index = retry_index // n_temps
+                    temp_index = retry_index % n_temps
+                    step_mult = getattr(self, "retry_tokens_step_mult", 2.0)
+                    ctx_fraction = getattr(self, "retry_tokens_ctx_fraction", 0.5)
+                    default_ceiling = getattr(
+                        self, "retry_tokens_default_ceiling", 32768)
+                    num_ctx = getattr(self, "num_ctx", 0)
+                    ceiling = (
+                        int(num_ctx * ctx_fraction) if num_ctx else default_ceiling
+                    )
+                    uncapped_tokens = int(max_tokens * (step_mult ** (tier_index + 1)))
+                    attempt_tokens = min(uncapped_tokens, ceiling)
+                    attempt_temp = retry_temps[temp_index]
                     attempt_user = (
                         user + "\n\n(Ответь ТОЛЬКО объектом JSON, "
                         "начиная с символа '{'. Попытка "
                         f"{attempt}.)"
                     )
+                    on_retry = getattr(self, "on_retry", None)
+                    if attempt_tokens < uncapped_tokens and on_retry:
+                        on_retry(
+                            f"chat_json retry escalation wants "
+                            f"max_tokens={uncapped_tokens} but capped at "
+                            f"{attempt_tokens} by num_ctx={num_ctx or 'unset'} "
+                            f"(ceiling = num_ctx * {ctx_fraction})"
+                        )
                 # EOS-2/STUB: заглушки в тестах и stub-режиме подменяют
                 # chat() своей функцией со старой сигнатурой, без
                 # json_mode. Передавать новый kwarg вслепую — значит
@@ -1056,13 +1160,13 @@ class LLMClient:
                 if _chat_takes_json_mode(self.chat):
                     text = self.chat(system, attempt_user,
                                      temperature=attempt_temp,
-                                     max_tokens=max_tokens, json_mode=True)
+                                     max_tokens=attempt_tokens, json_mode=True)
                 else:
                     text = self.chat(system, attempt_user,
                                      temperature=attempt_temp,
-                                     max_tokens=max_tokens)
+                                     max_tokens=attempt_tokens)
                 _dbg(f"chat_json() attempt {attempt}: text len={len(text)}, "
-                     f"temperature={attempt_temp:.3f}")
+                     f"temperature={attempt_temp:.3f}, max_tokens={attempt_tokens}")
                 cleaned = strip_json_fence(text)
                 _dbg(f"chat_json() after strip_json_fence len={len(cleaned)}, "
                      f"repr(first 300): {cleaned[:300]!r}")
