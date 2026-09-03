@@ -26,8 +26,11 @@ both of them, the same way the public casino ledger already is for bets.
 
 from __future__ import annotations
 
+import logging
 import os
 import common
+
+logger = logging.getLogger(__name__)
 
 MAX_ENTRIES_PER_PLAYER = 60   # oldest entries dropped first, like the raw ledger windows
 
@@ -38,9 +41,16 @@ def ledger_file(pid, base_dir):
 
 def load_entries(pid, base_dir) -> list[dict]:
     path = ledger_file(pid, base_dir)
-    if os.path.exists(path):
+    if not os.path.exists(path):
+        return []
+    try:
         return common.read_json(path).get("entries", [])
-    return []
+    except (OSError, ValueError) as e:
+        # Corrupt or unreadable ledger file: don't crash the dialogue phase
+        # over a broken transfer history — fall back to an empty ledger,
+        # same as if the player had no recorded transfers yet.
+        logger.warning("Could not read transfer ledger %s for %s: %s", path, pid, e)
+        return []
 
 
 def _save(pid, base_dir, entries: list[dict]):

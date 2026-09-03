@@ -3,10 +3,13 @@ croupier_v2.py — same as original croupier but with logging and returns (winni
 """
 
 import glob
+import logging
 import os
 import re
 
 import common
+
+logger = logging.getLogger(__name__)
 
 
 def collect_bets(base_dir):
@@ -17,7 +20,11 @@ def collect_bets(base_dir):
         if not m:
             continue
         pid = m.group(1)
-        bet = common.read_json(path)
+        try:
+            bet = common.read_json(path)
+        except (OSError, ValueError) as e:
+            logger.warning("Skipping corrupted/unreadable bet file %s: %s", path, e)
+            continue
         bets.append((pid, bet, path))
     return bets
 

@@ -1,8 +1,13 @@
 """TVIS-1: видимость несостоявшихся переводов. python3 test_transfer_visibility.py"""
+import json
+import os
+import shutil
+import tempfile
 import unittest
 
 import agent_v2
 import run_game_v2 as R
+import transfer_ledger
 
 
 class L:
@@ -280,6 +285,34 @@ class TestDsynMalformedModelResponse(unittest.TestCase):
             "reputation_note": "n",
             "future_intent": {"a": "b"} , "summary": "s",
         })
+
+
+class TestLoadEntriesRobustness(unittest.TestCase):
+    """AUTO-T5: load_entries should never crash the dialogue phase over a
+    missing or corrupt transfer ledger file — it should fall back to []."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_missing_file_returns_empty_list(self):
+        self.assertEqual(transfer_ledger.load_entries("p1", self.tmp), [])
+
+    def test_corrupt_json_returns_empty_list_instead_of_raising(self):
+        path = transfer_ledger.ledger_file("p1", self.tmp)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not valid json")
+        self.assertEqual(transfer_ledger.load_entries("p1", self.tmp), [])
+
+    def test_valid_file_returns_entries(self):
+        path = transfer_ledger.ledger_file("p1", self.tmp)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"entries": [{"round_no": 1, "partner": "p2"}]}, f)
+        entries = transfer_ledger.load_entries("p1", self.tmp)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["partner"], "p2")
 
 
 if __name__ == "__main__":

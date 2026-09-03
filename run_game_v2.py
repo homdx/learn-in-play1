@@ -23,6 +23,7 @@ Snapshots:
 
 import argparse
 import configparser
+import logging
 import shutil
 import threading
 import os
@@ -61,7 +62,12 @@ def load_config(path):
     cfg = configparser.ConfigParser()
     if not os.path.exists(path):
         raise SystemExit(f"Config not found: {path}")
-    cfg.read(path, encoding="utf-8")
+    try:
+        cfg.read(path, encoding="utf-8")
+    except configparser.Error as e:
+        raise SystemExit(f"Invalid config file {path}: {e}")
+    except OSError as e:
+        raise SystemExit(f"Could not read config file {path}: {e}")
     return cfg
 
 
@@ -71,9 +77,17 @@ def state_file(base_dir):
 
 def load_last_round(base_dir):
     path = state_file(base_dir)
-    if os.path.exists(path):
+    if not os.path.exists(path):
+        return 0
+    try:
         return common.read_json(path).get("last_completed_round", 0)
-    return 0
+    except (OSError, ValueError) as e:
+        # Missing/optional or corrupt state file: don't crash the whole
+        # orchestrator over it, just resume as if no state was recorded.
+        logging.getLogger(__name__).warning(
+            "Could not read game state %s (%s) — resuming from round 0", path, e
+        )
+        return 0
 
 
 def save_last_round(base_dir, round_no):
@@ -134,27 +148,57 @@ def restore_round_snapshot(base_dir, round_no):
     """
     src = snapshot_dir(base_dir, round_no)
     if not os.path.isdir(src):
+        root_dir = snapshots_root(base_dir)
+        try:
+            available = sorted(os.listdir(root_dir)) if os.path.isdir(root_dir) else []
+        except OSError:
+            available = []
         raise SystemExit(
             f"No snapshot found for round {round_no} at {src}. "
-            f"Available snapshots: {sorted(os.listdir(snapshots_root(base_dir))) if os.path.isdir(snapshots_root(base_dir)) else '(none)'}"
+            f"Available snapshots: {available if available else '(none)'}"
         )
-    # Clear current state files (except snapshots/) before restoring,
-    # so stale files that didn't exist at snapshot time don't linger.
-    for name in os.listdir(base_dir):
-        if name == SNAPSHOTS_DIRNAME:
-            continue
-        path = os.path.join(base_dir, name)
-        if os.path.isdir(path):
-            shutil.rmtree(path)
-        else:
-            os.remove(path)
+
+    # Sanity-check any JSON state files in the snapshot before touching
+    # the live table dir, so a corrupt snapshot fails loudly instead of
+    # leaving base_dir half-wiped, half-restored.
     for name in os.listdir(src):
-        src_path = os.path.join(src, name)
-        dst_path = os.path.join(base_dir, name)
-        if os.path.isdir(src_path):
-            shutil.copytree(src_path, dst_path)
-        else:
-            shutil.copy2(src_path, dst_path)
+        if name.endswith(".json"):
+            try:
+                common.read_json(os.path.join(src, name))
+            except (OSError, ValueError) as e:
+                raise SystemExit(
+                    f"Corrupt or unreadable snapshot state file "
+                    f"{os.path.join(src, name)}: {e}"
+                )
+
+    try:
+        # Clear current state files (except snapshots/) before restoring,
+        # so stale files that didn't exist at snapshot time don't linger.
+        for name in os.listdir(base_dir):
+            if name == SNAPSHOTS_DIRNAME:
+                continue
+            path = os.path.join(base_dir, name)
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        for name in os.listdir(src):
+            src_path = os.path.join(src, name)
+            dst_path = os.path.join(base_dir, name)
+            if os.path.isdir(src_path):
+                shutil.copytree(src_path, dst_path)
+            else:
+                shutil.copy2(src_path, dst_path)
+    except PermissionError as e:
+        raise SystemExit(
+            f"Permission denied while restoring snapshot for round {round_no} "
+            f"in {base_dir}: {e}"
+        )
+    except OSError as e:
+        raise SystemExit(
+            f"OS error while restoring snapshot for round {round_no} "
+            f"in {base_dir}: {e}"
+        )
 
 
 def dialogue_phase_state_file(base_dir):
